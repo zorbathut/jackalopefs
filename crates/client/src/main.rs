@@ -3,7 +3,9 @@ use clap::Parser;
 use jackalopefs_client::mount::{Mount, MountOptions};
 use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::Auth;
+use jackalopefs_proto::DEFAULT_PORT;
 use std::io::IsTerminal;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -12,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Server address, `host:port`.
+    /// Server: `host`, `host:port`, or an IP address; the port defaults to 1933. An IPv6 address with a port goes in brackets, `[::1]:1933`.
     server: String,
     /// Empty directory to mount on.
     mountpoint: PathBuf,
@@ -70,16 +72,13 @@ fn main() -> anyhow::Result<()> {
     };
     let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
     runtime.block_on(async move {
-        let server_addr = tokio::net::lookup_host(&args.server)
+        let (host, port) = server_target(&args.server)?;
+        let server_addr = tokio::net::lookup_host((host.as_str(), port))
             .await
-            .with_context(|| format!("resolving {}", args.server))?
+            .with_context(|| format!("resolving {host} port {port}"))?
             .next()
-            .with_context(|| format!("{} resolves to nothing", args.server))?;
-        let server_name = args
-            .server
-            .rsplit_once(':')
-            .map(|(host, _)| host.trim_matches(|c| c == '[' || c == ']').to_string())
-            .unwrap_or_else(|| "jackalopefs".to_string());
+            .with_context(|| format!("{host} resolves to nothing"))?;
+        let server_name = host;
         let config = Config {
             server_addr,
             server_name,
@@ -131,5 +130,62 @@ async fn wait_for_shutdown_signal() {
     tokio::select! {
         result = tokio::signal::ctrl_c() => if let Err(e) = result { tracing::error!("cannot listen for SIGINT: {e}"); std::future::pending::<()>().await },
         _ = term.recv() => {},
+    }
+}
+
+/// The server as typed: `host`, `host:port`, an IPv4 or IPv6 address, or `[v6]:port`; a missing port is [`DEFAULT_PORT`]. A bare IPv6 address is taken whole, so one with a port needs the brackets.
+fn server_target(input: &str) -> anyhow::Result<(String, u16)> {
+    let usage = || {
+        anyhow::anyhow!(
+            "server must be `host`, `host:port`, or an IP address, with an IPv6 address and port in brackets (`[::1]:{DEFAULT_PORT}`); got `{input}`"
+        )
+    };
+    if let Ok(ip) = input.parse::<IpAddr>() {
+        return Ok((ip.to_string(), DEFAULT_PORT));
+    }
+    let (host, port) = match input.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((host, "")) => (host, None),
+            Some((host, port)) => (host, Some(port.strip_prefix(':').ok_or_else(usage)?)),
+            None => return Err(usage()),
+        },
+        None => match input.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (input, None),
+        },
+    };
+    if host.is_empty() {
+        return Err(usage());
+    }
+    let port = match port {
+        Some(port) => port.parse::<u16>().map_err(|_| usage())?,
+        None => DEFAULT_PORT,
+    };
+    Ok((host.to_string(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_target_shapes() {
+        let ok = |s: &str| server_target(s).unwrap();
+        assert_eq!(ok("nas"), ("nas".into(), DEFAULT_PORT));
+        assert_eq!(ok("nas:5"), ("nas".into(), 5));
+        assert_eq!(ok("10.0.0.2"), ("10.0.0.2".into(), DEFAULT_PORT));
+        assert_eq!(ok("10.0.0.2:5"), ("10.0.0.2".into(), 5));
+        assert_eq!(ok("::1"), ("::1".into(), DEFAULT_PORT));
+        assert_eq!(ok("[::1]"), ("::1".into(), DEFAULT_PORT));
+        assert_eq!(
+            ok("[2001:db8::1234]"),
+            ("2001:db8::1234".into(), DEFAULT_PORT)
+        );
+        assert_eq!(ok("[::1]:5"), ("::1".into(), 5));
+        // A bare IPv6 address is taken whole; a port needs the brackets.
+        assert_eq!(ok("::1:5"), ("::1:5".into(), DEFAULT_PORT));
+        for bad in ["", ":5", "nas:", "nas:x", "nas:70000", "[::1", "[::1]5"] {
+            assert!(server_target(bad).is_err(), "{bad}");
+        }
     }
 }

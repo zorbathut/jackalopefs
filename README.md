@@ -21,10 +21,10 @@ On first start it generates a certificate under `$XDG_STATE_HOME/jackalopefs` (o
 Client:
 
 ```
-jackalopefs-client server:1933 /mnt/share --fingerprint sha256:… [--token SECRET]
+jackalopefs-client server[:port] /mnt/share --fingerprint sha256:… [--token SECRET]
 ```
 
-`--fingerprint` pins the server certificate; `--insecure` skips that check (the connection is still encrypted). Other options: `--op-timeout 30s`, `--connect-timeout 10s`, `--entry-timeout 1s`, `--attr-timeout 1s`, `--allow-other`, `--auto-unmount`, `--default-permissions`. The client runs in the foreground and unmounts on `SIGINT`/`SIGTERM`.
+The server is a host name or an IP address, with or without a port (an IPv6 address with a port in brackets, `[::1]:1933`); the port defaults to 1933. `--fingerprint` pins the server certificate; `--insecure` skips that check (the connection is still encrypted). Other options: `--op-timeout 30s`, `--connect-timeout 10s`, `--entry-timeout 1s`, `--attr-timeout 1s`, `--allow-other`, `--auto-unmount`, `--default-permissions`. The client runs in the foreground and unmounts on `SIGINT`/`SIGTERM`.
 
 `--default-permissions` has the kernel enforce mode bits against the attributes the server reports before it forwards a request. The server only ever checks its own access, so a mount shared through `--allow-other` enforces nothing without it. It costs extra attribute fetches, bounded by `--attr-timeout`, and a `chmod` made on the server side is honoured only after that timeout or the change event. The client warns at startup when `--allow-other` is given without it.
 
