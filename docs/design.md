@@ -108,7 +108,7 @@ The server's certificate authenticates the server to a client that pins its fing
 - Write-through costs one round trip per `write(2)`; a writeback mode is a follow-up.
 - Multiple clients: cache coherence between them is best-effort (push invalidation plus TTL), and locks are local to each client.
 - No `FUSE_INTERRUPT` handling (a fuser limitation): `SIGKILL` on a blocked process takes effect when the operation completes or times out.
-- Device nodes, `chown` to other users, and `RENAME_WHITEOUT` need privileges the server does not have and fail with the kernel's errno.
+- Device nodes are refused with `EPERM` before reaching the kernel; `chown` to other users needs a privilege the server does not have and fails with the kernel's errno; `RENAME_WHITEOUT` is refused with `EINVAL`.
 - Metadata operations that reach the server without a handle (xattrs) fail on a file that has been unlinked while open; those with a handle, or for which the client still holds one (stat, chmod, chown, times, truncate, fsync, read, write through the descriptor), work.
 
 ## Follow-ups
