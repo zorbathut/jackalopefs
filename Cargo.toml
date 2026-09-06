@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = ["crates/proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.88"
+repository = "https://github.com/zorba/jackalopefs"
+
+[workspace.dependencies]
+jackalopefs-proto = { path = "crates/proto" }
+jackalopefs-server = { path = "crates/server" }
+jackalopefs-client = { path = "crates/client" }
+
+anyhow = "1"
+bytes = "1"
+capnp = { version = "0.27", features = ["unaligned"] }
+capnpc = "0.27"
+clap = { version = "4", features = ["derive"] }
+fuser = "0.18"
+humantime = "2"
+libc = "0.2"
+nix = { version = "0.31", features = ["fs", "dir", "user"] }
+notify = "8"
+parking_lot = "0.12"
+quinn = "0.11"
+rand = "0.9"
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sha2 = "0.10"
+subtle = "2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = 1
