@@ -243,6 +243,10 @@ pub fn spawn(
     let dropped_by_handler = dropped.clone();
     let handler = move |result: notify::Result<notify::Event>| match result {
         Ok(event) => {
+            // Opens, which the server itself generates in bulk, produce nothing downstream.
+            if matches!(event.kind, EventKind::Access(_)) {
+                return;
+            }
             if raw_tx.try_send(event).is_err() {
                 dropped_by_handler.store(true, Ordering::Relaxed);
             }
@@ -473,5 +477,78 @@ mod tests {
             "the oldest record was evicted"
         );
         assert!(inner.by_path.contains_key(std::ffi::OsStr::new("f10")));
+    }
+
+    /// Create files under `dir` until a batch reports an entry there, failing after 5 s.
+    async fn wait_until_watched(
+        events: &mut broadcast::Receiver<Arc<EventBatch>>,
+        root: &std::path::Path,
+        dir: &str,
+    ) {
+        let target = if dir.is_empty() {
+            Path::root()
+        } else {
+            Path::from_names(dir.split('/').map(name).collect()).unwrap()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for i in 0.. {
+            assert!(
+                Instant::now() < deadline,
+                "no entry event under {dir} before the deadline"
+            );
+            std::fs::write(root.join(dir).join(format!("f{i}")), b"x").unwrap();
+            while let Ok(batch) =
+                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
+            {
+                let batch = batch.unwrap();
+                if batch
+                    .items
+                    .iter()
+                    .any(|(item, _)| matches!(item, EventItem::Entry { dir, .. } if *dir == target))
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_do_not_fill_the_change_queue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export = tmp.path().canonicalize().unwrap();
+        let file = export.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let (events, mut rx) = broadcast::channel(256);
+        let _watcher = spawn(&export, Arc::new(ChangeLog::default()), events).expect("watcher");
+        wait_until_watched(&mut rx, &export, "").await;
+        // Well over RAW_QUEUE opens while the debounce task cannot run (this runtime is single-threaded and we are not awaiting).
+        for _ in 0..(RAW_QUEUE * 5) {
+            std::fs::read(&file).unwrap();
+        }
+        // Whatever those opens produced is in the next window; a write afterwards proves the pipeline is still live and marks the end.
+        std::fs::write(&file, b"y").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no batch for the write before the deadline"
+            );
+            let Ok(batch) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await else {
+                continue;
+            };
+            let batch = batch.unwrap();
+            assert!(
+                !batch
+                    .items
+                    .iter()
+                    .any(|(item, _)| matches!(item, EventItem::Overflow)),
+                "reads must not overflow the queue"
+            );
+            if batch.items.iter().any(
+                |(item, _)| matches!(item, EventItem::Data { path } if path.to_os_string() == "f"),
+            ) {
+                break;
+            }
+        }
     }
 }

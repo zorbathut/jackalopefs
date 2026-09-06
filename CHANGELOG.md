@@ -20,3 +20,4 @@
 - A failed connection said only what went wrong, never which address it was talking to; every connect error now names it, and the client names the server as typed.
 - Unmounting while the client was between connections waited for the whole connect attempt (up to `--connect-timeout`) and logged `connection manager did not stop in time`; the attempt is now abandoned as soon as the unmount is signalled.
 - The server passed the export filesystem's `f_namelen` through unclamped; it is now capped at the protocol's `NAME_MAX` (255), which `pathconf(_PC_NAME_MAX)` is answered from.
+- The server's own directory listings and file opens counted toward its change queue, so a large export produced spurious `Overflow` events at startup and under read load.
