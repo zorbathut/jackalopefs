@@ -91,6 +91,10 @@ fn main() -> anyhow::Result<()> {
             connect_timeout: args.connect_timeout,
             op_timeout: args.op_timeout,
         };
+        tracing::info!(
+            "protocol revision {:016x}",
+            jackalopefs_proto::PROTO_REVISION
+        );
         let client = Client::connect(config).await.context("connecting")?;
         let mount = Mount::start(
             client,

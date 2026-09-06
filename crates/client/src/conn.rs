@@ -4,7 +4,7 @@ use crate::client::{exchange, Error};
 use crate::handles::{HandleKind, HandleTable};
 use crate::transport::{client_config, ServerTrust};
 use jackalopefs_proto::{
-    read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Resume, PROTO_VERSION,
+    read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Resume, PROTO_REVISION,
 };
 use quinn::{Connection, Endpoint};
 use std::net::SocketAddr;
@@ -70,6 +70,8 @@ pub enum ErrorConnect {
     Codec(#[from] jackalopefs_proto::ErrorCodec),
     #[error("server rejected the session: {0}")]
     Rejected(String),
+    #[error("protocol revision mismatch: this client speaks {client:016x}, the server {server:016x}; both must be built from the same schema")]
+    Revision { client: u64, server: u64 },
     #[error("timed out")]
     Timeout,
 }
@@ -182,7 +184,14 @@ async fn run(
                     break;
                 }
                 failures += 1;
-                if failures == 1 || failures.is_power_of_two() {
+                // A revision mismatch is refused every time until one side is rebuilt; retrying still lets a server rollback recover the mount, and every refusal is logged so the reason is never far up the log.
+                if matches!(e, ErrorConnect::Revision { .. }) {
+                    tracing::error!(
+                        failures,
+                        "reconnect to {} refused: {e}; retrying in {backoff:?}",
+                        cfg.server_addr
+                    );
+                } else if failures == 1 || failures.is_power_of_two() {
                     tracing::warn!(
                         failures,
                         "reconnect to {} failed: {e}; retrying in {backoff:?}",
@@ -271,7 +280,7 @@ async fn connect_once(
     write_frame(
         &mut send,
         &Hello {
-            proto_version: PROTO_VERSION,
+            revision: PROTO_REVISION,
             auth: cfg.auth.clone(),
             resume,
         },
@@ -294,6 +303,13 @@ async fn connect_once(
         HelloReply::Reject { reason } => {
             conn.close(close_code::UNMOUNT.into(), b"rejected");
             Err(ErrorConnect::Rejected(reason))
+        }
+        HelloReply::RevisionMismatch { revision } => {
+            conn.close(close_code::UNMOUNT.into(), b"revision mismatch");
+            Err(ErrorConnect::Revision {
+                client: PROTO_REVISION,
+                server: revision,
+            })
         }
     }
 }

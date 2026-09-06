@@ -65,9 +65,10 @@ fn main() -> anyhow::Result<()> {
         let endpoint = quinn::Endpoint::server(server_config, args.listen)
             .with_context(|| format!("binding {}", args.listen))?;
         tracing::info!(
-            "exporting {} on {}",
+            "exporting {} on {} (protocol revision {:016x})",
             args.export.display(),
-            endpoint.local_addr()?
+            endpoint.local_addr()?,
+            jackalopefs_proto::PROTO_REVISION
         );
         let (events, _) = broadcast::channel::<Arc<EventBatch>>(256);
         let changes = Arc::new(ChangeLog::default());

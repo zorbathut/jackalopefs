@@ -63,7 +63,7 @@ const BASE_WORDS: u32 = 32;
 /// A path cannot legitimately have more components than this (every component is at least one byte plus a separator), so a list that declares more is rejected before anything is allocated for it.
 const MAX_PATH_COMPONENTS: u32 = (PATH_MAX / 2 + 1) as u32;
 
-/// Every element of a struct list occupies at least one word in a genuine message, so a list declaring more elements than the whole message has words is an amplification attempt (a zero-sized element type makes the count otherwise unbounded). Checked before allocating.
+/// Every element of a struct list occupies at least one word in a genuine message, so a list declaring more elements than the whole message has words is an amplification attempt (a zero-sized element type makes the count otherwise unbounded). Checked before allocating. Changing this rule is a protocol change: edit the schema so the revision moves.
 fn checked_len(declared: u32, message_words: usize) -> Result<usize, ErrorDecode> {
     if declared as usize > message_words {
         return Err(ErrorDecode::Invalid(format!(
@@ -73,7 +73,7 @@ fn checked_len(declared: u32, message_words: usize) -> Result<usize, ErrorDecode
     Ok(declared as usize)
 }
 
-/// Wire size of one directory entry in a `readdir`/`readdirPlus` reply: four words of `DirEntry` plus the name rounded up to a word, and fourteen more words with an `Attr`. The server budgets listings with this.
+/// Wire size of one directory entry in a `readdir`/`readdirPlus` reply: four words of `DirEntry` plus the name rounded up to a word, and fourteen more words with an `Attr`. The server budgets listings with this. Changing it is a protocol change: edit the schema so the revision moves.
 pub fn dir_entry_bytes(name_len: usize, plus: bool) -> usize {
     32 + name_len.next_multiple_of(8) + if plus { 112 } else { 0 }
 }
@@ -309,7 +309,7 @@ fn parse_set_attr(r: schema::set_attr::Reader<'_>) -> Result<SetAttr, ErrorDecod
 impl Message for Hello {
     fn build(&self, message: &mut message::Builder<HeapAllocator>) {
         let mut b = message.init_root::<schema::hello::Builder<'_>>();
-        b.set_proto_version(self.proto_version);
+        b.set_revision(self.revision);
         match &self.auth {
             Auth::Anonymous => b.reborrow().get_auth().set_anonymous(()),
             Auth::Token(token) => b.reborrow().get_auth().set_token(token),
@@ -341,7 +341,7 @@ impl Message for Hello {
             }
         };
         Ok(Hello {
-            proto_version: r.get_proto_version(),
+            revision: r.get_revision(),
             auth,
             resume,
         })
@@ -377,6 +377,9 @@ impl Message for HelloReply {
                 ack.set_resumed(*resumed);
             }
             HelloReply::Reject { reason } => b.init_reject().set_reason(reason.as_str()),
+            HelloReply::RevisionMismatch { revision } => {
+                b.init_revision_mismatch().set_revision(*revision)
+            }
         }
     }
 
@@ -397,6 +400,9 @@ impl Message for HelloReply {
                     reason: reason.to_string(),
                 }
             }
+            schema::hello_reply::Which::RevisionMismatch(m) => HelloReply::RevisionMismatch {
+                revision: m.get_revision(),
+            },
         })
     }
 
@@ -405,6 +411,7 @@ impl Message for HelloReply {
             + match self {
                 HelloReply::Ack { .. } => 4,
                 HelloReply::Reject { reason } => words_for_text(reason.len()),
+                HelloReply::RevisionMismatch { .. } => 1,
             }
     }
 }

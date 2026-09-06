@@ -16,10 +16,10 @@ pub const MAX_IO: usize = 1024 * 1024;
 /// Bytes read per step while filling a frame body, so memory tracks what has actually arrived rather than what the peer declared.
 const READ_CHUNK: usize = 64 * 1024;
 
-/// Words a decoder may traverse per frame. Four times the largest frame: pointer aliasing stays bounded, but a legitimately maximal message never trips it even though the reader charges every getter call and double-counts re-reads.
+/// Words a decoder may traverse per frame. Four times the largest frame: pointer aliasing stays bounded, but a legitimately maximal message never trips it even though the reader charges every getter call and double-counts re-reads. Changing it is a protocol change: edit the schema so the revision moves.
 const TRAVERSAL_LIMIT_WORDS: usize = 4 * MAX_FRAME / 8;
 
-/// The deepest real message is five levels (Response → List(DirEntryPlus) → DirEntryPlus → Attr → group); sixteen leaves room without inviting recursion abuse.
+/// The deepest real message is five levels (Response → List(DirEntryPlus) → DirEntryPlus → Attr → group); sixteen leaves room without inviting recursion abuse. Changing it is a protocol change: edit the schema so the revision moves.
 const NESTING_LIMIT: i32 = 16;
 
 #[derive(Debug, thiserror::Error)]
@@ -417,12 +417,12 @@ mod tests {
         (
             vec![
                 Hello {
-                    proto_version: PROTO_VERSION,
+                    revision: 0x0102030405060708,
                     auth: Auth::Anonymous,
                     resume: None,
                 },
                 Hello {
-                    proto_version: 1,
+                    revision: 0x0102030405060708,
                     auth: Auth::Token(b"secret".to_vec()),
                     resume: Some(Resume {
                         session_id: 3,
@@ -438,6 +438,9 @@ mod tests {
                 },
                 HelloReply::Reject {
                     reason: "no".into(),
+                },
+                HelloReply::RevisionMismatch {
+                    revision: 0x0102030405060708,
                 },
             ],
             Event {
@@ -571,7 +574,7 @@ mod tests {
     #[test]
     fn trailing_bytes_inside_a_frame_are_rejected() {
         let mut body = frame_body(&Hello {
-            proto_version: 1,
+            revision: 0x0102030405060708,
             auth: Auth::Anonymous,
             resume: None,
         });
@@ -673,7 +676,7 @@ mod tests {
     fn resume_token_and_reason_are_validated() {
         let mut builder = message::Builder::new_default();
         let mut hello = builder.init_root::<jackalopefs_capnp::hello::Builder<'_>>();
-        hello.set_proto_version(1);
+        hello.set_revision(1);
         hello.reborrow().get_auth().set_anonymous(());
         let mut resume = hello.get_resume().init_some();
         resume.set_session_id(1);
@@ -855,7 +858,9 @@ mod tests {
         ))
         .unwrap();
         assert!(
-            text.contains("token = \"secret\"") && text.contains("sessionId = 3"),
+            text.contains("revision = 72623859790382856")
+                && text.contains("token = \"secret\"")
+                && text.contains("sessionId = 3"),
             "{text}"
         );
         let text = String::from_utf8(capnp_convert(
@@ -911,11 +916,19 @@ mod tests {
     }
 
     /// Exact bytes for one instance of each top-level message. A round trip is self-consistent by construction and cannot notice an ordinal renumber or a union reorder; this can. Regenerate deliberately when the schema changes, and say so in the changelog.
+    /// The framing limits are stated in the schema's comments so that they are part of the revision; this is what keeps the two copies equal.
+    #[test]
+    fn framing_limits_are_stated_in_the_schema() {
+        let schema = include_str!("../schema/jackalopefs.capnp");
+        assert!(schema.contains(&format!("frame body longer than {MAX_FRAME} bytes")));
+        assert!(schema.contains(&format!("write payload is at most {MAX_IO} bytes")));
+    }
+
     #[test]
     fn golden_bytes() {
         let (hellos, replies, event) = control_messages();
         let cases: [(&str, Vec<u8>, &str); 5] = [
-            ("hello", frame_body(&hellos[1]), "0000000009000000000000000100020001000000010001000500000032000000040000000100010073656372657400000300000000000000010000008200000007070707070707070707070707070707"),
+            ("hello", frame_body(&hellos[1]), "000000000a0000000000000002000200080706050403020101000100000000000500000032000000040000000100010073656372657400000300000000000000010000008200000007070707070707070707070707070707"),
             ("reply", frame_body(&replies[0]), "0000000006000000000000000200010001000000000000000100000000000000010000008200000001010101010101010101010101010101"),
             ("request", frame_body(&Request::Rename { parent: path("a"), name: name("b"), newparent: path("c"), newname: name("d"), flags: 1 }), "000000000e00000000000000030004000900000000000000010000000000000000000000000000000d0000000e000000110000000a000000110000000e000000150000000a000000010000000a00000061000000000000006200000000000000010000000a00000063000000000000006400000000000000"),
             ("response", frame_body(&Response::Entry(sample_attr(9))), "000000000e00000000000000010001000000000001000000000000000b00000009000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e8030000001000000000000000000000"),

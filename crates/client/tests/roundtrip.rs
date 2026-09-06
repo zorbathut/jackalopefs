@@ -1,8 +1,10 @@
 mod common;
 
 use common::*;
-use jackalopefs_client::{ConnState, Error, ServerTrust};
-use jackalopefs_proto::{Auth, Path, Request, SetAttr, TimeOrNow, TimeSpec};
+use jackalopefs_client::{ConnState, Error, ErrorConnect, ServerTrust};
+use jackalopefs_proto::{
+    Auth, Hello, HelloReply, Path, Request, SetAttr, TimeOrNow, TimeSpec, PROTO_REVISION,
+};
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -414,7 +416,7 @@ async fn truncated_request_is_ignored_by_the_server() {
     jackalopefs_proto::write_frame(
         &mut send,
         &jackalopefs_proto::Hello {
-            proto_version: jackalopefs_proto::PROTO_VERSION,
+            revision: PROTO_REVISION,
             auth: Auth::Anonymous,
             resume: None,
         },
@@ -579,4 +581,123 @@ async fn handles_are_reopened_and_verified_after_a_server_restart() {
     client.releasedir(dir_fh).await.unwrap();
     client.shutdown().await;
     second.stop().await;
+}
+
+#[tokio::test]
+async fn server_refuses_a_foreign_revision() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), Some("s3cret".into())).await;
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(
+        jackalopefs_client::transport::client_config(ServerTrust::Fingerprint(server.fingerprint))
+            .unwrap(),
+    );
+    let hello = |revision, auth| Hello {
+        revision,
+        auth,
+        resume: None,
+    };
+
+    // The revision is checked before the token, so a wrong token gets the revision diagnosis.
+    let conn = endpoint
+        .connect(server.addr, "jackalopefs")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    jackalopefs_proto::write_frame(
+        &mut send,
+        &hello(PROTO_REVISION ^ 1, Auth::Token("nope".into())),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    let reply: HelloReply = jackalopefs_proto::read_frame(&mut recv).await.unwrap();
+    assert_eq!(
+        reply,
+        HelloReply::RevisionMismatch {
+            revision: PROTO_REVISION
+        }
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+        .await
+        .expect("the server closes a refused connection");
+    assert!(
+        matches!(closed, quinn::ConnectionError::ApplicationClosed(_)),
+        "{closed}"
+    );
+
+    let conn = endpoint
+        .connect(server.addr, "jackalopefs")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    jackalopefs_proto::write_frame(
+        &mut send,
+        &hello(PROTO_REVISION, Auth::Token("s3cret".into())),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    let reply: HelloReply = jackalopefs_proto::read_frame(&mut recv).await.unwrap();
+    assert!(matches!(reply, HelloReply::Ack { .. }), "{reply:?}");
+    conn.close(0u32.into(), b"done");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn client_refuses_a_foreign_revision() {
+    // First connection: the mount never comes up, and the caller learns both revisions.
+    let hole = Blackhole::start_handshaking(vec![HelloReply::RevisionMismatch {
+        revision: PROTO_REVISION ^ 1,
+    }])
+    .await;
+    let err = jackalopefs_client::Client::connect(hole.config(Duration::from_secs(5)))
+        .await
+        .err()
+        .expect("a foreign revision must refuse the first connection");
+    match err.downcast_ref::<ErrorConnect>() {
+        Some(ErrorConnect::Revision { client, server }) => {
+            assert_eq!((*client, *server), (PROTO_REVISION, PROTO_REVISION ^ 1));
+        }
+        other => panic!("{other:?}: {err}"),
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let closed = hole
+            .connections
+            .lock()
+            .first()
+            .map(|c| c.close_reason().is_some());
+        if closed == Some(true) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the client left the refused connection open"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A mounted client whose server changes revision underneath it: the reconnect is refused every time, the state stays Connecting, and calls fail by the deadline rather than at once, so a rollback can still recover the mount.
+    let hole = Blackhole::start_handshaking(vec![
+        Blackhole::ack(),
+        HelloReply::RevisionMismatch {
+            revision: PROTO_REVISION ^ 1,
+        },
+    ])
+    .await;
+    let client = jackalopefs_client::Client::connect(hole.config(Duration::from_millis(500)))
+        .await
+        .unwrap();
+    hole.connections.lock()[0].close(0u32.into(), b"upgraded");
+    let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    assert!(matches!(*client.state().borrow(), ConnState::Connecting));
+    assert!(
+        hole.connections.lock().len() >= 2,
+        "the client did not retry"
+    );
+    client.shutdown().await;
 }

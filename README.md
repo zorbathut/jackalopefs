@@ -36,6 +36,7 @@ Set `RUST_LOG=debug` (or `trace`) on either side for more detail.
 
 - A filesystem call blocked on the server fails with `ETIMEDOUT` after `--op-timeout`; a call that was in flight when the connection dropped fails with `EIO` unless it is safe to retry, in which case it is retried once on the next connection.
 - The client reconnects with exponential backoff for as long as it is mounted. If the server kept the session (up to 60 s), open files continue exactly where they were; otherwise each open file is reopened by path and verified to be the same inode, and a handle whose file changed underneath it fails with `ESTALE`.
+- A server and client built from different protocol revisions refuse each other before any authentication, and both log the two revisions (`jackalopefs-client` exits with them when it is the first connection). While mounted, the client keeps retrying so that a server rollback recovers the mount, but calls fail with `ETIMEDOUT` until one side is rebuilt or the mount is given up as below.
 - To give up on a mount: `fusermount3 -uz /mnt/share` detaches the mount point, and killing `jackalopefs-client` fails every pending and future call with `ENOTCONN` immediately. Nothing needs root and nothing can wedge in uninterruptible sleep beyond the operation deadline.
 
 ## Semantics

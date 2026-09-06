@@ -18,7 +18,8 @@ pub struct Resume {
 /// First message on the control stream, client to server.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Hello {
-    pub proto_version: u32,
+    /// [`crate::PROTO_REVISION`] of the sender's build.
+    pub revision: u64,
     pub auth: Auth,
     /// Present when reconnecting: asks the server to reattach the previous session's open handles.
     pub resume: Option<Resume>,
@@ -34,6 +35,10 @@ pub enum HelloReply {
     },
     Reject {
         reason: String,
+    },
+    /// The server speaks another revision of the protocol; it closes the connection once this has been read.
+    RevisionMismatch {
+        revision: u64,
     },
 }
 

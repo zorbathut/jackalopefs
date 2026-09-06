@@ -7,7 +7,7 @@ use crate::watch::{ChangeLog, EventBatch};
 use crate::SESSION_GRACE;
 use jackalopefs_proto::{
     read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Request, Response,
-    PROTO_VERSION,
+    PROTO_REVISION,
 };
 use parking_lot::Mutex;
 use quinn::{Connection, RecvStream, SendStream};
@@ -224,7 +224,15 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     let (session, epoch, resumed) = match timeout(HELLO_TIMEOUT, handshake(&conn, &server)).await {
         Ok(Ok(attached)) => attached,
         Ok(Err(e)) => {
-            tracing::info!(%remote, "handshake failed: {e}");
+            match &e {
+                ErrorHandshake::Revision { client } => tracing::warn!(
+                    %remote,
+                    client_revision = %format_args!("{client:016x}"),
+                    server_revision = %format_args!("{PROTO_REVISION:016x}"),
+                    "refusing: {e}"
+                ),
+                _ => tracing::info!(%remote, "handshake failed: {e}"),
+            }
             conn.close(close_code::HANDSHAKE.into(), b"handshake");
             return;
         }
@@ -289,6 +297,17 @@ enum ErrorHandshake {
     Codec(#[from] jackalopefs_proto::ErrorCodec),
     #[error("rejected: {0}")]
     Rejected(String),
+    #[error(
+        "protocol revision mismatch: the client speaks {client:016x}, this server {:016x}",
+        PROTO_REVISION
+    )]
+    Revision { client: u64 },
+}
+
+/// A handshake the server turns down: what the client is told, and what the log gets.
+struct Refusal {
+    reply: HelloReply,
+    error: ErrorHandshake,
 }
 
 async fn handshake(
@@ -297,24 +316,37 @@ async fn handshake(
 ) -> Result<(Arc<SessionState>, u64, bool), ErrorHandshake> {
     let (mut send, mut recv) = conn.accept_bi().await?;
     let hello: Hello = read_frame(&mut recv).await?;
-    let outcome = if hello.proto_version != PROTO_VERSION {
-        Err(format!(
-            "unsupported protocol version {}; this server speaks {PROTO_VERSION}",
-            hello.proto_version
-        ))
-    } else {
-        server.authenticate(&hello.auth).map(|()| {
-            let resumed = hello
-                .resume
-                .and_then(|r| server.sessions.resume(r.session_id, &r.token));
-            match resumed {
-                Some((state, epoch)) => (state, epoch, true),
-                None => {
-                    let (state, epoch) = server.sessions.create();
-                    (state, epoch, false)
-                }
-            }
+    // The revision is checked before the token so that a peer built from another schema learns that, whatever its credentials.
+    let outcome = if hello.revision != PROTO_REVISION {
+        Err(Refusal {
+            reply: HelloReply::RevisionMismatch {
+                revision: PROTO_REVISION,
+            },
+            error: ErrorHandshake::Revision {
+                client: hello.revision,
+            },
         })
+    } else {
+        match server.authenticate(&hello.auth) {
+            Ok(()) => {
+                let resumed = hello
+                    .resume
+                    .and_then(|r| server.sessions.resume(r.session_id, &r.token));
+                Ok(match resumed {
+                    Some((state, epoch)) => (state, epoch, true),
+                    None => {
+                        let (state, epoch) = server.sessions.create();
+                        (state, epoch, false)
+                    }
+                })
+            }
+            Err(reason) => Err(Refusal {
+                reply: HelloReply::Reject {
+                    reason: reason.clone(),
+                },
+                error: ErrorHandshake::Rejected(reason),
+            }),
+        }
     };
     match outcome {
         Ok((state, epoch, resumed)) => {
@@ -332,14 +364,8 @@ async fn handshake(
             }
             Ok((state, epoch, resumed))
         }
-        Err(reason) => {
-            write_frame(
-                &mut send,
-                &HelloReply::Reject {
-                    reason: reason.clone(),
-                },
-            )
-            .await?;
+        Err(Refusal { reply, error }) => {
+            write_frame(&mut send, &reply).await?;
             if let Err(e) = send.finish() {
                 tracing::debug!("control stream already closed: {e}");
             }
@@ -347,7 +373,7 @@ async fn handshake(
             if timeout(REJECT_DRAIN_TIMEOUT, send.stopped()).await.is_err() {
                 tracing::debug!("client did not read the rejection in time");
             }
-            Err(ErrorHandshake::Rejected(reason))
+            Err(error)
         }
     }
 }

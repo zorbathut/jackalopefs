@@ -1,13 +1,19 @@
 @0xfb77a64f10864f65;
 
+# Every byte of this file, comments included, feeds the protocol revision the
+# peers compare in Hello (PROTO_REVISION in crates/proto/src/lib.rs; docs/design.md,
+# "Wire format"): any edit here is a new revision, and peers built from
+# different revisions refuse each other.
+#
 # jackalopefs wire protocol. Every frame on a QUIC stream is a u32 little-endian
 # length prefix followed by one standard Cap'n Proto message with exactly one
 # segment; docs/design.md, "Wire format", is the normative description of the
 # framing, the reader limits and the validation rules below.
 #
 # Evolution contract (checked against capnp 1.5): union discriminant values
-# follow ordinal order, not declaration order, so reordering declarations is
-# safe and renumbering ordinals breaks every peer; a group's position in a union
+# follow ordinal order, not declaration order, so reordering declarations keeps
+# the wire format (though it is still a new revision, see above) and renumbering
+# ordinals breaks every peer; a group's position in a union
 # is its lowest member ordinal, so new fields and new union members are always
 # appended with fresh, higher ordinals, never inserted; out-of-order ordinals
 # compile without complaint, so the compiler will not catch a renumber.
@@ -15,6 +21,7 @@
 # Rules the schema cannot express (docs/design.md, "Wire format", is normative):
 #
 # Decoders reject:
+# - a frame body longer than 2097152 bytes, before allocating it
 # - a name that is empty, longer than 255 bytes, contains '/' or NUL, or is "." or ".."
 # - a path longer than 4096 bytes when joined with '/' (the empty path, or an omitted path pointer, is the export root)
 # - a resume token that is not exactly 16 bytes
@@ -22,6 +29,7 @@
 # - an unknown union discriminant or enum value
 #
 # Senders guarantee (a receiver answers a violation with an ordinary error):
+# - a write payload is at most 1048576 bytes (EINVAL beyond that) and a read asks for at most that many (a larger request is clamped)
 # - getattr and setattr carry a path, a handle, or both, never neither
 # - fh values are chosen by the client and never reused within a client's lifetime
 # - err is a Linux errno; flags, mode and mask are Linux values; nextOffset is a getdents64 cookie
@@ -107,7 +115,8 @@ struct Resume {
 
 # First message on the control stream, client to server.
 struct Hello {
-  protoVersion @0 :UInt32;
+  # PROTO_REVISION of the client's build; the server refuses any other.
+  revision @0 :UInt64;
   auth :union { anonymous @1 :Void; token @2 :Data; }
   resume :union { none @3 :Void; some @4 :Resume; }
 }
@@ -121,6 +130,10 @@ struct HelloReply {
     }
     reject :group {
       reason @3 :Text;
+    }
+    # The server speaks another revision; it closes the connection once this has been read.
+    revisionMismatch :group {
+      revision @4 :UInt64;
     }
   }
 }

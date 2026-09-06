@@ -19,10 +19,22 @@ pub use wire::{dir_entry_bytes, ErrorDecode, Message};
 
 use sha2::{Digest, Sha256};
 
-/// Protocol version carried in `Hello`; bumped on any incompatible wire change.
-pub const PROTO_VERSION: u32 = 1;
+/// 64-bit FNV-1a, offset basis 0xcbf29ce484222325, prime 0x100000001b3, one byte at a time. An accident detector, not a security control; another implementation only has to reproduce it exactly.
+const fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut i = 0;
+    while i < bytes.len() {
+        hash ^= bytes[i] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    hash
+}
 
-/// TLS ALPN identifier; the QUIC handshake refuses peers that don't offer it.
+/// The revision of the protocol this build speaks, carried in `Hello` and compared by the server: the hash of the schema file's exact bytes, comments included, so any edit to the file is a new revision and peers built from different ones refuse each other. Shown as 16 hex digits.
+pub const PROTO_REVISION: u64 = fnv1a(include_bytes!("../schema/jackalopefs.capnp"));
+
+/// TLS ALPN identifier; the QUIC handshake refuses peers that don't offer it. Changing it is a protocol change: edit the schema so the revision moves.
 pub const ALPN: &[u8] = b"jackalopefs/1";
 
 /// SHA-256 of a DER-encoded certificate.
@@ -68,6 +80,14 @@ pub fn parse_fingerprint(text: &str) -> Result<[u8; 32], ErrorFingerprint> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revision_is_the_fnv1a_of_the_schema() {
+        assert_eq!(fnv1a(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a(b"a"), 0xaf63dc4c8601ec8c);
+        assert_ne!(PROTO_REVISION, 0);
+        assert_ne!(PROTO_REVISION, fnv1a(b""));
+    }
 
     #[test]
     fn fingerprint_round_trips() {

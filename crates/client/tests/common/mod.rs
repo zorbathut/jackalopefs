@@ -9,7 +9,7 @@ use jackalopefs_server::session::{self, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch, WatcherHandle};
 use parking_lot::Mutex;
-use quinn::{Endpoint, EndpointConfig, TokioRuntime};
+use quinn::{Connection, Endpoint, EndpointConfig, TokioRuntime};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::sync::Arc;
@@ -110,11 +110,13 @@ pub fn config_for(
     }
 }
 
-/// Accepts connections and completes the hello, then either swallows every request forever (recording when the client gives up on a stream) or answers every one with the same canned reply.
+/// Accepts connections and answers the hello from a list (one reply per connection in order, the last one repeating; a refusal closes that connection), then either swallows every request forever (recording when the client gives up on a stream) or answers every one with the same canned reply.
 pub struct Blackhole {
     pub addr: SocketAddr,
     pub fingerprint: [u8; 32],
     pub requests: Arc<Mutex<Vec<Request>>>,
+    /// Every connection accepted, in order, so a test can close one.
+    pub connections: Arc<Mutex<Vec<Connection>>>,
     /// STOP_SENDING codes received on swallowed request streams, i.e. cancellations the client made explicit.
     pub stops: Arc<Mutex<Vec<u64>>>,
     endpoint: Endpoint,
@@ -126,35 +128,62 @@ impl Blackhole {
     }
 
     pub async fn start_with(canned: Option<Response>) -> Blackhole {
+        Blackhole::start_full(canned, vec![Blackhole::ack()]).await
+    }
+
+    pub async fn start_handshaking(hellos: Vec<HelloReply>) -> Blackhole {
+        Blackhole::start_full(None, hellos).await
+    }
+
+    pub fn ack() -> HelloReply {
+        HelloReply::Ack {
+            session_id: 1,
+            resume_token: [0; 16],
+            resumed: false,
+        }
+    }
+
+    async fn start_full(canned: Option<Response>, hellos: Vec<HelloReply>) -> Blackhole {
         let identity = Identity::generate().unwrap();
         let fingerprint = jackalopefs_proto::fingerprint_bytes(identity.cert.as_ref());
         let config = tls::server_config(identity, jackalopefs_server::transport_config()).unwrap();
         let endpoint = Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stops = Arc::new(Mutex::new(Vec::new()));
+        let connections = Arc::new(Mutex::new(Vec::new()));
         let accept_endpoint = endpoint.clone();
         let seen = requests.clone();
         let seen_stops = stops.clone();
+        let accepted = connections.clone();
+        let hellos = Arc::new(hellos);
         tokio::spawn(async move {
+            let mut count = 0usize;
             while let Some(incoming) = accept_endpoint.accept().await {
                 let seen = seen.clone();
                 let seen_stops = seen_stops.clone();
                 let canned = canned.clone();
+                let reply = hellos[count.min(hellos.len() - 1)].clone();
+                count += 1;
+                let accepted = accepted.clone();
                 tokio::spawn(async move {
                     let conn = incoming.await.unwrap();
+                    accepted.lock().push(conn.clone());
                     let (mut send, mut recv) = conn.accept_bi().await.unwrap();
                     let _hello: Hello = read_frame(&mut recv).await.unwrap();
-                    write_frame(
-                        &mut send,
-                        &HelloReply::Ack {
-                            session_id: 1,
-                            resume_token: [0; 16],
-                            resumed: false,
-                        },
-                    )
-                    .await
-                    .unwrap();
+                    let refused = !matches!(reply, HelloReply::Ack { .. });
+                    write_frame(&mut send, &reply).await.unwrap();
                     send.finish().unwrap();
+                    if refused {
+                        // As the real server does: let the client read the reply, then close.
+                        if tokio::time::timeout(Duration::from_secs(2), send.stopped())
+                            .await
+                            .is_err()
+                        {
+                            eprintln!("blackhole: the client did not read the refusal in time");
+                        }
+                        conn.close(session::close_code::HANDSHAKE.into(), b"refused");
+                        return;
+                    }
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let seen = seen.clone();
                         let seen_stops = seen_stops.clone();
@@ -183,6 +212,7 @@ impl Blackhole {
             addr: endpoint.local_addr().unwrap(),
             fingerprint,
             requests,
+            connections,
             stops,
             endpoint,
         }
