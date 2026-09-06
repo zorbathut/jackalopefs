@@ -10,7 +10,7 @@ pub mod mount;
 pub mod transport;
 
 pub use client::{Client, Config, Error};
-pub use conn::{ConnState, ErrorConnect};
+pub use conn::{ConnState, ErrorConnect, ErrorConnectKind};
 pub use transport::ServerTrust;
 
 use std::time::Duration;

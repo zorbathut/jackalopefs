@@ -60,8 +60,16 @@ pub struct ConnManager {
     endpoint: Endpoint,
 }
 
+/// A failed connection attempt, naming the address it was made to.
 #[derive(Debug, thiserror::Error)]
-pub enum ErrorConnect {
+#[error("{addr}: {kind}")]
+pub struct ErrorConnect {
+    pub addr: SocketAddr,
+    pub kind: ErrorConnectKind,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ErrorConnectKind {
     #[error("connect: {0}")]
     Connect(#[from] quinn::ConnectError),
     #[error("connection: {0}")]
@@ -74,6 +82,12 @@ pub enum ErrorConnect {
     Revision { client: u64, server: u64 },
     #[error("timed out")]
     Timeout,
+}
+
+impl ErrorConnectKind {
+    fn at(self, addr: SocketAddr) -> ErrorConnect {
+        ErrorConnect { addr, kind: self }
+    }
 }
 
 impl ConnManager {
@@ -172,7 +186,7 @@ async fn run(
             break;
         }
         let attempt = tokio::select! {
-            attempt = timeout(cfg.connect_timeout, connect_once(&endpoint, &cfg, resume)) => attempt.unwrap_or(Err(ErrorConnect::Timeout)),
+            attempt = timeout(cfg.connect_timeout, connect_once(&endpoint, &cfg, resume)) => attempt.unwrap_or(Err(ErrorConnectKind::Timeout)).map_err(|kind| kind.at(cfg.server_addr)),
             _ = stop.changed() => break,
         };
         let attached = match attempt {
@@ -186,18 +200,10 @@ async fn run(
                 }
                 failures += 1;
                 // A revision mismatch is refused every time until one side is rebuilt; retrying still lets a server rollback recover the mount, and every refusal is logged so the reason is never far up the log.
-                if matches!(e, ErrorConnect::Revision { .. }) {
-                    tracing::error!(
-                        failures,
-                        "reconnect to {} refused: {e}; retrying in {backoff:?}",
-                        cfg.server_addr
-                    );
+                if matches!(e.kind, ErrorConnectKind::Revision { .. }) {
+                    tracing::error!(failures, "reconnect refused: {e}; retrying in {backoff:?}");
                 } else if failures == 1 || failures.is_power_of_two() {
-                    tracing::warn!(
-                        failures,
-                        "reconnect to {} failed: {e}; retrying in {backoff:?}",
-                        cfg.server_addr
-                    );
+                    tracing::warn!(failures, "reconnect failed: {e}; retrying in {backoff:?}");
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
@@ -275,7 +281,7 @@ async fn connect_once(
     endpoint: &Endpoint,
     cfg: &ConfigConn,
     resume: Option<Resume>,
-) -> Result<Handshaken, ErrorConnect> {
+) -> Result<Handshaken, ErrorConnectKind> {
     let conn = endpoint.connect(cfg.server_addr, &cfg.server_name)?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(
@@ -303,11 +309,11 @@ async fn connect_once(
         }),
         HelloReply::Reject { reason } => {
             conn.close(close_code::UNMOUNT.into(), b"rejected");
-            Err(ErrorConnect::Rejected(reason))
+            Err(ErrorConnectKind::Rejected(reason))
         }
         HelloReply::RevisionMismatch { revision } => {
             conn.close(close_code::UNMOUNT.into(), b"revision mismatch");
-            Err(ErrorConnect::Revision {
+            Err(ErrorConnectKind::Revision {
                 client: PROTO_REVISION,
                 server: revision,
             })

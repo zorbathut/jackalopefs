@@ -94,7 +94,9 @@ fn main() -> anyhow::Result<()> {
             "protocol revision {:016x}",
             jackalopefs_proto::PROTO_REVISION
         );
-        let client = Client::connect(config).await.context("connecting")?;
+        let client = Client::connect(config)
+            .await
+            .with_context(|| format!("connecting to {}", args.server))?;
         let mount = Mount::start(
             client,
             &args.mountpoint,

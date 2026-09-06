@@ -1,12 +1,13 @@
 mod common;
 
 use common::*;
-use jackalopefs_client::{ConnState, Error, ErrorConnect, ServerTrust};
+use jackalopefs_client::{ConnState, Error, ErrorConnect, ErrorConnectKind, ServerTrust};
 use jackalopefs_proto::{
     Auth, Hello, HelloReply, Path, Request, SetAttr, TimeOrNow, TimeSpec, PROTO_REVISION,
 };
 use std::collections::BTreeSet;
 use std::fs;
+use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, Instant};
 
@@ -616,6 +617,25 @@ async fn unmount_interrupts_a_connect_attempt() {
     );
 }
 
+/// A loopback address nothing will ever answer on. The socket stays bound for the caller's lifetime: freeing the port would let a concurrently starting test be handed it and complete a handshake there.
+fn dead_address() -> (std::net::UdpSocket, SocketAddr) {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let addr = socket.local_addr().unwrap();
+    (socket, addr)
+}
+
+#[tokio::test]
+async fn a_failed_connection_names_the_address() {
+    let (_dead_socket, dead) = dead_address();
+    let mut config = config_for(dead, [0u8; 32], Auth::Anonymous, Duration::from_secs(5));
+    config.connect_timeout = Duration::from_millis(300);
+    let err = jackalopefs_client::Client::connect(config)
+        .await
+        .err()
+        .expect("nothing answers there");
+    assert!(format!("{err:#}").contains(&dead.to_string()), "{err:#}");
+}
+
 #[tokio::test]
 async fn server_refuses_a_foreign_revision() {
     let export = tempfile::tempdir().unwrap();
@@ -690,8 +710,8 @@ async fn client_refuses_a_foreign_revision() {
         .await
         .err()
         .expect("a foreign revision must refuse the first connection");
-    match err.downcast_ref::<ErrorConnect>() {
-        Some(ErrorConnect::Revision { client, server }) => {
+    match err.downcast_ref::<ErrorConnect>().map(|e| &e.kind) {
+        Some(ErrorConnectKind::Revision { client, server }) => {
             assert_eq!((*client, *server), (PROTO_REVISION, PROTO_REVISION ^ 1));
         }
         other => panic!("{other:?}: {err}"),
