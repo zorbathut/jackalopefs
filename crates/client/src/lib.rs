@@ -3,6 +3,7 @@
 pub mod client;
 pub mod conn;
 pub mod handles;
+pub mod inodes;
 pub mod transport;
 
 pub use client::{Client, Config, Error};
