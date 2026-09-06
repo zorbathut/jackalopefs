@@ -5,6 +5,7 @@
 pub mod dirents;
 pub mod export;
 pub mod handles;
+pub mod ops;
 pub mod watch;
 
 use std::sync::Arc;
