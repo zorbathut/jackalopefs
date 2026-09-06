@@ -5,6 +5,7 @@
 pub mod dirents;
 pub mod export;
 pub mod handles;
+pub mod watch;
 
 use std::sync::Arc;
 use std::time::Duration;
