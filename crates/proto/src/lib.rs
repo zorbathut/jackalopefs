@@ -2,6 +2,7 @@
 //!
 //! Every frame is one single-segment Cap'n Proto message prefixed by a little-endian `u32` length (see [`codec`]). Names and paths are validated as they are parsed, so a server never sees a path component it must not trust.
 
+pub mod codec;
 pub mod msg;
 pub mod types;
 pub mod wire;
@@ -11,6 +12,7 @@ pub mod wire;
 #[allow(clippy::all, dead_code, unused_imports, unused_qualifications)]
 pub(crate) mod jackalopefs_capnp { include!(concat!(env!("OUT_DIR"), "/jackalopefs_capnp.rs")); }
 
+pub use codec::{decode, encode, read_frame, write_frame, ErrorCodec, MAX_FRAME, MAX_IO};
 pub use msg::*;
 pub use types::*;
 pub use wire::{dir_entry_bytes, ErrorDecode, Message};
