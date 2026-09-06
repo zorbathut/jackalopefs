@@ -4,7 +4,9 @@ use crate::dirents::{read_dir_fd, Listing};
 use crate::export::{kind_from_mode, proc_path, Export};
 use crate::handles::{Handle, Handles};
 use crate::watch::ChangeLog;
-use jackalopefs_proto::{Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, MAX_IO};
+use jackalopefs_proto::{
+    Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, MAX_IO, NAME_MAX,
+};
 use nix::errno::Errno;
 use nix::fcntl::{renameat2, AtFlags, OFlag, RenameFlags, AT_FDCWD};
 use nix::sys::stat::{
@@ -577,7 +579,8 @@ fn statfs<F: AsFd>(fd: &F) -> Result<Statfs, Errno> {
         files: st.f_files,
         ffree: st.f_ffree,
         bsize: st.f_bsize as u32,
-        namelen: st.f_namelen as u32,
+        // pathconf(_PC_NAME_MAX) is answered from this, and the protocol refuses names longer than NAME_MAX whatever the export allows.
+        namelen: (st.f_namelen as u32).min(NAME_MAX as u32),
         frsize: st.f_frsize as u32,
     })
 }
@@ -1126,7 +1129,9 @@ mod tests {
             );
         }
         match dispatch(&ops, Request::Statfs { path: Path::root() }) {
-            Response::Statfs(s) => assert!(s.blocks > 0 && s.bsize > 0 && s.namelen > 0),
+            Response::Statfs(s) => assert!(
+                s.blocks > 0 && s.bsize > 0 && s.namelen > 0 && s.namelen <= NAME_MAX as u32
+            ),
             other => panic!("{other:?}"),
         }
         assert_eq!(
