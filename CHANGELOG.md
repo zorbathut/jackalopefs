@@ -8,6 +8,7 @@
 - `jackalopefs-server`: exports one directory over QUIC as an unprivileged user. Paths are resolved with `openat2` confined to the export; sessions survive a dropped connection for 60 s so a reconnecting client keeps its open files; a recursive inotify watch pushes debounced change events to clients without echoing a client's own changes; optional `--token` authentication; a persistent self-signed certificate whose fingerprint is logged at startup; per-session handle and detached-session caps, non-blocking opens, and deadlines on every request read and reply write so no client can park a server thread or pin memory.
 - `jackalopefs-client`: a FUSE mount that never blocks the FUSE session thread on the network. Every operation has a deadline (`--op-timeout`, `ETIMEDOUT` on expiry); the connection is re-established with backoff and the session resumed or handles reopened and verified (`ESTALE` on mismatch); server events invalidate the kernel's entry and data caches; hardlinks share `st_ino` and `st_ino` is stable; readdir uses real directory cookies; `--fingerprint` pins the server certificate, `--insecure` skips it.
 - Documentation: `docs/design.md` (protocol, architecture, timeouts, limitations) and `docs/research-fusex.md` (the research notes behind the design).
+- `jackalopefs-client --default-permissions`: the kernel enforces mode bits against the reported attributes, which a mount shared through `--allow-other` needs to enforce anything; the client warns when `--allow-other` is given without it.
 
 ### Fixed
 

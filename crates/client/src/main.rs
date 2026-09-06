@@ -43,6 +43,9 @@ struct Args {
     /// Unmount automatically if this process dies; requires --allow-other.
     #[arg(long, requires = "allow_other")]
     auto_unmount: bool,
+    /// Have the kernel enforce mode bits against the attributes the server reports. Without it every request is forwarded and only the server's own access rights apply, so a mount shared through --allow-other enforces nothing.
+    #[arg(long)]
+    default_permissions: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -53,6 +56,9 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if args.allow_other && !args.default_permissions {
+        tracing::warn!("--allow-other without --default-permissions: every local user gets the server user's access to the export");
+    }
     let trust = match (&args.fingerprint, args.insecure) {
         (Some(fp), _) => ServerTrust::Fingerprint(
             jackalopefs_proto::parse_fingerprint(fp).context("--fingerprint")?,
@@ -94,6 +100,7 @@ fn main() -> anyhow::Result<()> {
                 attr_ttl: args.attr_timeout,
                 allow_other: args.allow_other,
                 auto_unmount: args.auto_unmount,
+                default_permissions: args.default_permissions,
             },
         )
         .await?;

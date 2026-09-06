@@ -53,6 +53,7 @@ impl Mounted {
                 attr_ttl: ttl,
                 allow_other: false,
                 auto_unmount: false,
+                default_permissions: false,
             },
         )
         .await

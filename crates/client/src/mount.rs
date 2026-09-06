@@ -17,6 +17,8 @@ pub struct MountOptions {
     pub allow_other: bool,
     /// Ask fusermount to clean up the mount point if this process dies; needs `allow_other`.
     pub auto_unmount: bool,
+    /// Have the kernel enforce mode bits against the reported attributes before forwarding a request; the server checks only its own access, so a mount other users share needs this to enforce anything.
+    pub default_permissions: bool,
 }
 
 /// A live mount. [`Mount::unmount`] is the orderly way down; dropping one unmounts too, blocking the dropping thread while it does, and is meant for panic paths.
@@ -56,6 +58,9 @@ impl Mount {
         };
         if options.auto_unmount {
             config.mount_options.push(MountOption::AutoUnmount);
+        }
+        if options.default_permissions {
+            config.mount_options.push(MountOption::DefaultPermissions);
         }
         let mountpoint = mountpoint.to_path_buf();
         let session = tokio::task::spawn_blocking(move || {
