@@ -1,7 +1,12 @@
 //! jackalopefs client: a reconnecting QUIC session to one server, a typed request API with a deadline on every call, and (in [`mount`]) the FUSE backend that presents it as a filesystem.
 
+pub mod client;
+pub mod conn;
+pub mod handles;
 pub mod transport;
 
+pub use client::{Client, Config, Error};
+pub use conn::ConnState;
 pub use transport::ServerTrust;
 
 use std::time::Duration;
