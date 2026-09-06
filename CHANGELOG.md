@@ -9,6 +9,7 @@
 - `jackalopefs-client`: a FUSE mount that never blocks the FUSE session thread on the network. Every operation has a deadline (`--op-timeout`, `ETIMEDOUT` on expiry); the connection is re-established with backoff and the session resumed or handles reopened and verified (`ESTALE` on mismatch); server events invalidate the kernel's entry and data caches; hardlinks share `st_ino` and `st_ino` is stable; readdir uses real directory cookies; `--fingerprint` pins the server certificate, `--insecure` skips it.
 - Documentation: `docs/design.md` (protocol, architecture, timeouts, limitations) and `docs/research-fusex.md` (the research notes behind the design).
 - `jackalopefs-client --default-permissions`: the kernel enforces mode bits against the reported attributes, which a mount shared through `--allow-other` needs to enforce anything; the client warns when `--allow-other` is given without it.
+- `scripts/validate/`: repeatable validation runs against a fresh server and mount: pjdfstest (POSIX conformance, with a checked-in expected-failure baseline per mode), xfstests' fsx and fsstress, fio with verification, plus resilience (server stopped, killed and restarted under load) and coherence (two mounts of one export) checks of our own; a rootless podman image for the root-only parts. `docs/validation.md` explains the runs and the baseline.
 
 ### Fixed
 

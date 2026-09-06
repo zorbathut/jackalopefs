@@ -1,0 +1,230 @@
+# Expected failures of scripts/validate/pjdfstest.sh in user mode: one line per check, `dir/file.t:N` followed by the detail from the log with the values that vary between runs normalised (NAME, INODE_A and so on, SERVER_UID, SERVER_GID; see tap.sh). Every entry sits under the reason that explains it; regressions are anything failing that is not listed here.
+# The candidate list after a run is validation/results/pjdfstest/failed.txt; an entry with no reason is a bug to report, not a line to add. The reasons were attributed with scripts/validate/pjdfstest-nodev.sh (docs/validation.md): a failure that vanishes, or changes, when devices are replaced by regular files is a device cascade; one that persists has another cause.
+
+# The server refuses block and character device nodes (S_IFBLK, S_IFCHR) with EPERM whatever its privilege. Each refused mknod is one failure, and the checks that then expect the device to exist cascade: ENOENT where the device should be; an EEXIST, ENOTDIR or ENOTEMPTY not raised because nothing or a directory is there; a rename or open denial in a sticky or read-only directory not raised because the target that should have been a device is missing, so only the directory permission is checked; the lstat that then finds the object at the wrong name; and the cleanup that follows. (214 checks)
+chmod/01.t:10 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chmod/01.t:11 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+chmod/01.t:12 tried 'chmod NAME/NAME/test 0644', expected ENOTDIR, got ENOENT
+chmod/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chmod/01.t:8 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+chmod/01.t:9 tried 'chmod NAME/NAME/test 0644', expected ENOTDIR, got ENOENT
+chown/01.t:10 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+chown/01.t:11 tried 'chown NAME/NAME/test 65534 65534', expected ENOTDIR, got ENOENT
+chown/01.t:12 tried 'lchown NAME/NAME/test 65534 65534', expected ENOTDIR, got ENOENT
+chown/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chown/01.t:14 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+chown/01.t:15 tried 'chown NAME/NAME/test 65534 65534', expected ENOTDIR, got ENOENT
+chown/01.t:16 tried 'lchown NAME/NAME/test 65534 65534', expected ENOTDIR, got ENOENT
+chown/01.t:17 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/01.t:14 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+link/01.t:15 tried 'link NAME/NAME/test NAME/NAME', expected ENOTDIR, got ENOENT
+link/01.t:16 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+link/01.t:17 tried 'link NAME/NAME NAME/NAME/test', expected ENOTDIR, got ENOENT
+link/01.t:18 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/01.t:19 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/01.t:20 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+link/01.t:21 tried 'link NAME/NAME/test NAME/NAME', expected ENOTDIR, got ENOENT
+link/01.t:22 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+link/01.t:23 tried 'link NAME/NAME NAME/NAME/test', expected ENOTDIR, got ENOENT
+link/01.t:24 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/01.t:25 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/10.t:11 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+link/10.t:12 tried 'link NAME NAME', expected EEXIST, got 0
+link/10.t:14 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+link/10.t:15 tried 'link NAME NAME', expected EEXIST, got 0
+mkdir/01.t:10 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mkdir/01.t:11 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+mkdir/01.t:12 tried 'mkdir NAME/NAME/test 0755', expected ENOTDIR, got ENOENT
+mkdir/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mkdir/01.t:8 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+mkdir/01.t:9 tried 'mkdir NAME/NAME/test 0755', expected ENOTDIR, got ENOENT
+mkdir/10.t:10 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mkdir/10.t:11 tried 'mkdir NAME 0755', expected EEXIST, got 0
+mkdir/10.t:12 tried 'unlink NAME', expected 0, got EISDIR
+mkdir/10.t:13 tried 'mknod NAME c 0644 1 2', expected 0, got EEXIST
+mkdir/10.t:15 tried 'unlink NAME', expected 0, got EISDIR
+mkdir/10.t:16 tried 'bind NAME', expected 0, got EADDRINUSE
+mkdir/10.t:18 tried 'unlink NAME', expected 0, got EISDIR
+mkdir/10.t:19 tried 'symlink test NAME', expected 0, got EEXIST
+mkdir/10.t:21 tried 'unlink NAME', expected 0, got EISDIR
+mkfifo/01.t:10 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mkfifo/01.t:11 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+mkfifo/01.t:12 tried 'mkfifo NAME/NAME/test 0644', expected ENOTDIR, got ENOENT
+mkfifo/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mkfifo/01.t:8 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+mkfifo/01.t:9 tried 'mkfifo NAME/NAME/test 0644', expected ENOTDIR, got ENOENT
+mkfifo/09.t:10 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mkfifo/09.t:11 tried 'mkfifo NAME 0644', expected EEXIST, got 0
+mkfifo/09.t:13 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+mkfifo/09.t:14 tried 'mkfifo NAME 0644', expected EEXIST, got 0
+mknod/01.t:12 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+mknod/01.t:13 tried 'mknod NAME/NAME/test b 0644 1 2', expected ENOTDIR, got ENOENT
+mknod/01.t:14 tried 'mknod NAME/NAME/test c 0644 1 2', expected ENOTDIR, got ENOENT
+mknod/01.t:15 tried 'mknod NAME/NAME/test f 0644 0 0', expected ENOTDIR, got ENOENT
+mknod/01.t:16 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mknod/01.t:17 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+mknod/01.t:18 tried 'mknod NAME/NAME/test b 0644 1 2', expected ENOTDIR, got ENOENT
+mknod/01.t:19 tried 'mknod NAME/NAME/test c 0644 1 2', expected ENOTDIR, got ENOENT
+mknod/01.t:20 tried 'mknod NAME/NAME/test f 0644 0 0', expected ENOTDIR, got ENOENT
+mknod/01.t:21 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mknod/02.t:10 tried 'stat NAME type,mode', expected char,0644, got ENOENT
+mknod/02.t:11 tried 'unlink NAME', expected 0, got ENOENT
+mknod/02.t:5 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mknod/02.t:6 tried 'stat NAME type,mode', expected block,0644, got ENOENT
+mknod/02.t:7 tried 'unlink NAME', expected 0, got ENOENT
+mknod/02.t:9 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+mknod/03.t:10 tried 'stat NAME type', expected char, got ENOENT
+mknod/03.t:11 tried 'unlink NAME', expected 0, got ENOENT
+mknod/03.t:5 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mknod/03.t:6 tried 'stat NAME type', expected block, got ENOENT
+mknod/03.t:7 tried 'unlink NAME', expected 0, got ENOENT
+mknod/03.t:9 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+mknod/08.t:16 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mknod/08.t:17 tried 'mknod NAME b 0644 0 0', expected EEXIST, got EPERM
+mknod/08.t:18 tried 'mknod NAME c 0644 0 0', expected EEXIST, got EPERM
+mknod/08.t:19 tried 'mknod NAME f 0644 0 0', expected EEXIST, got 0
+mknod/08.t:21 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+mknod/08.t:22 tried 'mknod NAME b 0644 0 0', expected EEXIST, got EPERM
+mknod/08.t:23 tried 'mknod NAME c 0644 0 0', expected EEXIST, got EPERM
+mknod/08.t:24 tried 'mknod NAME f 0644 0 0', expected EEXIST, got 0
+mknod/11.t:10
+mknod/11.t:11
+mknod/11.t:12
+mknod/11.t:13
+mknod/11.t:14 tried 'unlink NAME', expected 0, got ENOENT
+mknod/11.t:15 tried 'mknod NAME b 0755 1 2', expected 0, got EPERM
+mknod/11.t:16 tried 'lstat NAME type,mode', expected block,0755, got ENOENT
+mknod/11.t:17 tried 'lstat NAME major,minor', expected 1,2, got ENOENT
+mknod/11.t:18 tried 'mknod NAME b 0777 3 4', expected EEXIST, got EPERM
+mknod/11.t:19 tried 'unlink NAME', expected 0, got ENOENT
+mknod/11.t:2 tried 'mknod NAME c 0755 1 2', expected 0, got EPERM
+mknod/11.t:21 tried 'mknod NAME b 0755 1 2', expected 0, got EPERM
+mknod/11.t:22
+mknod/11.t:23
+mknod/11.t:24
+mknod/11.t:25
+mknod/11.t:26
+mknod/11.t:27 tried 'unlink NAME', expected 0, got ENOENT
+mknod/11.t:3 tried 'lstat NAME type,mode', expected char,0755, got ENOENT
+mknod/11.t:4 tried 'lstat NAME major,minor', expected 1,2, got ENOENT
+mknod/11.t:5 tried 'mknod NAME c 0777 3 4', expected EEXIST, got EPERM
+mknod/11.t:6 tried 'unlink NAME', expected 0, got ENOENT
+mknod/11.t:8 tried 'mknod NAME c 0755 1 2', expected 0, got EPERM
+mknod/11.t:9
+open/01.t:10 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+open/01.t:11 tried 'open NAME/NAME/test O_RDONLY', expected ENOTDIR, got ENOENT
+open/01.t:12 tried 'open NAME/NAME/test O_CREAT 0644', expected ENOTDIR, got ENOENT
+open/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+open/01.t:14 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+open/01.t:15 tried 'open NAME/NAME/test O_RDONLY', expected ENOTDIR, got ENOENT
+open/01.t:16 tried 'open NAME/NAME/test O_CREAT 0644', expected ENOTDIR, got ENOENT
+open/01.t:17 tried 'unlink NAME/NAME', expected 0, got ENOENT
+open/22.t:10 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+open/22.t:11 tried 'open NAME O_CREAT,O_EXCL 0644', expected EEXIST, got 0
+open/22.t:13 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+open/22.t:14 tried 'open NAME O_CREAT,O_EXCL 0644', expected EEXIST, got 0
+rename/12.t:14 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/12.t:15 tried 'rename NAME/NAME/test NAME/NAME', expected ENOTDIR, got ENOENT
+rename/12.t:16 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/12.t:17 tried 'link NAME/NAME NAME/NAME/test', expected ENOTDIR, got ENOENT
+rename/12.t:18 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/12.t:19 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/12.t:20 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/12.t:21 tried 'rename NAME/NAME/test NAME/NAME', expected ENOTDIR, got ENOENT
+rename/12.t:22 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/12.t:23 tried 'link NAME/NAME NAME/NAME/test', expected ENOTDIR, got ENOENT
+rename/12.t:24 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/12.t:25 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/13.t:12 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/13.t:13 tried 'rename NAME NAME', expected ENOTDIR, got 0
+rename/13.t:14 tried 'lstat NAME type', expected dir, got ENOENT
+rename/13.t:15 tried 'lstat NAME type', expected block, got dir
+rename/13.t:16 tried 'unlink NAME', expected 0, got EISDIR
+rename/13.t:17 tried 'mknod NAME c 0644 1 2', expected 0, got EEXIST
+rename/13.t:18 tried 'rename NAME NAME', expected ENOTDIR, got ENOENT
+rename/13.t:19 tried 'lstat NAME type', expected dir, got ENOENT
+rename/13.t:20 tried 'lstat NAME type', expected char, got dir
+rename/13.t:21 tried 'unlink NAME', expected 0, got EISDIR
+rename/13.t:22 tried 'bind NAME', expected 0, got EADDRINUSE
+rename/13.t:23 tried 'rename NAME NAME', expected ENOTDIR, got ENOENT
+rename/13.t:24 tried 'lstat NAME type', expected dir, got ENOENT
+rename/13.t:25 tried 'lstat NAME type', expected socket, got dir
+rename/13.t:26 tried 'unlink NAME', expected 0, got EISDIR
+rename/13.t:27 tried 'symlink test NAME', expected 0, got EEXIST
+rename/13.t:28 tried 'rename NAME NAME', expected ENOTDIR, got ENOENT
+rename/13.t:29 tried 'lstat NAME type', expected dir, got ENOENT
+rename/13.t:30 tried 'lstat NAME type', expected symlink, got dir
+rename/13.t:31 tried 'unlink NAME', expected 0, got EISDIR
+rename/13.t:32 tried 'rmdir NAME', expected 0, got ENOENT
+rename/14.t:12 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/14.t:13 tried 'rename NAME NAME', expected EISDIR, got ENOENT
+rename/14.t:15 tried 'lstat NAME type', expected block, got ENOENT
+rename/14.t:16 tried 'unlink NAME', expected 0, got ENOENT
+rename/14.t:17 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+rename/14.t:18 tried 'rename NAME NAME', expected EISDIR, got ENOENT
+rename/14.t:20 tried 'lstat NAME type', expected char, got ENOENT
+rename/14.t:21 tried 'unlink NAME', expected 0, got ENOENT
+rename/20.t:12 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/20.t:13 tried 'rename NAME NAME', expected EEXIST|ENOTEMPTY, got 0
+rename/20.t:14 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/20.t:15 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/20.t:16 tried 'rename NAME NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rename/20.t:17 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/20.t:19 tried 'rename NAME NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rename/20.t:22 tried 'rename NAME NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rename/20.t:25 tried 'rmdir NAME', expected 0, got ENOENT
+rename/23.t:18 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/23.t:19 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/23.t:20 tried 'link NAME NAME', expected 0, got ENOENT
+rename/23.t:21 tried 'rename NAME NAME', expected 0, got ENOENT
+rename/23.t:22 tried 'lstat NAME type,nlink', expected block,1, got ENOENT
+rename/23.t:23
+rename/23.t:24 tried 'unlink NAME', expected 0, got ENOENT
+rename/23.t:25 tried 'unlink NAME', expected 0, got ENOENT
+rename/23.t:26 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+rename/23.t:27 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+rename/23.t:28 tried 'link NAME NAME', expected 0, got ENOENT
+rename/23.t:29 tried 'rename NAME NAME', expected 0, got ENOENT
+rename/23.t:30 tried 'lstat NAME type,nlink', expected char,1, got ENOENT
+rename/23.t:31
+rename/23.t:32 tried 'unlink NAME', expected 0, got ENOENT
+rename/23.t:33 tried 'unlink NAME', expected 0, got ENOENT
+rmdir/06.t:11 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rmdir/06.t:12 tried 'rmdir NAME', expected EEXIST|ENOTEMPTY, got 0
+rmdir/06.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:14 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got ENOENT
+rmdir/06.t:15 tried 'rmdir NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rmdir/06.t:16 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:17 tried 'bind NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:18 tried 'rmdir NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rmdir/06.t:19 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:20 tried 'symlink test NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:21 tried 'rmdir NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rmdir/06.t:22 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:23 tried 'rmdir NAME', expected 0, got ENOENT
+symlink/08.t:10 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+symlink/08.t:11 tried 'symlink test NAME', expected EEXIST, got 0
+symlink/08.t:13 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+symlink/08.t:14 tried 'symlink test NAME', expected EEXIST, got 0
+utimensat/00.t:17 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+utimensat/00.t:18 tried 'open . O_RDONLY : utimensat 0 NAME 1900000000 0 1950000000 0 0', expected 0, got ENOENT
+utimensat/00.t:19 tried 'lstat NAME atime', expected 1900000000, got ENOENT
+utimensat/00.t:20 tried 'lstat NAME mtime', expected 1950000000, got ENOENT
+utimensat/00.t:21 tried 'unlink NAME', expected 0, got ENOENT
+utimensat/00.t:22 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+utimensat/00.t:23 tried 'open . O_RDONLY : utimensat 0 NAME 1900000000 0 1950000000 0 0', expected 0, got ENOENT
+utimensat/00.t:24 tried 'lstat NAME atime', expected 1900000000, got ENOENT
+utimensat/00.t:25 tried 'lstat NAME mtime', expected 1950000000, got ENOENT
+utimensat/00.t:26 tried 'unlink NAME', expected 0, got ENOENT
+
+# Chown to a uid or gid other than the server's own needs CAP_CHOWN, which the unprivileged server does not have: EPERM, and the stat that expected the new owner sees the server's identity. (10 checks)
+chown/02.t:2 tried 'chown NAME 65534 65534', expected 0, got EPERM
+chown/02.t:3 tried 'stat NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+chown/02.t:7 tried 'lchown NAME 65534 65534', expected 0, got EPERM
+chown/02.t:8 tried 'stat NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+chown/03.t:2 tried 'chown NAME 65534 65534', expected 0, got EPERM
+chown/03.t:3 tried 'stat NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+chown/03.t:7 tried 'lchown NAME 65534 65534', expected 0, got EPERM
+chown/03.t:8 tried 'stat NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+mknod/11.t:20 tried 'chown . 0 0', expected 0, got EPERM
+mknod/11.t:7 tried 'chown . 0 0', expected 0, got EPERM

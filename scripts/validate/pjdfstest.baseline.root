@@ -1,0 +1,1964 @@
+# Expected failures of scripts/validate/pjdfstest.sh in root mode: one line per check, `dir/file.t:N` followed by the detail from the log with the values that vary between runs normalised (NAME, INODE_A and so on, SERVER_UID, SERVER_GID; see tap.sh). Every entry sits under the reason that explains it; regressions are anything failing that is not listed here.
+# The candidate list after a run is validation/results/pjdfstest/failed.txt; an entry with no reason is a bug to report, not a line to add. The reasons were attributed with scripts/validate/pjdfstest-nodev.sh (docs/validation.md): a failure that vanishes, or changes, when devices are replaced by regular files is a device cascade; one that persists has another cause.
+
+# The server refuses block and character device nodes (S_IFBLK, S_IFCHR) with EPERM whatever its privilege. Each refused mknod is one failure, and the checks that then expect the device to exist cascade: ENOENT where the device should be; an EEXIST, ENOTDIR or ENOTEMPTY not raised because nothing or a directory is there; a rename or open denial in a sticky or read-only directory not raised because the target that should have been a device is missing, so only the directory permission is checked; the lstat that then finds the object at the wrong name; and the cleanup that follows. (1798 checks)
+chmod/00.t:100
+chmod/00.t:101 tried 'unlink NAME', expected 0, got ENOENT
+chmod/00.t:102 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chmod/00.t:103 tried '-u 65534 chmod NAME 0111', expected EPERM, got ENOENT
+chmod/00.t:104
+chmod/00.t:105 tried 'unlink NAME', expected 0, got ENOENT
+chmod/00.t:32 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chmod/00.t:33 tried 'chmod NAME 0111', expected 0, got ENOENT
+chmod/00.t:34 tried 'stat NAME mode', expected 0111, got ENOENT
+chmod/00.t:36 tried 'chmod NAME 0222', expected 0, got ENOENT
+chmod/00.t:37 tried 'stat NAME mode', expected 0222, got ENOENT
+chmod/00.t:38 tried 'stat NAME mode', expected 0222, got ENOENT
+chmod/00.t:41 tried 'unlink NAME', expected 0, got ENOENT
+chmod/00.t:42 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chmod/00.t:43 tried 'chmod NAME 0111', expected 0, got ENOENT
+chmod/00.t:44 tried 'stat NAME mode', expected 0111, got ENOENT
+chmod/00.t:46 tried 'chmod NAME 0222', expected 0, got ENOENT
+chmod/00.t:47 tried 'stat NAME mode', expected 0222, got ENOENT
+chmod/00.t:48 tried 'stat NAME mode', expected 0222, got ENOENT
+chmod/00.t:51 tried 'unlink NAME', expected 0, got ENOENT
+chmod/00.t:74 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chmod/00.t:75 tried 'chmod NAME 0111', expected 0, got ENOENT
+chmod/00.t:76
+chmod/00.t:77 tried 'unlink NAME', expected 0, got ENOENT
+chmod/00.t:78 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chmod/00.t:79 tried 'chmod NAME 0111', expected 0, got ENOENT
+chmod/00.t:80
+chmod/00.t:81 tried 'unlink NAME', expected 0, got ENOENT
+chmod/00.t:98 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chmod/00.t:99 tried '-u 65534 chmod NAME 0111', expected EPERM, got ENOENT
+chmod/01.t:10 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chmod/01.t:11 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+chmod/01.t:12 tried 'chmod NAME/NAME/test 0644', expected ENOTDIR, got ENOENT
+chmod/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chmod/01.t:8 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+chmod/01.t:9 tried 'chmod NAME/NAME/test 0644', expected ENOTDIR, got ENOENT
+chmod/11.t:26 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chmod/11.t:27 tried 'chmod NAME 01621', expected 0, got ENOENT
+chmod/11.t:28 tried 'stat NAME mode', expected 01621, got ENOENT
+chmod/11.t:30 tried 'chmod NAME 01700', expected 0, got ENOENT
+chmod/11.t:31 tried 'stat NAME mode', expected 01700, got ENOENT
+chmod/11.t:33 tried 'unlink NAME', expected 0, got ENOENT
+chmod/11.t:34 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chmod/11.t:35 tried 'chmod NAME 01621', expected 0, got ENOENT
+chmod/11.t:36 tried 'stat NAME mode', expected 01621, got ENOENT
+chmod/11.t:38 tried 'chmod NAME 01700', expected 0, got ENOENT
+chmod/11.t:39 tried 'stat NAME mode', expected 01700, got ENOENT
+chmod/11.t:41 tried 'unlink NAME', expected 0, got ENOENT
+chmod/11.t:79 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chmod/11.t:80 tried 'chmod NAME 0640', expected 0, got ENOENT
+chmod/11.t:81 tried 'lchown NAME 65534 65534', expected 0, got ENOENT
+chmod/11.t:83 tried '-u 65534 -g 65534 chmod NAME 01644', expected 0, got ENOENT
+chmod/11.t:84 tried 'stat NAME mode', expected 01644, got ENOENT
+chmod/11.t:85 tried '-u 65534 -g 65534 chmod NAME 01640', expected 0, got ENOENT
+chmod/11.t:86 tried 'stat NAME mode', expected 01640, got ENOENT
+chmod/11.t:88 tried 'unlink NAME', expected 0, got ENOENT
+chmod/11.t:89 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chmod/11.t:90 tried 'chmod NAME 0640', expected 0, got ENOENT
+chmod/11.t:91 tried 'lchown NAME 65534 65534', expected 0, got ENOENT
+chmod/11.t:93 tried '-u 65534 -g 65534 chmod NAME 01644', expected 0, got ENOENT
+chmod/11.t:94 tried 'stat NAME mode', expected 01644, got ENOENT
+chmod/11.t:95 tried '-u 65534 -g 65534 chmod NAME 01640', expected 0, got ENOENT
+chmod/11.t:96 tried 'stat NAME mode', expected 01640, got ENOENT
+chmod/11.t:98 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1000 tried '-u 65534 -g 65532 chown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:1001 tried 'stat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:1002
+chown/00.t:1004 tried 'chown NAME 65533 65532', expected 0, got ENOENT
+chown/00.t:1005 tried 'stat NAME uid,gid', expected 65533,65532, got ENOENT
+chown/00.t:1006
+chown/00.t:1007 tried '-u 65533 -g 65531 chown NAME 65533 65531', expected 0, got ENOENT
+chown/00.t:1008 tried 'stat NAME uid,gid', expected 65533,65531, got ENOENT
+chown/00.t:1009
+chown/00.t:1011 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1012 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:1013 tried 'lchown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:1014 tried 'lstat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:1015
+chown/00.t:1016 tried '-u 65534 -g 65532 lchown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:1017 tried 'lstat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:1018
+chown/00.t:1019 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1097 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:1098 tried '-- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:1100 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1102 tried '-- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:1104 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1106 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1107 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:1108 tried '-- lchown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:1110 tried 'lstat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1111 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1112 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:1113 tried '-- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:1115 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1117 tried '-- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:1119 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1121 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1122 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:1123 tried '-- lchown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:1125 tried 'lstat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1126 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1210 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:1211 tried '-u 65534 -- chown NAME 65534 -1', expected EPERM, got ENOENT
+chown/00.t:1212 tried '-u 65534 -g 65534 -- chown NAME -1 65534', expected EPERM, got ENOENT
+chown/00.t:1213 tried '-u 65534 -g 65534 chown NAME 65534 65534', expected EPERM, got ENOENT
+chown/00.t:1214
+chown/00.t:1215 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1217 tried '-u 65534 -- chown NAME 65534 -1', expected EPERM, got ENOENT
+chown/00.t:1218 tried '-u 65534 -g 65534 -- chown NAME -1 65534', expected EPERM, got ENOENT
+chown/00.t:1219 tried '-u 65534 -g 65534 chown NAME 65534 65534', expected EPERM, got ENOENT
+chown/00.t:1220
+chown/00.t:1221 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1223 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1224 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:1225 tried '-u 65534 -- lchown NAME 65534 -1', expected EPERM, got ENOENT
+chown/00.t:1226 tried '-u 65534 -g 65534 -- lchown NAME -1 65534', expected EPERM, got ENOENT
+chown/00.t:1227 tried '-u 65534 -g 65534 lchown NAME 65534 65534', expected EPERM, got ENOENT
+chown/00.t:1228
+chown/00.t:1229 tried 'lstat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1230 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1231 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:1232 tried '-u 65534 -- chown NAME 65534 -1', expected EPERM, got ENOENT
+chown/00.t:1233 tried '-u 65534 -g 65534 -- chown NAME -1 65534', expected EPERM, got ENOENT
+chown/00.t:1234 tried '-u 65534 -g 65534 chown NAME 65534 65534', expected EPERM, got ENOENT
+chown/00.t:1235
+chown/00.t:1236 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1238 tried '-u 65534 -- chown NAME 65534 -1', expected EPERM, got ENOENT
+chown/00.t:1239 tried '-u 65534 -g 65534 -- chown NAME -1 65534', expected EPERM, got ENOENT
+chown/00.t:1240 tried '-u 65534 -g 65534 chown NAME 65534 65534', expected EPERM, got ENOENT
+chown/00.t:1241
+chown/00.t:1242 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1244 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:1245 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:1246 tried '-u 65534 -- lchown NAME 65534 -1', expected EPERM, got ENOENT
+chown/00.t:1247 tried '-u 65534 -g 65534 -- lchown NAME -1 65534', expected EPERM, got ENOENT
+chown/00.t:1248 tried '-u 65534 -g 65534 lchown NAME 65534 65534', expected EPERM, got ENOENT
+chown/00.t:1249
+chown/00.t:1250 tried 'lstat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:1251 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:192 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:193 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:194 tried 'lstat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:195 tried '-u 65534 -g 65532,65531 -- chown NAME -1 65532', expected 0, got ENOENT
+chown/00.t:196 tried 'lstat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:197 tried '-u 65534 -g 65532,65531 chown NAME 65534 65531', expected 0, got ENOENT
+chown/00.t:198 tried 'lstat NAME uid,gid', expected 65534,65531, got ENOENT
+chown/00.t:200 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:201 tried 'stat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:202 tried 'stat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:204 tried '-u 65534 -g 65532,65531 -- chown NAME -1 65532', expected 0, got ENOENT
+chown/00.t:205 tried 'stat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:206 tried 'stat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:208 tried '-u 65534 -g 65532,65531 chown NAME 65534 65531', expected 0, got ENOENT
+chown/00.t:209 tried 'stat NAME uid,gid', expected 65534,65531, got ENOENT
+chown/00.t:210 tried 'stat NAME uid,gid', expected 65534,65531, got ENOENT
+chown/00.t:213 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:214 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:215 tried 'lchown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:216 tried 'lstat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:217 tried '-u 65534 -g 65532,65531 -- lchown NAME -1 65532', expected 0, got ENOENT
+chown/00.t:218 tried 'lstat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:219 tried '-u 65534 -g 65532,65531 lchown NAME 65534 65531', expected 0, got ENOENT
+chown/00.t:220 tried 'lstat NAME uid,gid', expected 65534,65531, got ENOENT
+chown/00.t:221 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:222 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:223 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:224 tried 'lstat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:225 tried '-u 65534 -g 65532,65531 -- chown NAME -1 65532', expected 0, got ENOENT
+chown/00.t:226 tried 'lstat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:227 tried '-u 65534 -g 65532,65531 chown NAME 65534 65531', expected 0, got ENOENT
+chown/00.t:228 tried 'lstat NAME uid,gid', expected 65534,65531, got ENOENT
+chown/00.t:230 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:231 tried 'stat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:232 tried 'stat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:234 tried '-u 65534 -g 65532,65531 -- chown NAME -1 65532', expected 0, got ENOENT
+chown/00.t:235 tried 'stat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:236 tried 'stat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:238 tried '-u 65534 -g 65532,65531 chown NAME 65534 65531', expected 0, got ENOENT
+chown/00.t:239 tried 'stat NAME uid,gid', expected 65534,65531, got ENOENT
+chown/00.t:240 tried 'stat NAME uid,gid', expected 65534,65531, got ENOENT
+chown/00.t:243 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:244 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:245 tried 'lchown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:246 tried 'lstat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:247 tried '-u 65534 -g 65532,65531 -- lchown NAME -1 65532', expected 0, got ENOENT
+chown/00.t:248 tried 'lstat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:249 tried '-u 65534 -g 65532,65531 lchown NAME 65534 65531', expected 0, got ENOENT
+chown/00.t:250 tried 'lstat NAME uid,gid', expected 65534,65531, got ENOENT
+chown/00.t:251 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:329 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:330 tried '-u 65534 -g 65534 -- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:331 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:333 tried '-u 65534 -g 65534 -- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:334 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:337 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:338 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:339 tried '-u 65534 -g 65534 -- lchown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:340 tried 'lstat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:341 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:342 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:343 tried '-u 65534 -g 65534 -- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:344 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:346 tried '-u 65534 -g 65534 -- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:347 tried 'stat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:350 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:351 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:352 tried '-u 65534 -g 65534 -- lchown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:353 tried 'lstat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:354 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:483 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:484 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:485 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:486 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:487 tried 'chown NAME 65532 65531', expected 0, got ENOENT
+chown/00.t:488 tried 'stat NAME mode,uid,gid', expected (06555|0555),65532,65531, got ENOENT
+chown/00.t:489 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:490 tried 'stat NAME mode,uid,gid', expected 06555,65532,65531, got ENOENT
+chown/00.t:491 tried 'chown NAME 0 0', expected 0, got ENOENT
+chown/00.t:492 tried 'stat NAME mode,uid,gid', expected (06555|0555),0,0, got ENOENT
+chown/00.t:494 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:495 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:496 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:497 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:498 tried 'chown NAME 65532 65531', expected 0, got ENOENT
+chown/00.t:499 tried 'stat NAME mode,uid,gid', expected (06555|0555),65532,65531, got ENOENT
+chown/00.t:50 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:500 tried 'stat NAME mode,uid,gid', expected (06555|0555),65532,65531, got ENOENT
+chown/00.t:501 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:502 tried 'stat NAME mode,uid,gid', expected 06555,65532,65531, got ENOENT
+chown/00.t:503 tried 'stat NAME mode,uid,gid', expected 06555,65532,65531, got ENOENT
+chown/00.t:504 tried 'chown NAME 0 0', expected 0, got ENOENT
+chown/00.t:505 tried 'stat NAME mode,uid,gid', expected (06555|0555),0,0, got ENOENT
+chown/00.t:506 tried 'stat NAME mode,uid,gid', expected (06555|0555),0,0, got ENOENT
+chown/00.t:508 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:509 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:51 tried 'chown NAME 123 456', expected 0, got ENOENT
+chown/00.t:510 tried 'lchown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:511 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:512 tried 'lstat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:513 tried 'lchown NAME 65532 65531', expected 0, got ENOENT
+chown/00.t:514 tried 'lstat NAME mode,uid,gid', expected (06555|0555),65532,65531, got ENOENT
+chown/00.t:515 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:516 tried 'lstat NAME mode,uid,gid', expected 06555,65532,65531, got ENOENT
+chown/00.t:517 tried 'lchown NAME 0 0', expected 0, got ENOENT
+chown/00.t:518 tried 'lstat NAME mode,uid,gid', expected (06555|0555),0,0, got ENOENT
+chown/00.t:519 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:52 tried 'lstat NAME uid,gid', expected 123,456, got ENOENT
+chown/00.t:520 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:521 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:522 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:523 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:524 tried 'chown NAME 65532 65531', expected 0, got ENOENT
+chown/00.t:525 tried 'stat NAME mode,uid,gid', expected (06555|0555),65532,65531, got ENOENT
+chown/00.t:526 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:527 tried 'stat NAME mode,uid,gid', expected 06555,65532,65531, got ENOENT
+chown/00.t:528 tried 'chown NAME 0 0', expected 0, got ENOENT
+chown/00.t:529 tried 'stat NAME mode,uid,gid', expected (06555|0555),0,0, got ENOENT
+chown/00.t:53 tried 'chown NAME 0 0', expected 0, got ENOENT
+chown/00.t:531 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:532 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:533 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:534 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:535 tried 'chown NAME 65532 65531', expected 0, got ENOENT
+chown/00.t:536 tried 'stat NAME mode,uid,gid', expected (06555|0555),65532,65531, got ENOENT
+chown/00.t:537 tried 'stat NAME mode,uid,gid', expected (06555|0555),65532,65531, got ENOENT
+chown/00.t:538 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:539 tried 'stat NAME mode,uid,gid', expected 06555,65532,65531, got ENOENT
+chown/00.t:54 tried 'lstat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:540 tried 'stat NAME mode,uid,gid', expected 06555,65532,65531, got ENOENT
+chown/00.t:541 tried 'chown NAME 0 0', expected 0, got ENOENT
+chown/00.t:542 tried 'stat NAME mode,uid,gid', expected (06555|0555),0,0, got ENOENT
+chown/00.t:543 tried 'stat NAME mode,uid,gid', expected (06555|0555),0,0, got ENOENT
+chown/00.t:545 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:546 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:547 tried 'lchown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:548 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:549 tried 'lstat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:550 tried 'lchown NAME 65532 65531', expected 0, got ENOENT
+chown/00.t:551 tried 'lstat NAME mode,uid,gid', expected (06555|0555),65532,65531, got ENOENT
+chown/00.t:552 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:553 tried 'lstat NAME mode,uid,gid', expected 06555,65532,65531, got ENOENT
+chown/00.t:554 tried 'lchown NAME 0 0', expected 0, got ENOENT
+chown/00.t:555 tried 'lstat NAME mode,uid,gid', expected (06555|0555),0,0, got ENOENT
+chown/00.t:556 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:56 tried 'chown NAME 123 456', expected 0, got ENOENT
+chown/00.t:57 tried 'stat NAME uid,gid', expected 123,456, got ENOENT
+chown/00.t:58 tried 'stat NAME uid,gid', expected 123,456, got ENOENT
+chown/00.t:61 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:62 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:63 tried 'lchown NAME 123 456', expected 0, got ENOENT
+chown/00.t:64 tried 'lstat NAME uid,gid', expected 123,456, got ENOENT
+chown/00.t:65 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:66 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:67 tried 'chown NAME 123 456', expected 0, got ENOENT
+chown/00.t:68 tried 'lstat NAME uid,gid', expected 123,456, got ENOENT
+chown/00.t:69 tried 'chown NAME 0 0', expected 0, got ENOENT
+chown/00.t:70 tried 'lstat NAME uid,gid', expected 0,0, got ENOENT
+chown/00.t:72 tried 'chown NAME 123 456', expected 0, got ENOENT
+chown/00.t:73 tried 'stat NAME uid,gid', expected 123,456, got ENOENT
+chown/00.t:74 tried 'stat NAME uid,gid', expected 123,456, got ENOENT
+chown/00.t:747 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:748 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:749 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:750 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:751 tried '-u 65534 -g 65533,65532 chown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:752 tried 'stat NAME mode,uid,gid', expected 0555,65534,65532, got ENOENT
+chown/00.t:753 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:754 tried 'stat NAME mode,uid,gid', expected 06555,65534,65532, got ENOENT
+chown/00.t:755 tried '-u 65534 -g 65533,65532 -- chown NAME -1 65533', expected 0, got ENOENT
+chown/00.t:756 tried 'stat NAME mode,uid,gid', expected 0555,65534,65533, got ENOENT
+chown/00.t:757 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:758 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:759 tried '-u 65534 -g 65533,65532 -- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:760 tried 'stat NAME mode,uid,gid', expected (06555|0555),65534,65533, got ENOENT
+chown/00.t:762 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:763 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:764 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:765 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:766 tried '-u 65534 -g 65533,65532 chown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:767 tried 'stat NAME mode,uid,gid', expected 0555,65534,65532, got ENOENT
+chown/00.t:768 tried 'stat NAME mode,uid,gid', expected 0555,65534,65532, got ENOENT
+chown/00.t:769 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:77 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:770 tried 'stat NAME mode,uid,gid', expected 06555,65534,65532, got ENOENT
+chown/00.t:771 tried 'stat NAME mode,uid,gid', expected 06555,65534,65532, got ENOENT
+chown/00.t:772 tried '-u 65534 -g 65533,65532 -- chown NAME -1 65533', expected 0, got ENOENT
+chown/00.t:773 tried 'stat NAME mode,uid,gid', expected 0555,65534,65533, got ENOENT
+chown/00.t:774 tried 'stat NAME mode,uid,gid', expected 0555,65534,65533, got ENOENT
+chown/00.t:775 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:776 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:777 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:778 tried '-u 65534 -g 65533,65532 -- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:779 tried 'stat NAME mode,uid,gid', expected (06555|0555),65534,65533, got ENOENT
+chown/00.t:78 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:780 tried 'stat NAME mode,uid,gid', expected (06555|0555),65534,65533, got ENOENT
+chown/00.t:782 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:783 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:784 tried 'lchown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:785 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:786 tried 'lstat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:787 tried '-u 65534 -g 65533,65532 lchown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:788 tried 'lstat NAME mode,uid,gid', expected 0555,65534,65532, got ENOENT
+chown/00.t:789 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:79 tried 'lchown NAME 123 456', expected 0, got ENOENT
+chown/00.t:790 tried 'lstat NAME mode,uid,gid', expected 06555,65534,65532, got ENOENT
+chown/00.t:791 tried '-u 65534 -g 65533,65532 -- lchown NAME -1 65533', expected 0, got ENOENT
+chown/00.t:792 tried 'lstat NAME mode,uid,gid', expected 0555,65534,65533, got ENOENT
+chown/00.t:793 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:794 tried 'lstat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:795 tried '-u 65534 -g 65533,65532 -- lchown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:796 tried 'lstat NAME mode,uid,gid', expected (06555|0555),65534,65533, got ENOENT
+chown/00.t:797 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:798 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:799 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:80 tried 'lstat NAME uid,gid', expected 123,456, got ENOENT
+chown/00.t:800 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:801 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:802 tried '-u 65534 -g 65533,65532 chown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:803 tried 'stat NAME mode,uid,gid', expected 0555,65534,65532, got ENOENT
+chown/00.t:804 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:805 tried 'stat NAME mode,uid,gid', expected 06555,65534,65532, got ENOENT
+chown/00.t:806 tried '-u 65534 -g 65533,65532 -- chown NAME -1 65533', expected 0, got ENOENT
+chown/00.t:807 tried 'stat NAME mode,uid,gid', expected 0555,65534,65533, got ENOENT
+chown/00.t:808 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:809 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:81 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:810 tried '-u 65534 -g 65533,65532 -- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:811 tried 'stat NAME mode,uid,gid', expected (06555|0555),65534,65533, got ENOENT
+chown/00.t:813 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:814 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:815 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:816 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:817 tried '-u 65534 -g 65533,65532 chown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:818 tried 'stat NAME mode,uid,gid', expected 0555,65534,65532, got ENOENT
+chown/00.t:819 tried 'stat NAME mode,uid,gid', expected 0555,65534,65532, got ENOENT
+chown/00.t:820 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:821 tried 'stat NAME mode,uid,gid', expected 06555,65534,65532, got ENOENT
+chown/00.t:822 tried 'stat NAME mode,uid,gid', expected 06555,65534,65532, got ENOENT
+chown/00.t:823 tried '-u 65534 -g 65533,65532 -- chown NAME -1 65533', expected 0, got ENOENT
+chown/00.t:824 tried 'stat NAME mode,uid,gid', expected 0555,65534,65533, got ENOENT
+chown/00.t:825 tried 'stat NAME mode,uid,gid', expected 0555,65534,65533, got ENOENT
+chown/00.t:826 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:827 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:828 tried 'stat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:829 tried '-u 65534 -g 65533,65532 -- chown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:830 tried 'stat NAME mode,uid,gid', expected (06555|0555),65534,65533, got ENOENT
+chown/00.t:831 tried 'stat NAME mode,uid,gid', expected (06555|0555),65534,65533, got ENOENT
+chown/00.t:833 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:834 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:835 tried 'lchown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:836 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:837 tried 'lstat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:838 tried '-u 65534 -g 65533,65532 lchown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:839 tried 'lstat NAME mode,uid,gid', expected 0555,65534,65532, got ENOENT
+chown/00.t:840 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:841 tried 'lstat NAME mode,uid,gid', expected 06555,65534,65532, got ENOENT
+chown/00.t:842 tried '-u 65534 -g 65533,65532 -- lchown NAME -1 65533', expected 0, got ENOENT
+chown/00.t:843 tried 'lstat NAME mode,uid,gid', expected 0555,65534,65533, got ENOENT
+chown/00.t:844 tried 'chmod NAME 06555', expected 0, got ENOENT
+chown/00.t:845 tried 'lstat NAME mode,uid,gid', expected 06555,65534,65533, got ENOENT
+chown/00.t:846 tried '-u 65534 -g 65533,65532 -- lchown NAME -1 -1', expected 0, got ENOENT
+chown/00.t:847 tried 'lstat NAME mode,uid,gid', expected (06555|0555),65534,65533, got ENOENT
+chown/00.t:848 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:972 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:973 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:974 tried 'stat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:975
+chown/00.t:976 tried '-u 65534 -g 65532 chown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:977 tried 'stat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:978
+chown/00.t:980 tried 'chown NAME 65533 65532', expected 0, got ENOENT
+chown/00.t:981 tried 'stat NAME uid,gid', expected 65533,65532, got ENOENT
+chown/00.t:982
+chown/00.t:983 tried '-u 65533 -g 65531 chown NAME 65533 65531', expected 0, got ENOENT
+chown/00.t:984 tried 'stat NAME uid,gid', expected 65533,65531, got ENOENT
+chown/00.t:985
+chown/00.t:987 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:988 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+chown/00.t:989 tried 'lchown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:990 tried 'lstat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:991
+chown/00.t:992 tried '-u 65534 -g 65532 lchown NAME 65534 65532', expected 0, got ENOENT
+chown/00.t:993 tried 'lstat NAME uid,gid', expected 65534,65532, got ENOENT
+chown/00.t:994
+chown/00.t:995 tried 'unlink NAME', expected 0, got ENOENT
+chown/00.t:996 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+chown/00.t:997 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+chown/00.t:998 tried 'stat NAME uid,gid', expected 65534,65533, got ENOENT
+chown/00.t:999
+chown/01.t:10 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+chown/01.t:11 tried 'chown NAME/NAME/test 65534 65534', expected ENOTDIR, got ENOENT
+chown/01.t:12 tried 'lchown NAME/NAME/test 65534 65534', expected ENOTDIR, got ENOENT
+chown/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chown/01.t:14 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+chown/01.t:15 tried 'chown NAME/NAME/test 65534 65534', expected ENOTDIR, got ENOENT
+chown/01.t:16 tried 'lchown NAME/NAME/test 65534 65534', expected ENOTDIR, got ENOENT
+chown/01.t:17 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chown/07.t:100 tried '-u 65533 -g 65533 lchown NAME/NAME 65534 65534', expected EPERM, got ENOENT
+chown/07.t:101 tried '-u 65533 -g 65533 lchown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:102 tried '-u 65534 -g 65534 -- lchown NAME/NAME -1 65533', expected EPERM, got ENOENT
+chown/07.t:103 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chown/07.t:64 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+chown/07.t:65 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+chown/07.t:66 tried '-u 65534 -g 65534 chown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:67 tried '-u 65533 -g 65533 chown NAME/NAME 65534 65534', expected EPERM, got ENOENT
+chown/07.t:68 tried '-u 65533 -g 65533 chown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:69 tried '-u 65534 -g 65534 -- chown NAME/NAME -1 65533', expected EPERM, got ENOENT
+chown/07.t:71 tried '-u 65534 -g 65534 chown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:72 tried '-u 65533 -g 65533 chown NAME/NAME 65534 65534', expected EPERM, got ENOENT
+chown/07.t:73 tried '-u 65533 -g 65533 chown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:74 tried '-u 65534 -g 65534 -- chown NAME/NAME -1 65533', expected EPERM, got ENOENT
+chown/07.t:76 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chown/07.t:77 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+chown/07.t:78 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+chown/07.t:79 tried '-u 65534 -g 65534 lchown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:80 tried '-u 65533 -g 65533 lchown NAME/NAME 65534 65534', expected EPERM, got ENOENT
+chown/07.t:81 tried '-u 65533 -g 65533 lchown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:82 tried '-u 65534 -g 65534 -- lchown NAME/NAME -1 65533', expected EPERM, got ENOENT
+chown/07.t:83 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chown/07.t:84 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+chown/07.t:85 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+chown/07.t:86 tried '-u 65534 -g 65534 chown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:87 tried '-u 65533 -g 65533 chown NAME/NAME 65534 65534', expected EPERM, got ENOENT
+chown/07.t:88 tried '-u 65533 -g 65533 chown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:89 tried '-u 65534 -g 65534 -- chown NAME/NAME -1 65533', expected EPERM, got ENOENT
+chown/07.t:91 tried '-u 65534 -g 65534 chown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:92 tried '-u 65533 -g 65533 chown NAME/NAME 65534 65534', expected EPERM, got ENOENT
+chown/07.t:93 tried '-u 65533 -g 65533 chown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+chown/07.t:94 tried '-u 65534 -g 65534 -- chown NAME/NAME -1 65533', expected EPERM, got ENOENT
+chown/07.t:96 tried 'unlink NAME/NAME', expected 0, got ENOENT
+chown/07.t:97 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+chown/07.t:98 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+chown/07.t:99 tried '-u 65534 -g 65534 lchown NAME/NAME 65533 65533', expected EPERM, got ENOENT
+link/00.t:100 tried 'lstat NAME type,mode,nlink,uid,gid', expected char,0201,1,65534,65533, got ENOENT
+link/00.t:102 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:146 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+link/00.t:147 tried 'link NAME NAME', expected 0, got ENOENT
+link/00.t:148
+link/00.t:149
+link/00.t:150
+link/00.t:151 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:152 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:153 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+link/00.t:154 tried 'link NAME NAME', expected 0, got ENOENT
+link/00.t:155
+link/00.t:156
+link/00.t:157
+link/00.t:158 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:159 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:181 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+link/00.t:182 tried '-- chown NAME 65534 -1', expected 0, got ENOENT
+link/00.t:183 tried '-u 65534 link NAME NAME', expected EACCES, got ENOENT
+link/00.t:184
+link/00.t:187 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:188 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+link/00.t:189 tried '-- chown NAME 65534 -1', expected 0, got ENOENT
+link/00.t:190 tried '-u 65534 link NAME NAME', expected EACCES, got ENOENT
+link/00.t:191
+link/00.t:194 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:54 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+link/00.t:55 tried 'lstat NAME type,nlink', expected block,1, got ENOENT
+link/00.t:56 tried 'link NAME NAME', expected 0, got ENOENT
+link/00.t:57 tried 'lstat NAME type,nlink', expected block,2, got ENOENT
+link/00.t:58 tried 'lstat NAME type,nlink', expected block,2, got ENOENT
+link/00.t:59 tried 'link NAME NAME', expected 0, got ENOENT
+link/00.t:60 tried 'lstat NAME type,nlink', expected block,3, got ENOENT
+link/00.t:61 tried 'lstat NAME type,nlink', expected block,3, got ENOENT
+link/00.t:62 tried 'lstat NAME type,nlink', expected block,3, got ENOENT
+link/00.t:63 tried 'chmod NAME 0201', expected 0, got ENOENT
+link/00.t:64 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+link/00.t:65 tried 'lstat NAME type,mode,nlink,uid,gid', expected block,0201,3,65534,65533, got ENOENT
+link/00.t:66 tried 'lstat NAME type,mode,nlink,uid,gid', expected block,0201,3,65534,65533, got ENOENT
+link/00.t:67 tried 'lstat NAME type,mode,nlink,uid,gid', expected block,0201,3,65534,65533, got ENOENT
+link/00.t:68 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:70 tried 'lstat NAME type,mode,nlink,uid,gid', expected block,0201,2,65534,65533, got ENOENT
+link/00.t:71 tried 'lstat NAME type,mode,nlink,uid,gid', expected block,0201,2,65534,65533, got ENOENT
+link/00.t:72 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:74 tried 'lstat NAME type,mode,nlink,uid,gid', expected block,0201,1,65534,65533, got ENOENT
+link/00.t:76 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:80 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+link/00.t:81 tried 'lstat NAME type,nlink', expected char,1, got ENOENT
+link/00.t:82 tried 'link NAME NAME', expected 0, got ENOENT
+link/00.t:83 tried 'lstat NAME type,nlink', expected char,2, got ENOENT
+link/00.t:84 tried 'lstat NAME type,nlink', expected char,2, got ENOENT
+link/00.t:85 tried 'link NAME NAME', expected 0, got ENOENT
+link/00.t:86 tried 'lstat NAME type,nlink', expected char,3, got ENOENT
+link/00.t:87 tried 'lstat NAME type,nlink', expected char,3, got ENOENT
+link/00.t:88 tried 'lstat NAME type,nlink', expected char,3, got ENOENT
+link/00.t:89 tried 'chmod NAME 0201', expected 0, got ENOENT
+link/00.t:90 tried 'chown NAME 65534 65533', expected 0, got ENOENT
+link/00.t:91 tried 'lstat NAME type,mode,nlink,uid,gid', expected char,0201,3,65534,65533, got ENOENT
+link/00.t:92 tried 'lstat NAME type,mode,nlink,uid,gid', expected char,0201,3,65534,65533, got ENOENT
+link/00.t:93 tried 'lstat NAME type,mode,nlink,uid,gid', expected char,0201,3,65534,65533, got ENOENT
+link/00.t:94 tried 'unlink NAME', expected 0, got ENOENT
+link/00.t:96 tried 'lstat NAME type,mode,nlink,uid,gid', expected char,0201,2,65534,65533, got ENOENT
+link/00.t:97 tried 'lstat NAME type,mode,nlink,uid,gid', expected char,0201,2,65534,65533, got ENOENT
+link/00.t:98 tried 'unlink NAME', expected 0, got ENOENT
+link/01.t:14 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+link/01.t:15 tried 'link NAME/NAME/test NAME/NAME', expected ENOTDIR, got ENOENT
+link/01.t:16 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+link/01.t:17 tried 'link NAME/NAME NAME/NAME/test', expected ENOTDIR, got ENOENT
+link/01.t:18 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/01.t:19 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/01.t:20 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+link/01.t:21 tried 'link NAME/NAME/test NAME/NAME', expected ENOTDIR, got ENOENT
+link/01.t:22 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+link/01.t:23 tried 'link NAME/NAME NAME/NAME/test', expected ENOTDIR, got ENOENT
+link/01.t:24 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/01.t:25 tried 'unlink NAME/NAME', expected 0, got ENOENT
+link/10.t:11 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+link/10.t:12 tried 'link NAME NAME', expected EEXIST, got 0
+link/10.t:14 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+link/10.t:15 tried 'link NAME NAME', expected EEXIST, got 0
+mkdir/01.t:10 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mkdir/01.t:11 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+mkdir/01.t:12 tried 'mkdir NAME/NAME/test 0755', expected ENOTDIR, got ENOENT
+mkdir/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mkdir/01.t:8 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+mkdir/01.t:9 tried 'mkdir NAME/NAME/test 0755', expected ENOTDIR, got ENOENT
+mkdir/10.t:10 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mkdir/10.t:11 tried 'mkdir NAME 0755', expected EEXIST, got 0
+mkdir/10.t:12 tried 'unlink NAME', expected 0, got EISDIR
+mkdir/10.t:13 tried 'mknod NAME c 0644 1 2', expected 0, got EEXIST
+mkdir/10.t:15 tried 'unlink NAME', expected 0, got EISDIR
+mkdir/10.t:16 tried 'bind NAME', expected 0, got EADDRINUSE
+mkdir/10.t:18 tried 'unlink NAME', expected 0, got EISDIR
+mkdir/10.t:19 tried 'symlink test NAME', expected 0, got EEXIST
+mkdir/10.t:21 tried 'unlink NAME', expected 0, got EISDIR
+mkfifo/01.t:10 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mkfifo/01.t:11 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+mkfifo/01.t:12 tried 'mkfifo NAME/NAME/test 0644', expected ENOTDIR, got ENOENT
+mkfifo/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mkfifo/01.t:8 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+mkfifo/01.t:9 tried 'mkfifo NAME/NAME/test 0644', expected ENOTDIR, got ENOENT
+mkfifo/09.t:10 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mkfifo/09.t:11 tried 'mkfifo NAME 0644', expected EEXIST, got 0
+mkfifo/09.t:13 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+mkfifo/09.t:14 tried 'mkfifo NAME 0644', expected EEXIST, got 0
+mknod/01.t:12 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+mknod/01.t:13 tried 'mknod NAME/NAME/test b 0644 1 2', expected ENOTDIR, got ENOENT
+mknod/01.t:14 tried 'mknod NAME/NAME/test c 0644 1 2', expected ENOTDIR, got ENOENT
+mknod/01.t:15 tried 'mknod NAME/NAME/test f 0644 0 0', expected ENOTDIR, got ENOENT
+mknod/01.t:16 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mknod/01.t:17 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+mknod/01.t:18 tried 'mknod NAME/NAME/test b 0644 1 2', expected ENOTDIR, got ENOENT
+mknod/01.t:19 tried 'mknod NAME/NAME/test c 0644 1 2', expected ENOTDIR, got ENOENT
+mknod/01.t:20 tried 'mknod NAME/NAME/test f 0644 0 0', expected ENOTDIR, got ENOENT
+mknod/01.t:21 tried 'unlink NAME/NAME', expected 0, got ENOENT
+mknod/02.t:10 tried 'stat NAME type,mode', expected char,0644, got ENOENT
+mknod/02.t:11 tried 'unlink NAME', expected 0, got ENOENT
+mknod/02.t:5 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mknod/02.t:6 tried 'stat NAME type,mode', expected block,0644, got ENOENT
+mknod/02.t:7 tried 'unlink NAME', expected 0, got ENOENT
+mknod/02.t:9 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+mknod/03.t:10 tried 'stat NAME type', expected char, got ENOENT
+mknod/03.t:11 tried 'unlink NAME', expected 0, got ENOENT
+mknod/03.t:5 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mknod/03.t:6 tried 'stat NAME type', expected block, got ENOENT
+mknod/03.t:7 tried 'unlink NAME', expected 0, got ENOENT
+mknod/03.t:9 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+mknod/08.t:16 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+mknod/08.t:17 tried 'mknod NAME b 0644 0 0', expected EEXIST, got EPERM
+mknod/08.t:18 tried 'mknod NAME c 0644 0 0', expected EEXIST, got EPERM
+mknod/08.t:19 tried 'mknod NAME f 0644 0 0', expected EEXIST, got 0
+mknod/08.t:21 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+mknod/08.t:22 tried 'mknod NAME b 0644 0 0', expected EEXIST, got EPERM
+mknod/08.t:23 tried 'mknod NAME c 0644 0 0', expected EEXIST, got EPERM
+mknod/08.t:24 tried 'mknod NAME f 0644 0 0', expected EEXIST, got 0
+mknod/11.t:10
+mknod/11.t:11
+mknod/11.t:12
+mknod/11.t:13
+mknod/11.t:14 tried 'unlink NAME', expected 0, got ENOENT
+mknod/11.t:15 tried 'mknod NAME b 0755 1 2', expected 0, got EPERM
+mknod/11.t:16 tried 'lstat NAME type,mode', expected block,0755, got ENOENT
+mknod/11.t:17 tried 'lstat NAME major,minor', expected 1,2, got ENOENT
+mknod/11.t:18 tried 'mknod NAME b 0777 3 4', expected EEXIST, got EPERM
+mknod/11.t:19 tried 'unlink NAME', expected 0, got ENOENT
+mknod/11.t:2 tried 'mknod NAME c 0755 1 2', expected 0, got EPERM
+mknod/11.t:21 tried 'mknod NAME b 0755 1 2', expected 0, got EPERM
+mknod/11.t:22
+mknod/11.t:23
+mknod/11.t:24
+mknod/11.t:25
+mknod/11.t:26
+mknod/11.t:27 tried 'unlink NAME', expected 0, got ENOENT
+mknod/11.t:3 tried 'lstat NAME type,mode', expected char,0755, got ENOENT
+mknod/11.t:4 tried 'lstat NAME major,minor', expected 1,2, got ENOENT
+mknod/11.t:5 tried 'mknod NAME c 0777 3 4', expected EEXIST, got EPERM
+mknod/11.t:6 tried 'unlink NAME', expected 0, got ENOENT
+mknod/11.t:8 tried 'mknod NAME c 0755 1 2', expected 0, got EPERM
+mknod/11.t:9
+open/01.t:10 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+open/01.t:11 tried 'open NAME/NAME/test O_RDONLY', expected ENOTDIR, got ENOENT
+open/01.t:12 tried 'open NAME/NAME/test O_CREAT 0644', expected ENOTDIR, got ENOENT
+open/01.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+open/01.t:14 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+open/01.t:15 tried 'open NAME/NAME/test O_RDONLY', expected ENOTDIR, got ENOENT
+open/01.t:16 tried 'open NAME/NAME/test O_CREAT 0644', expected ENOTDIR, got ENOENT
+open/01.t:17 tried 'unlink NAME/NAME', expected 0, got ENOENT
+open/22.t:10 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+open/22.t:11 tried 'open NAME O_CREAT,O_EXCL 0644', expected EEXIST, got 0
+open/22.t:13 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+open/22.t:14 tried 'open NAME O_CREAT,O_EXCL 0644', expected EEXIST, got 0
+rename/00.t:106 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/00.t:107 tried '-u 65534 rename NAME NAME', expected EACCES, got ENOENT
+rename/00.t:108
+rename/00.t:109 tried 'unlink NAME', expected 0, got ENOENT
+rename/00.t:110 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+rename/00.t:111 tried '-u 65534 rename NAME NAME', expected EACCES, got ENOENT
+rename/00.t:112
+rename/00.t:113 tried 'unlink NAME', expected 0, got ENOENT
+rename/00.t:32 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/00.t:33 tried 'chmod NAME 0644', expected 0, got ENOENT
+rename/00.t:34 tried 'lstat NAME type,mode,nlink', expected block,0644,1, got ENOENT
+rename/00.t:35 tried 'rename NAME NAME', expected 0, got ENOENT
+rename/00.t:37 tried 'lstat NAME type,inode,mode,nlink', expected block,ENOENT,0644,1, got ENOENT
+rename/00.t:38 tried 'link NAME NAME', expected 0, got ENOENT
+rename/00.t:39 tried 'lstat NAME type,inode,mode,nlink', expected block,ENOENT,0644,2, got ENOENT
+rename/00.t:40 tried 'lstat NAME type,inode,mode,nlink', expected block,ENOENT,0644,2, got ENOENT
+rename/00.t:41 tried 'rename NAME NAME', expected 0, got ENOENT
+rename/00.t:42 tried 'lstat NAME type,inode,mode,nlink', expected block,ENOENT,0644,2, got ENOENT
+rename/00.t:44 tried 'lstat NAME type,inode,mode,nlink', expected block,ENOENT,0644,2, got ENOENT
+rename/00.t:45 tried 'unlink NAME', expected 0, got ENOENT
+rename/00.t:46 tried 'unlink NAME', expected 0, got ENOENT
+rename/00.t:47 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+rename/00.t:48 tried 'chmod NAME 0644', expected 0, got ENOENT
+rename/00.t:49 tried 'lstat NAME type,mode,nlink', expected char,0644,1, got ENOENT
+rename/00.t:50 tried 'rename NAME NAME', expected 0, got ENOENT
+rename/00.t:52 tried 'lstat NAME type,inode,mode,nlink', expected char,ENOENT,0644,1, got ENOENT
+rename/00.t:53 tried 'link NAME NAME', expected 0, got ENOENT
+rename/00.t:54 tried 'lstat NAME type,inode,mode,nlink', expected char,ENOENT,0644,2, got ENOENT
+rename/00.t:55 tried 'lstat NAME type,inode,mode,nlink', expected char,ENOENT,0644,2, got ENOENT
+rename/00.t:56 tried 'rename NAME NAME', expected 0, got ENOENT
+rename/00.t:57 tried 'lstat NAME type,inode,mode,nlink', expected char,ENOENT,0644,2, got ENOENT
+rename/00.t:59 tried 'lstat NAME type,inode,mode,nlink', expected char,ENOENT,0644,2, got ENOENT
+rename/00.t:60 tried 'unlink NAME', expected 0, got ENOENT
+rename/00.t:61 tried 'unlink NAME', expected 0, got ENOENT
+rename/09.t:1000 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1002 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1008 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1010 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1012 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1013 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1016 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1018 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1020 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1021 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1024 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1026 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1032 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1034 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1040 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1042 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1046 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1047 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/09.t:1048 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1049 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1052 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1053 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1058 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1059 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1062 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1063 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1064 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1065 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1066 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1067 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1068 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1069 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1070 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1071 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1072 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1073 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1076 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1077 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1082 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1083 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1086 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1088 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1089 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/09.t:1090 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1091 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1094 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1095 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1100 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1101 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1104 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1105 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1106 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1107 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1108 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1109 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1110 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1111 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1112 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1113 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1114 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1115 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1118 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1119 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1124 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1125 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1128 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1130 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1131 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1132 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1134 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got ENOENT
+rename/09.t:1135 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1140 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1142 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1144 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1150 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1152 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1154 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1155 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1158 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1160 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1162 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1163 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1166 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1168 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1174 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1176 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1182 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1184 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1188 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1189 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/09.t:1190 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1192 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1193 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1198 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1200 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:1202 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1208 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:1210 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1212 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1213 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1216 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:1218 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1220 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1221 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1224 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:1226 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1232 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:1234 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1240 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:1242 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1246 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1247 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/09.t:1248 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1250 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1251 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1256 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1258 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:1260 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1266 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:1268 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1270 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1271 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1274 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:1276 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1278 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1279 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1282 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:1284 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1290 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:1292 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1298 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:1300 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1304 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1305 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1306 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1308 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got ENOENT
+rename/09.t:1309 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1314 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1316 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1318 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1324 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1326 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1328 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1329 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1332 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1334 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1336 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1337 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1340 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1342 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1348 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1350 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1356 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1358 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1362 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1363 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1364 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1366 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got ENOENT
+rename/09.t:1367 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1372 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:1374 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1376 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1382 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1384 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1386 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1387 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1390 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1392 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1394 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1395 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1398 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1400 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1406 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1408 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1414 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:1416 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:1420 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1421 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/09.t:1422 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1423 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1426 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1427 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1432 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1433 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1436 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1437 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1438 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1439 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1440 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1441 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1442 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1443 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1444 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1445 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1446 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1447 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1450 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1451 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1456 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1457 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:1460 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1462 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1463 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/09.t:1464 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1465 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1468 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1469 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1474 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1475 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1478 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1479 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:148 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1480 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1481 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1482 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1483 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1484 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1485 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1486 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1487 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1488 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1489 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:149 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1492 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1493 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1498 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/09.t:1499 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:1502 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1528 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1529 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1536 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1537 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:156 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:157 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1586 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1587 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1594 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1595 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1644 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1645 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1652 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1653 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1702 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1703 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1710 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1711 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1760 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1761 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1768 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1769 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1810 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1811 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1814 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1815 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1816 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1817 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1820 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1821 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1852 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1853 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1856 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1857 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1858 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1859 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1862 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:1863 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:1902 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1903 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1910 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1911 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1960 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:1961 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:1968 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:1969 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2018 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:2019 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2026 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:2027 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:206 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:207 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2076 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:2077 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2084 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:2085 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2134 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:2135 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:214 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:2142 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:2143 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:215 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2184 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:2185 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2188 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:2189 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:2190 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:2191 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2194 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:2195 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:2226 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:2227 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2230 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:2231 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:2232 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:2233 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:2236 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:2237 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:264 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:265 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:272 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:273 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:314 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:315 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:318 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:319 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:32 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:320 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:321 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:324 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:325 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:33 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:356 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:357 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:360 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:361 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:362 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:363 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:366 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:367 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:40 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:406 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:407 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:41 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:414 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:415 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:464 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:465 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:472 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:473 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:522 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:523 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:530 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:531 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:580 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:581 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:588 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:589 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:638 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:639 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:646 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:647 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:688 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:689 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:692 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:693 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:694 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:695 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:698 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:699 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:730 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:731 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:734 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:735 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:736 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:737 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:740 tried 'lstat NAME/NAME uid,gid', expected 65534,65534, got ENOENT
+rename/09.t:741 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/09.t:756 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:757 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:758 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:760 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got ENOENT
+rename/09.t:761 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:766 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:768 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:770 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:776 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:778 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:780 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:781 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:784 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:786 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:788 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:789 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:792 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:794 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:800 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:802 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:808 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:810 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:814 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:815 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/09.t:816 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:818 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got ENOENT
+rename/09.t:819 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:824 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:826 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:828 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:834 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:836 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:838 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:839 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:842 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:844 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:846 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:847 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:850 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:852 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:858 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:860 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:866 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,0,0, got INODE_A,65534,65534
+rename/09.t:868 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:872 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:873 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/09.t:874 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:876 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got ENOENT
+rename/09.t:877 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:882 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:884 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:886 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:892 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:894 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:896 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:897 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:90 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:900 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:902 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:904 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:905 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:908 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:91 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:910 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:916 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:918 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:924 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65533,65533, got INODE_A,65534,65534
+rename/09.t:926 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:930 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:931 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:932 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:934 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got ENOENT
+rename/09.t:935 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:940 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:942 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:944 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:950 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:952 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:954 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:955 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:958 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:960 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:962 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:963 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:966 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:968 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:974 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:976 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:98 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/09.t:982 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got INODE_A,65534,65534
+rename/09.t:984 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/09.t:988 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/09.t:989 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:99 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/09.t:990 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:992 tried 'lstat NAME/NAME inode,uid,gid', expected ENOENT,65534,65534, got ENOENT
+rename/09.t:993 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/09.t:998 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:1001 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1002 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1003 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1005 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got ENOENT
+rename/10.t:1006 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1007 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1008 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1009 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1011 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got ENOENT
+rename/10.t:1012 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1015 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1021 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1025 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1027 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1028 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1031 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:1033 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1035 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1041 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1043 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1045 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1046 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1049 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1051 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1053 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1054 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1057 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1059 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1065 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1067 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1073 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1075 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1079 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1080 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1083 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:1085 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1087 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1093 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1095 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1097 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1098 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1101 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1103 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1105 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1106 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1109 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1111 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1117 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1119 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1125 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1127 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1131 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1132 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1135 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:1137 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1139 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1145 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1147 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1149 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1150 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1153 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1155 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1157 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1158 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1161 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1163 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1169 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1171 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1177 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1179 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1183 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1184 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1187 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:1189 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1191 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1197 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1199 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1201 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1202 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1205 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1207 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1209 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1210 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1213 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1215 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1221 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1223 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1229 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1231 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1235 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1236 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1239 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:1241 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1243 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1249 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1251 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1253 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1254 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1257 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1259 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1261 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1262 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1265 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1267 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1273 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1275 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1281 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1283 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:1287 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1288 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:129 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1291 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1297 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:130 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1301 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1302 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1303 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1305 tried 'lstat NAME/NAME uid,gid', expected 0,0, got ENOENT
+rename/10.t:1306 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1307 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1308 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1309 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1311 tried 'lstat NAME/NAME uid,gid', expected 0,0, got ENOENT
+rename/10.t:1312 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1315 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1321 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1325 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1327 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1328 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1331 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1337 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1341 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1342 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1343 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1345 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got ENOENT
+rename/10.t:1346 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1347 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1348 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1349 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1351 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got ENOENT
+rename/10.t:1352 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1355 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1361 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1365 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:137 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:138 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1385 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1386 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1393 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1394 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1437 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1438 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1445 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1446 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1489 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1490 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1497 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1498 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1541 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1542 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1549 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1550 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1593 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1594 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1601 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1602 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1641 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1642 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1643 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got 0
+rename/10.t:1644 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1645 tried 'lstat NAME/NAME uid,gid', expected 0,0, got 65534,65534
+rename/10.t:1647 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1648 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1649 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1650 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1651 tried 'lstat NAME/NAME uid,gid', expected 0,0, got ENOENT
+rename/10.t:1652 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1655 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1656 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1661 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1662 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1665 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1681 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1682 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1683 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got 0
+rename/10.t:1684 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1685 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got 65534,65534
+rename/10.t:1687 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1688 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1689 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1690 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1691 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got ENOENT
+rename/10.t:1692 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1695 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1696 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1701 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1702 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1705 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1725 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1726 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1733 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1734 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1777 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1778 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1785 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1786 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:181 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:182 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1829 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1830 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1837 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1838 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:1881 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1882 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1889 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:189 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1890 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:190 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1933 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1934 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1941 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1942 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:1981 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:1982 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1983 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got 0
+rename/10.t:1984 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1985 tried 'lstat NAME/NAME uid,gid', expected 0,0, got 65534,65534
+rename/10.t:1987 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:1988 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:1989 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1990 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:1991 tried 'lstat NAME/NAME uid,gid', expected 0,0, got ENOENT
+rename/10.t:1992 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:1995 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:1996 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:2001 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:2002 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:2005 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:2021 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:2022 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:2023 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got 0
+rename/10.t:2024 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:2025 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got 65534,65534
+rename/10.t:2027 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:2028 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:2029 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:2030 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:2031 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got ENOENT
+rename/10.t:2032 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:2035 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:2036 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:2041 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:2042 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:2045 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:233 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:234 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:241 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:242 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:25 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:26 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:281 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:282 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:283 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got 0
+rename/10.t:284 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:285 tried 'lstat NAME/NAME uid,gid', expected 0,0, got 65534,65534
+rename/10.t:287 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:288 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:289 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:290 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:291 tried 'lstat NAME/NAME uid,gid', expected 0,0, got ENOENT
+rename/10.t:292 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:295 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:296 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:301 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:302 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:305 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:321 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:322 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:323 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got 0
+rename/10.t:324 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:325 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got 65534,65534
+rename/10.t:327 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:328 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:329 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:33 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:330 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:331 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got ENOENT
+rename/10.t:332 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:335 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:336 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:34 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:341 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:342 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:345 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:365 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:366 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:373 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:374 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:417 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:418 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:425 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:426 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:469 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:470 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:477 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:478 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:521 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:522 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:529 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:530 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:573 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:574 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:581 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:582 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:621 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:622 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:623 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got 0
+rename/10.t:624 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:625 tried 'lstat NAME/NAME uid,gid', expected 0,0, got 65534,65534
+rename/10.t:627 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:628 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:629 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:630 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:631 tried 'lstat NAME/NAME uid,gid', expected 0,0, got ENOENT
+rename/10.t:632 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:635 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:636 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:641 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:642 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:645 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:661 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:662 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:663 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got 0
+rename/10.t:664 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:665 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got 65534,65534
+rename/10.t:667 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:668 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:669 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:670 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:671 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got ENOENT
+rename/10.t:672 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:675 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:676 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:681 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:682 tried 'lstat NAME/NAME inode', expected INODE_A, got ENOENT
+rename/10.t:685 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:687 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:688 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:691 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:693 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:695 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:701 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:703 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:705 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:706 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:709 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:711 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:713 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:714 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:717 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:719 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:725 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:727 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:733 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:735 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:739 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:740 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:743 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:745 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:747 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:753 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:755 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:757 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:758 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:761 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:763 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:765 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:766 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:769 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:77 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:771 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:777 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:779 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:78 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:785 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:787 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:791 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:792 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:795 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:797 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:799 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:805 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:807 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:809 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:810 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:813 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:815 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:817 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:818 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+rename/10.t:821 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:823 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:829 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:831 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:837 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:839 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:843 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:844 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:847 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:849 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:85 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:851 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:857 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:859 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:86 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:861 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:862 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:865 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:867 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:869 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:870 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:873 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:875 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:881 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:883 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:889 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:891 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:895 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:896 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:899 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got ENOENT
+rename/10.t:901 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:903 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:909 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:911 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:913 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:914 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:917 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:919 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:921 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:922 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:925 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:927 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:933 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:935 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:941 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:943 tried 'lstat NAME/NAME inode', expected ENOENT, got INODE_A
+rename/10.t:947 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:948 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:951 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:957 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:961 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:962 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:963 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:965 tried 'lstat NAME/NAME uid,gid', expected 0,0, got ENOENT
+rename/10.t:966 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:967 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/10.t:968 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+rename/10.t:969 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:971 tried 'lstat NAME/NAME uid,gid', expected 0,0, got ENOENT
+rename/10.t:972 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:975 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:981 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:985 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/10.t:987 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/10.t:988 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+rename/10.t:991 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/10.t:997 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected EACCES|EPERM, got ENOENT
+rename/12.t:14 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/12.t:15 tried 'rename NAME/NAME/test NAME/NAME', expected ENOTDIR, got ENOENT
+rename/12.t:16 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/12.t:17 tried 'link NAME/NAME NAME/NAME/test', expected ENOTDIR, got ENOENT
+rename/12.t:18 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/12.t:19 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/12.t:20 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/12.t:21 tried 'rename NAME/NAME/test NAME/NAME', expected ENOTDIR, got ENOENT
+rename/12.t:22 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/12.t:23 tried 'link NAME/NAME NAME/NAME/test', expected ENOTDIR, got ENOENT
+rename/12.t:24 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/12.t:25 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/13.t:12 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/13.t:13 tried 'rename NAME NAME', expected ENOTDIR, got 0
+rename/13.t:14 tried 'lstat NAME type', expected dir, got ENOENT
+rename/13.t:15 tried 'lstat NAME type', expected block, got dir
+rename/13.t:16 tried 'unlink NAME', expected 0, got EISDIR
+rename/13.t:17 tried 'mknod NAME c 0644 1 2', expected 0, got EEXIST
+rename/13.t:18 tried 'rename NAME NAME', expected ENOTDIR, got ENOENT
+rename/13.t:19 tried 'lstat NAME type', expected dir, got ENOENT
+rename/13.t:20 tried 'lstat NAME type', expected char, got dir
+rename/13.t:21 tried 'unlink NAME', expected 0, got EISDIR
+rename/13.t:22 tried 'bind NAME', expected 0, got EADDRINUSE
+rename/13.t:23 tried 'rename NAME NAME', expected ENOTDIR, got ENOENT
+rename/13.t:24 tried 'lstat NAME type', expected dir, got ENOENT
+rename/13.t:25 tried 'lstat NAME type', expected socket, got dir
+rename/13.t:26 tried 'unlink NAME', expected 0, got EISDIR
+rename/13.t:27 tried 'symlink test NAME', expected 0, got EEXIST
+rename/13.t:28 tried 'rename NAME NAME', expected ENOTDIR, got ENOENT
+rename/13.t:29 tried 'lstat NAME type', expected dir, got ENOENT
+rename/13.t:30 tried 'lstat NAME type', expected symlink, got dir
+rename/13.t:31 tried 'unlink NAME', expected 0, got EISDIR
+rename/13.t:32 tried 'rmdir NAME', expected 0, got ENOENT
+rename/14.t:12 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/14.t:13 tried 'rename NAME NAME', expected EISDIR, got ENOENT
+rename/14.t:15 tried 'lstat NAME type', expected block, got ENOENT
+rename/14.t:16 tried 'unlink NAME', expected 0, got ENOENT
+rename/14.t:17 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+rename/14.t:18 tried 'rename NAME NAME', expected EISDIR, got ENOENT
+rename/14.t:20 tried 'lstat NAME type', expected char, got ENOENT
+rename/14.t:21 tried 'unlink NAME', expected 0, got ENOENT
+rename/20.t:12 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rename/20.t:13 tried 'rename NAME NAME', expected EEXIST|ENOTEMPTY, got 0
+rename/20.t:14 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/20.t:15 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+rename/20.t:16 tried 'rename NAME NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rename/20.t:17 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rename/20.t:19 tried 'rename NAME NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rename/20.t:22 tried 'rename NAME NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rename/20.t:25 tried 'rmdir NAME', expected 0, got ENOENT
+rename/23.t:18 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/23.t:19 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+rename/23.t:20 tried 'link NAME NAME', expected 0, got ENOENT
+rename/23.t:21 tried 'rename NAME NAME', expected 0, got ENOENT
+rename/23.t:22 tried 'lstat NAME type,nlink', expected block,1, got ENOENT
+rename/23.t:23
+rename/23.t:24 tried 'unlink NAME', expected 0, got ENOENT
+rename/23.t:25 tried 'unlink NAME', expected 0, got ENOENT
+rename/23.t:26 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+rename/23.t:27 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+rename/23.t:28 tried 'link NAME NAME', expected 0, got ENOENT
+rename/23.t:29 tried 'rename NAME NAME', expected 0, got ENOENT
+rename/23.t:30 tried 'lstat NAME type,nlink', expected char,1, got ENOENT
+rename/23.t:31
+rename/23.t:32 tried 'unlink NAME', expected 0, got ENOENT
+rename/23.t:33 tried 'unlink NAME', expected 0, got ENOENT
+rmdir/06.t:11 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+rmdir/06.t:12 tried 'rmdir NAME', expected EEXIST|ENOTEMPTY, got 0
+rmdir/06.t:13 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:14 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got ENOENT
+rmdir/06.t:15 tried 'rmdir NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rmdir/06.t:16 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:17 tried 'bind NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:18 tried 'rmdir NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rmdir/06.t:19 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:20 tried 'symlink test NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:21 tried 'rmdir NAME', expected EEXIST|ENOTEMPTY, got ENOENT
+rmdir/06.t:22 tried 'unlink NAME/NAME', expected 0, got ENOENT
+rmdir/06.t:23 tried 'rmdir NAME', expected 0, got ENOENT
+symlink/08.t:10 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+symlink/08.t:11 tried 'symlink test NAME', expected EEXIST, got 0
+symlink/08.t:13 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+symlink/08.t:14 tried 'symlink test NAME', expected EEXIST, got 0
+unlink/00.t:14 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+unlink/00.t:15 tried 'lstat NAME type', expected block, got ENOENT
+unlink/00.t:16 tried 'unlink NAME', expected 0, got ENOENT
+unlink/00.t:18 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+unlink/00.t:19 tried 'lstat NAME type', expected char, got ENOENT
+unlink/00.t:20 tried 'unlink NAME', expected 0, got ENOENT
+unlink/00.t:36 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+unlink/00.t:37 tried 'link NAME NAME', expected 0, got ENOENT
+unlink/00.t:38 tried 'unlink NAME', expected 0, got ENOENT
+unlink/00.t:39
+unlink/00.t:40 tried 'unlink NAME', expected 0, got ENOENT
+unlink/00.t:41 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+unlink/00.t:42 tried 'link NAME NAME', expected 0, got ENOENT
+unlink/00.t:43 tried 'unlink NAME', expected 0, got ENOENT
+unlink/00.t:44
+unlink/00.t:45 tried 'unlink NAME', expected 0, got ENOENT
+unlink/00.t:59 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+unlink/00.t:60 tried '-u 65534 unlink NAME', expected EACCES, got ENOENT
+unlink/00.t:61
+unlink/00.t:62 tried 'unlink NAME', expected 0, got ENOENT
+unlink/00.t:63 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+unlink/00.t:64 tried '-u 65534 unlink NAME', expected EACCES, got ENOENT
+unlink/00.t:65
+unlink/00.t:66 tried 'unlink NAME', expected 0, got ENOENT
+unlink/00.t:84 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+unlink/00.t:85 tried 'unlink NAME/NAME', expected 0, got ENOENT
+unlink/00.t:86
+unlink/00.t:87
+unlink/00.t:90 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+unlink/00.t:91 tried 'unlink NAME/NAME', expected 0, got ENOENT
+unlink/00.t:92
+unlink/00.t:93
+unlink/11.t:100 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+unlink/11.t:101 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+unlink/11.t:102 tried 'lstat NAME/NAME type,uid,gid', expected block,0,0, got ENOENT
+unlink/11.t:103 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:106 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+unlink/11.t:107 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+unlink/11.t:108 tried 'lstat NAME/NAME type,uid,gid', expected block,65533,65533, got ENOENT
+unlink/11.t:109 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:112 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+unlink/11.t:113 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+unlink/11.t:114 tried 'lstat NAME/NAME type,uid,gid', expected block,65534,65534, got ENOENT
+unlink/11.t:115 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:118 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+unlink/11.t:119 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+unlink/11.t:120 tried 'lstat NAME/NAME type,uid,gid', expected block,65534,65534, got ENOENT
+unlink/11.t:121 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:124 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+unlink/11.t:125 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+unlink/11.t:126 tried 'lstat NAME/NAME type,uid,gid', expected block,0,0, got ENOENT
+unlink/11.t:127 tried '-u 65534 -g 65534 unlink NAME/NAME', expected EACCES|EPERM, got ENOENT
+unlink/11.t:128 tried 'lstat NAME/NAME type,uid,gid', expected block,0,0, got ENOENT
+unlink/11.t:129 tried 'unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:131 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+unlink/11.t:132 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+unlink/11.t:133 tried 'lstat NAME/NAME type,uid,gid', expected block,65533,65533, got ENOENT
+unlink/11.t:134 tried '-u 65534 -g 65534 unlink NAME/NAME', expected EACCES|EPERM, got ENOENT
+unlink/11.t:135 tried 'lstat NAME/NAME type,uid,gid', expected block,65533,65533, got ENOENT
+unlink/11.t:136 tried 'unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:138 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+unlink/11.t:139 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+unlink/11.t:140 tried 'lstat NAME/NAME type,uid,gid', expected char,65534,65534, got ENOENT
+unlink/11.t:141 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:144 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+unlink/11.t:145 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+unlink/11.t:146 tried 'lstat NAME/NAME type,uid,gid', expected char,0,0, got ENOENT
+unlink/11.t:147 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:150 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+unlink/11.t:151 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+unlink/11.t:152 tried 'lstat NAME/NAME type,uid,gid', expected char,65533,65533, got ENOENT
+unlink/11.t:153 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:156 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+unlink/11.t:157 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+unlink/11.t:158 tried 'lstat NAME/NAME type,uid,gid', expected char,65534,65534, got ENOENT
+unlink/11.t:159 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:162 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+unlink/11.t:163 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+unlink/11.t:164 tried 'lstat NAME/NAME type,uid,gid', expected char,65534,65534, got ENOENT
+unlink/11.t:165 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:168 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+unlink/11.t:169 tried 'lchown NAME/NAME 0 0', expected 0, got ENOENT
+unlink/11.t:170 tried 'lstat NAME/NAME type,uid,gid', expected char,0,0, got ENOENT
+unlink/11.t:171 tried '-u 65534 -g 65534 unlink NAME/NAME', expected EACCES|EPERM, got ENOENT
+unlink/11.t:172 tried 'lstat NAME/NAME type,uid,gid', expected char,0,0, got ENOENT
+unlink/11.t:173 tried 'unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:175 tried 'mknod NAME/NAME c 0644 1 2', expected 0, got EPERM
+unlink/11.t:176 tried 'lchown NAME/NAME 65533 65533', expected 0, got ENOENT
+unlink/11.t:177 tried 'lstat NAME/NAME type,uid,gid', expected char,65533,65533, got ENOENT
+unlink/11.t:178 tried '-u 65534 -g 65534 unlink NAME/NAME', expected EACCES|EPERM, got ENOENT
+unlink/11.t:179 tried 'lstat NAME/NAME type,uid,gid', expected char,65533,65533, got ENOENT
+unlink/11.t:180 tried 'unlink NAME/NAME', expected 0, got ENOENT
+unlink/11.t:94 tried 'mknod NAME/NAME b 0644 1 2', expected 0, got EPERM
+unlink/11.t:95 tried 'lchown NAME/NAME 65534 65534', expected 0, got ENOENT
+unlink/11.t:96 tried 'lstat NAME/NAME type,uid,gid', expected block,65534,65534, got ENOENT
+unlink/11.t:97 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+utimensat/00.t:17 tried 'mknod NAME b 0644 1 2', expected 0, got EPERM
+utimensat/00.t:18 tried 'open . O_RDONLY : utimensat 0 NAME 1900000000 0 1950000000 0 0', expected 0, got ENOENT
+utimensat/00.t:19 tried 'lstat NAME atime', expected 1900000000, got ENOENT
+utimensat/00.t:20 tried 'lstat NAME mtime', expected 1950000000, got ENOENT
+utimensat/00.t:21 tried 'unlink NAME', expected 0, got ENOENT
+utimensat/00.t:22 tried 'mknod NAME c 0644 1 2', expected 0, got EPERM
+utimensat/00.t:23 tried 'open . O_RDONLY : utimensat 0 NAME 1900000000 0 1950000000 0 0', expected 0, got ENOENT
+utimensat/00.t:24 tried 'lstat NAME atime', expected 1900000000, got ENOENT
+utimensat/00.t:25 tried 'lstat NAME mtime', expected 1950000000, got ENOENT
+utimensat/00.t:26 tried 'unlink NAME', expected 0, got ENOENT
+
+# The protocol carries no requester uid/gid, so an object created by uid 65534 through the mount belongs to the server user (root here). Every check that expects 65534 as owner or group of what it created fails, and so does everything that depends on that ownership: chmod, chown, rename, unlink and link by 65534 on 'its own' files (EPERM or EACCES from the kernel's permission and sticky-directory checks and from the fs.protected_* sysctls), the opens that then succeed or fail against the creation mode because the chmod before them was refused, and the lstat that then finds the old name still there or the new one missing. (160 checks)
+chmod/05.t:10 tried '-u 65534 -g 65534 chmod NAME/NAME 0420', expected 0, got EPERM
+chmod/05.t:11 tried '-u 65534 -g 65534 stat NAME/NAME mode', expected 0420, got 0644
+chmod/05.t:5 tried '-u 65534 -g 65534 chmod NAME/NAME 0642', expected 0, got EPERM
+chmod/05.t:6 tried '-u 65534 -g 65534 stat NAME/NAME mode', expected 0642, got 0644
+chmod/07.t:11 tried 'stat NAME/NAME mode', expected 0642, got 0644
+chmod/07.t:15 tried '-u 65534 -g 65534 chmod NAME/NAME 0642', expected 0, got EPERM
+chmod/07.t:16 tried 'stat NAME/NAME mode,uid,gid', expected 0642,65534,65534, got 0644,SERVER_UID,SERVER_GID
+chmod/07.t:18 tried 'stat NAME/NAME mode,uid,gid', expected 0642,65534,65534, got 0644,SERVER_UID,SERVER_GID
+chmod/07.t:21 tried 'stat NAME/NAME mode,uid,gid', expected 0642,0,0, got 0644,SERVER_UID,SERVER_GID
+chmod/07.t:5 tried '-u 65534 -g 65534 chmod NAME/NAME 0642', expected 0, got EPERM
+chmod/07.t:6 tried 'stat NAME/NAME mode', expected 0642, got 0644
+chmod/07.t:8 tried 'stat NAME/NAME mode', expected 0642, got 0644
+chown/05.t:11 tried '-u 65534 -g 65534 stat NAME/NAME uid,gid', expected 65534,65533, got SERVER_UID,SERVER_GID
+chown/05.t:12 tried '-u 65534 -g 65533,65534 -- chown NAME/NAME -1 65534', expected 0, got EPERM
+chown/05.t:13 tried '-u 65534 -g 65534 stat NAME/NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+chown/05.t:14 tried '-u 65534 -g 65533,65534 -- lchown NAME/NAME -1 65533', expected 0, got EPERM
+chown/05.t:15 tried '-u 65534 -g 65533 stat NAME/NAME uid,gid', expected 65534,65533, got SERVER_UID,SERVER_GID
+chown/05.t:5 tried '-u 65534 -g 65533,65534 -- chown NAME/NAME -1 65533', expected 0, got EPERM
+chown/05.t:6 tried '-u 65534 -g 65534 stat NAME/NAME uid,gid', expected 65534,65533, got SERVER_UID,SERVER_GID
+ftruncate/05.t:10 tried '-u 65534 -g 65534 stat NAME/NAME size', expected 123, got 0
+ftruncate/05.t:11 tried '-u 65534 -g 65534 truncate NAME/NAME 1234', expected 0, got EACCES
+ftruncate/05.t:12 tried '-u 65534 -g 65534 stat NAME/NAME size', expected 1234, got 0
+ftruncate/05.t:5 tried '-u 65534 -g 65534 truncate NAME/NAME 123', expected 0, got EACCES
+ftruncate/05.t:6 tried '-u 65534 -g 65534 stat NAME/NAME size', expected 123, got 0
+link/06.t:7 tried '-u 65534 -g 65534 link NAME/NAME NAME/NAME', expected 0, got EPERM
+link/06.t:8 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+link/07.t:10 tried '-u 65534 -g 65534 link NAME/NAME NAME/NAME', expected EACCES, got EPERM
+link/07.t:12 tried '-u 65534 -g 65534 link NAME/NAME NAME/NAME', expected EACCES, got EPERM
+link/07.t:7 tried '-u 65534 -g 65534 link NAME/NAME NAME/NAME', expected 0, got EPERM
+link/07.t:8 tried '-u 65534 -g 65534 unlink NAME/NAME', expected 0, got ENOENT
+mkdir/00.t:19 tried 'lstat NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+mkdir/00.t:22 tried 'lstat NAME uid,gid', expected 65534,6553[34], got SERVER_UID,SERVER_GID
+mkdir/00.t:26 tried 'lstat NAME uid,gid', expected 65533,6553[24], got SERVER_UID,SERVER_GID
+mkfifo/00.t:19 tried 'lstat NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+mkfifo/00.t:22 tried 'lstat NAME uid,gid', expected 65534,6553[34], got SERVER_UID,SERVER_GID
+mkfifo/00.t:26 tried 'lstat NAME uid,gid', expected 65533,6553[24], got SERVER_UID,SERVER_GID
+mknod/00.t:19 tried 'lstat NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+mknod/00.t:22 tried 'lstat NAME uid,gid', expected 65534,6553[34], got SERVER_UID,SERVER_GID
+mknod/00.t:26 tried 'lstat NAME uid,gid', expected 65533,6553[24], got SERVER_UID,SERVER_GID
+open/00.t:19 tried 'lstat NAME uid,gid', expected 65534,65534, got SERVER_UID,SERVER_GID
+open/00.t:22 tried 'lstat NAME uid,gid', expected 65534,6553[34], got SERVER_UID,SERVER_GID
+open/00.t:26 tried 'lstat NAME uid,gid', expected 65533,6553[24], got SERVER_UID,SERVER_GID
+open/06.t:10 tried '-u 65533 -g 65534 open NAME O_WRONLY,', expected 0, got EACCES
+open/06.t:100 tried '-u 65534 -g 65534 open NAME O_RDONLY,O_NONBLOCK', expected EACCES, got 0
+open/06.t:103 tried '-u 65534 -g 65534 chmod NAME 0707', expected 0, got EPERM
+open/06.t:104 tried '-u 65533 -g 65534 open NAME O_RDONLY,O_NONBLOCK', expected EACCES, got 0
+open/06.t:107 tried '-u 65534 -g 65534 chmod NAME 0770', expected 0, got EPERM
+open/06.t:108 tried '-u 65533 -g 65533 open NAME O_RDONLY,O_NONBLOCK', expected EACCES, got 0
+open/06.t:11 tried '-u 65533 -g 65534 open NAME O_RDWR,', expected 0, got EACCES
+open/06.t:113 tried '-u 65534 -g 65534 chmod NAME 0600', expected 0, got EPERM
+open/06.t:115 tried '-u 65534 -g 65534 chmod NAME 0060', expected 0, got EPERM
+open/06.t:117 tried '-u 65534 -g 65534 chmod NAME 0006', expected 0, got EPERM
+open/06.t:119 tried '-u 65534 -g 65534 chmod NAME 0477', expected 0, got EPERM
+open/06.t:12 tried '-u 65534 -g 65534 chmod NAME 0006', expected 0, got EPERM
+open/06.t:121 tried '-u 65534 -g 65534 chmod NAME 0747', expected 0, got EPERM
+open/06.t:123 tried '-u 65534 -g 65534 chmod NAME 0774', expected 0, got EPERM
+open/06.t:125 tried '-u 65534 -g 65534 chmod NAME 0277', expected 0, got EPERM
+open/06.t:126 tried '-u 65534 -g 65534 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:127 tried '-u 65534 -g 65534 chmod NAME 0727', expected 0, got EPERM
+open/06.t:128 tried '-u 65533 -g 65534 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:129 tried '-u 65534 -g 65534 chmod NAME 0772', expected 0, got EPERM
+open/06.t:130 tried '-u 65533 -g 65533 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:131 tried '-u 65534 -g 65534 chmod NAME 0177', expected 0, got EPERM
+open/06.t:132 tried '-u 65534 -g 65534 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:133 tried '-u 65534 -g 65534 chmod NAME 0717', expected 0, got EPERM
+open/06.t:134 tried '-u 65533 -g 65534 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:135 tried '-u 65534 -g 65534 chmod NAME 0771', expected 0, got EPERM
+open/06.t:136 tried '-u 65533 -g 65533 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:137 tried '-u 65534 -g 65534 chmod NAME 0077', expected 0, got EPERM
+open/06.t:138 tried '-u 65534 -g 65534 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:139 tried '-u 65534 -g 65534 chmod NAME 0707', expected 0, got EPERM
+open/06.t:14 tried '-u 65533 -g 65533 open NAME O_WRONLY,', expected 0, got EACCES
+open/06.t:140 tried '-u 65533 -g 65534 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:141 tried '-u 65534 -g 65534 chmod NAME 0770', expected 0, got EPERM
+open/06.t:142 tried '-u 65533 -g 65533 open NAME O_RDONLY', expected EACCES, got 0
+open/06.t:15 tried '-u 65533 -g 65533 open NAME O_RDWR,', expected 0, got EACCES
+open/06.t:16 tried '-u 65534 -g 65534 chmod NAME 0477', expected 0, got EPERM
+open/06.t:20 tried '-u 65534 -g 65534 chmod NAME 0747', expected 0, got EPERM
+open/06.t:24 tried '-u 65534 -g 65534 chmod NAME 0774', expected 0, got EPERM
+open/06.t:28 tried '-u 65534 -g 65534 chmod NAME 0277', expected 0, got EPERM
+open/06.t:29 tried '-u 65534 -g 65534 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:30 tried '-u 65534 -g 65534 open NAME O_WRONLY,', expected 0, got EACCES
+open/06.t:32 tried '-u 65534 -g 65534 chmod NAME 0727', expected 0, got EPERM
+open/06.t:33 tried '-u 65533 -g 65534 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:34 tried '-u 65533 -g 65534 open NAME O_WRONLY,', expected 0, got EACCES
+open/06.t:36 tried '-u 65534 -g 65534 chmod NAME 0772', expected 0, got EPERM
+open/06.t:37 tried '-u 65533 -g 65533 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:38 tried '-u 65533 -g 65533 open NAME O_WRONLY,', expected 0, got EACCES
+open/06.t:4 tried '-u 65534 -g 65534 chmod NAME 0600', expected 0, got EPERM
+open/06.t:40 tried '-u 65534 -g 65534 chmod NAME 0177', expected 0, got EPERM
+open/06.t:41 tried '-u 65534 -g 65534 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:44 tried '-u 65534 -g 65534 chmod NAME 0717', expected 0, got EPERM
+open/06.t:45 tried '-u 65533 -g 65534 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:48 tried '-u 65534 -g 65534 chmod NAME 0771', expected 0, got EPERM
+open/06.t:49 tried '-u 65533 -g 65533 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:52 tried '-u 65534 -g 65534 chmod NAME 0077', expected 0, got EPERM
+open/06.t:53 tried '-u 65534 -g 65534 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:56 tried '-u 65534 -g 65534 chmod NAME 0707', expected 0, got EPERM
+open/06.t:57 tried '-u 65533 -g 65534 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:6 tried '-u 65534 -g 65534 open NAME O_WRONLY,', expected 0, got EACCES
+open/06.t:60 tried '-u 65534 -g 65534 chmod NAME 0770', expected 0, got EPERM
+open/06.t:61 tried '-u 65533 -g 65533 open NAME O_RDONLY,', expected EACCES, got 0
+open/06.t:66 tried '-u 65534 -g 65534 chmod NAME 0600', expected 0, got EPERM
+open/06.t:68 tried '-u 65534 -g 65534 open NAME O_RDWR', expected 0, got EACCES
+open/06.t:69 tried '-u 65534 -g 65534 chmod NAME 0060', expected 0, got EPERM
+open/06.t:7 tried '-u 65534 -g 65534 open NAME O_RDWR,', expected 0, got EACCES
+open/06.t:71 tried '-u 65533 -g 65534 open NAME O_RDWR', expected 0, got EACCES
+open/06.t:72 tried '-u 65534 -g 65534 chmod NAME 0006', expected 0, got EPERM
+open/06.t:74 tried '-u 65533 -g 65533 open NAME O_RDWR', expected 0, got EACCES
+open/06.t:75 tried '-u 65534 -g 65534 chmod NAME 0477', expected 0, got EPERM
+open/06.t:79 tried '-u 65534 -g 65534 chmod NAME 0747', expected 0, got EPERM
+open/06.t:8 tried '-u 65534 -g 65534 chmod NAME 0060', expected 0, got EPERM
+open/06.t:83 tried '-u 65534 -g 65534 chmod NAME 0774', expected 0, got EPERM
+open/06.t:87 tried '-u 65534 -g 65534 chmod NAME 0177', expected 0, got EPERM
+open/06.t:88 tried '-u 65534 -g 65534 open NAME O_RDONLY,O_NONBLOCK', expected EACCES, got 0
+open/06.t:91 tried '-u 65534 -g 65534 chmod NAME 0717', expected 0, got EPERM
+open/06.t:92 tried '-u 65533 -g 65534 open NAME O_RDONLY,O_NONBLOCK', expected EACCES, got 0
+open/06.t:95 tried '-u 65534 -g 65534 chmod NAME 0771', expected 0, got EPERM
+open/06.t:96 tried '-u 65533 -g 65533 open NAME O_RDONLY,O_NONBLOCK', expected EACCES, got 0
+open/06.t:99 tried '-u 65534 -g 65534 chmod NAME 0077', expected 0, got EPERM
+open/07.t:11 tried '-u 65534 -g 65534 chmod NAME 0177', expected 0, got EPERM
+open/07.t:13 tried '-u 65534 -g 65534 chmod NAME 0717', expected 0, got EPERM
+open/07.t:15 tried '-u 65534 -g 65534 chmod NAME 0771', expected 0, got EPERM
+open/07.t:17 tried '-u 65534 -g 65534 chmod NAME 0077', expected 0, got EPERM
+open/07.t:19 tried '-u 65534 -g 65534 chmod NAME 0707', expected 0, got EPERM
+open/07.t:21 tried '-u 65534 -g 65534 chmod NAME 0770', expected 0, got EPERM
+open/07.t:23 tried '-u 65534 -g 65534 open NAME O_RDONLY : fstat 0 size', expected 1, got 0
+open/07.t:4 tried '-u 65534 -g 65534 open NAME O_WRONLY : write 0 x : fstat 0 size', expected 1, got EACCES
+open/07.t:5 tried '-u 65534 -g 65534 chmod NAME 0477', expected 0, got EPERM
+open/07.t:7 tried '-u 65534 -g 65534 chmod NAME 0747', expected 0, got EPERM
+open/07.t:9 tried '-u 65534 -g 65534 chmod NAME 0774', expected 0, got EPERM
+rename/09.t:2336 tried 'lstat NAME/NAME type,uid,gid', expected dir,65534,65534, got dir,SERVER_UID,SERVER_GID
+rename/09.t:2348 tried 'lstat NAME/NAME type,uid,gid', expected dir,65534,65534, got dir,SERVER_UID,SERVER_GID
+rename/10.t:2049 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got EACCES
+rename/10.t:2050 tried 'lstat NAME/NAME type', expected ENOENT, got dir
+rename/10.t:2051 tried 'lstat NAME/NAME inode', expected INODE_A, got INODE_B
+rename/10.t:2054 tried '-u 65534 -g 65534 mkdir NAME/NAME 0755', expected 0, got EEXIST
+rename/10.t:2056 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got EACCES
+rename/10.t:2057 tried 'lstat NAME/NAME type', expected ENOENT, got dir
+rename/10.t:2058 tried 'lstat NAME/NAME inode', expected INODE_A, got INODE_B
+rename/10.t:2061 tried '-u 65534 -g 65534 mkdir NAME/NAME 0755', expected 0, got EEXIST
+rename/10.t:2063 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got EACCES
+rename/10.t:2064 tried 'lstat NAME/NAME type', expected ENOENT, got dir
+rename/10.t:2065 tried 'lstat NAME/NAME inode', expected INODE_A, got INODE_B
+rename/10.t:2068 tried '-u 65534 -g 65534 mkdir NAME/NAME 0755', expected 0, got EEXIST
+rename/10.t:2070 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got EPERM
+rename/10.t:2071 tried 'lstat NAME/NAME type', expected ENOENT, got dir
+rename/10.t:2072 tried 'lstat NAME/NAME inode', expected INODE_A, got INODE_B
+rename/10.t:2075 tried '-u 65534 -g 65534 mkdir NAME/NAME 0755', expected 0, got EEXIST
+rename/10.t:2077 tried '-u 65534 -g 65534 rename NAME/NAME NAME/NAME', expected 0, got EPERM
+rename/10.t:2078 tried 'lstat NAME/NAME type', expected ENOENT, got dir
+rename/10.t:2079 tried 'lstat NAME/NAME inode', expected INODE_A, got INODE_B
+rename/10.t:2082 tried '-u 65534 -g 65534 mkdir NAME/NAME 0755', expected 0, got EEXIST
+rename/10.t:2094 tried 'lstat NAME/NAME uid,gid', expected 65533,65533, got SERVER_UID,SERVER_GID
+rmdir/11.t:6 tried 'lstat NAME/NAME type,uid,gid', expected dir,65534,65534, got dir,SERVER_UID,SERVER_GID
+truncate/05.t:10 tried '-u 65534 -g 65534 stat NAME/NAME size', expected 123, got 0
+truncate/05.t:11 tried '-u 65534 -g 65534 truncate NAME/NAME 1234', expected 0, got EACCES
+truncate/05.t:12 tried '-u 65534 -g 65534 stat NAME/NAME size', expected 1234, got 0
+truncate/05.t:5 tried '-u 65534 -g 65534 truncate NAME/NAME 123', expected 0, got EACCES
+truncate/05.t:6 tried '-u 65534 -g 65534 stat NAME/NAME size', expected 123, got 0

@@ -1,0 +1,18 @@
+; Concurrent verified I/O: every job writes its own file, then reads it back and checks each block's crc32c. This covers contents under concurrency only; fsx owns the size contract.
+[global]
+ioengine=psync
+verify=crc32c
+verify_fatal=1
+randseed=1
+numjobs=4
+fsync_on_close=1
+size=32m
+group_reporting
+
+[randwrite]
+rw=randwrite
+bsrange=4k-64k
+
+[seqwrite]
+rw=write
+bs=1m

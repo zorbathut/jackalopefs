@@ -51,7 +51,9 @@ cargo build --release
 cargo test --workspace
 ```
 
-The test suite runs real servers on loopback and, where `/dev/fuse` and `fusermount3` are available, real FUSE mounts; the mount tests skip themselves otherwise. `pjdfstest` can be pointed at a mount for a broader POSIX check; most of it needs root, the non-root subset is the relevant part here.
+The test suite runs real servers on loopback and, where `/dev/fuse` and `fusermount3` are available, real FUSE mounts; the mount tests skip themselves otherwise.
+
+`scripts/validate/all.sh` runs the external validation suites (pjdfstest, fsx, fsstress, fio) plus resilience and cache-coherence checks of our own against a fresh server and mount; `docs/validation.md` describes them, their prerequisites, and what the results mean.
 
 ## License
 
