@@ -1,9 +1,9 @@
-//! Change notification: inotify on the export root, folded into short batches and fanned out to sessions. A session is not told about changes it made itself.
+//! Change notification: one inotify watch per directory under the export, placed by a walker thread that skips what it cannot list, folded into short batches and fanned out to sessions. A session is not told about changes it made itself. Each directory's watch also reports that directory's own deletion or move, which its parent's watch reports too; the batch folds the duplicate.
 //!
 //! This is a latency improvement, not the correctness mechanism: the client's cache TTL is the backstop. inotify misses `mmap` writes, has watch limits, and drops events under load; every such gap surfaces as [`EventItem::Overflow`] or is simply covered by the TTL.
 
 use jackalopefs_proto::{Event, EventItem, Name, Path};
-use notify::event::{ModifyKind, RenameMode};
+use notify::event::{CreateKind, ModifyKind, RenameMode};
 use notify::{EventKind, RecursiveMode, Watcher};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -210,19 +210,214 @@ fn origin_key(item: &EventItem) -> Option<OsString> {
     }
 }
 
-/// Keeps the inotify watcher alive; dropping it stops notifications.
+/// Directories this event brought into the tree: creates the kernel flagged as directories, and rename destinations that are directories right now (a rename is reported for files too, and the stat here keeps them off the walker's queue). Each needs its own walk, since nothing under a non-recursive watch is watched automatically. `RenameMode::Both` is not consulted: notify emits `To` for every `MOVED_TO` and adds `Both` alongside it only when it paired the cookie, so `To` alone is complete.
+fn arrivals(event: &notify::Event) -> Vec<PathBuf> {
+    match event.kind {
+        EventKind::Create(CreateKind::Folder) => event.paths.clone(),
+        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => event
+            .paths
+            .iter()
+            .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
+            .cloned()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[derive(Debug, Default)]
+struct WalkOutcome {
+    watched: usize,
+    skipped: usize,
+    /// The directory at which the inotify watch limit was hit; the walk stopped there and the rest of the tree is unwatched.
+    limit_hit: Option<PathBuf>,
+}
+
+/// The failure behind a watch error, without the path notify appends to its own message.
+fn io_cause(err: notify::Error) -> std::io::Error {
+    match err.kind {
+        notify::ErrorKind::Io(e) => e,
+        notify::ErrorKind::PathNotFound => std::io::ErrorKind::NotFound.into(),
+        other => std::io::Error::other(format!("{other:?}")),
+    }
+}
+
+/// Report a directory the walk is leaving out. An unreadable or vanished directory is routine on an export (snapshot directories, private home directories); anything else deserves attention.
+fn log_skip(dir: &std::path::Path, err: &std::io::Error) {
+    if matches!(
+        err.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+    ) {
+        tracing::debug!("not watching {}: {err}", dir.display());
+    } else {
+        tracing::warn!("not watching {}: {err}", dir.display());
+    }
+}
+
+/// Watch `top` and every directory below it, one non-recursive watch each. A directory below `top` that cannot be watched or listed is skipped: the server cannot list it for clients either, and its parent's watch still reports the entry itself. `top` itself failing is the error. Hitting the inotify watch limit ends the walk, keeping the watches placed so far; so does `stopping`. Symlinks are not followed; the server never resolves through them.
+///
+/// Each directory is watched before it is listed, so a subdirectory created meanwhile is found either by the listing or by the fresh watch's own create event (watching a path twice is harmless).
+fn watch_tree(
+    watcher: &mut notify::RecommendedWatcher,
+    top: &std::path::Path,
+    stopping: &AtomicBool,
+) -> Result<WalkOutcome, std::io::Error> {
+    let mut outcome = WalkOutcome::default();
+    let mut stack = vec![top.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if stopping.load(Ordering::Relaxed) {
+            break;
+        }
+        if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
+                outcome.limit_hit = Some(dir);
+                break;
+            }
+            let e = io_cause(e);
+            if dir == top {
+                return Err(e);
+            }
+            log_skip(&dir, &e);
+            outcome.skipped += 1;
+            continue;
+        }
+        outcome.watched += 1;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                log_skip(&dir, &e);
+                outcome.skipped += 1;
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    tracing::warn!("listing {}: {e}", dir.display());
+                    continue;
+                }
+            };
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                Ok(_) => {}
+                Err(e) => tracing::debug!("not examining {}: {e}", entry.path().display()),
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// A request to the walker thread.
+enum Walk {
+    /// Watch this directory and everything under it.
+    Tree(PathBuf),
+    Stop,
+}
+
+/// Owns the watcher: walks the root first, then every directory the event handler reports as new, until told to stop. Adding a watch is a round trip through notify's event loop, so this runs on its own thread rather than holding up event handling or the server's startup.
+fn walker(
+    mut watcher: notify::RecommendedWatcher,
+    root: PathBuf,
+    walks: std::sync::mpsc::Receiver<Walk>,
+    stopping: Arc<AtomicBool>,
+) {
+    let mut limit_logged = false;
+    let mut batch = vec![root.clone()];
+    loop {
+        // Take everything queued so far and collapse it: a root walk (a rescan after the kernel dropped events) covers every other request, and a burst of rescans is one walk, not a walk per overflow.
+        for request in walks.try_iter() {
+            match request {
+                Walk::Tree(dir) => batch.push(dir),
+                Walk::Stop => return,
+            }
+        }
+        if batch.contains(&root) {
+            batch = vec![root.clone()];
+        } else {
+            batch.sort();
+            batch.dedup();
+        }
+        for dir in batch.drain(..) {
+            if stopping.load(Ordering::Relaxed) {
+                return;
+            }
+            walk_and_report(&mut watcher, &root, &dir, &stopping, &mut limit_logged);
+        }
+        match walks.recv() {
+            Ok(Walk::Tree(dir)) => batch.push(dir),
+            Ok(Walk::Stop) | Err(_) => return,
+        }
+    }
+}
+
+/// One walk and its log lines: a root walk at info, any other at debug, a root that cannot be watched at all as the error it is.
+fn walk_and_report(
+    watcher: &mut notify::RecommendedWatcher,
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    stopping: &AtomicBool,
+    limit_logged: &mut bool,
+) {
+    let outcome = match watch_tree(watcher, dir, stopping) {
+        // A walk cut short by shutdown has no census worth reporting.
+        Ok(_) if stopping.load(Ordering::Relaxed) => return,
+        Ok(outcome) => outcome,
+        Err(e) if dir == root => {
+            tracing::error!(
+                "cannot watch {}: {e}; change notification disabled",
+                root.display()
+            );
+            return;
+        }
+        Err(e) => {
+            log_skip(dir, &e);
+            return;
+        }
+    };
+    if dir == root {
+        tracing::info!(
+            "watching {} directories under {} ({} skipped)",
+            outcome.watched,
+            root.display(),
+            outcome.skipped
+        );
+    } else {
+        tracing::debug!(
+            "watching {} directories under {} ({} skipped)",
+            outcome.watched,
+            dir.display(),
+            outcome.skipped
+        );
+    }
+    if let Some(at) = outcome.limit_hit {
+        if *limit_logged {
+            tracing::debug!("inotify watch limit reached at {}", at.display());
+        } else {
+            tracing::error!("inotify watch limit reached at {}; directories beyond it stay unwatched (raise fs.inotify.max_user_watches and restart)", at.display());
+            *limit_logged = true;
+        }
+    }
+}
+
+/// Keeps change notification alive. Dropping it stops the walker thread, which drops the inotify watcher, and aborts the debounce task.
 pub struct WatcherHandle {
-    _watcher: notify::RecommendedWatcher,
+    walks: std::sync::mpsc::Sender<Walk>,
+    stopping: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for WatcherHandle {
     fn drop(&mut self) {
+        // The flag ends a walk in progress; the message wakes the walker if it is idle. Dropping this sender would not: the event handler holds one too, inside the watcher the walker owns.
+        self.stopping.store(true, Ordering::Relaxed);
+        if self.walks.send(Walk::Stop).is_err() {
+            tracing::debug!("watch walker had already stopped");
+        }
         self.task.abort();
     }
 }
 
-/// Start watching `export_dir` recursively. Returns `None` (after logging) when watching is impossible, in which case clients fall back to their cache TTLs.
+/// Start watching `export_dir` and everything under it. Returns `None` (after logging) when no watcher can be created, in which case clients fall back to their cache TTLs; a root that cannot be watched is logged by the walker to the same effect. Watches are placed by a background walk, so the first changes after startup may arrive on a large export before its watch does; the TTL covers those too.
 pub fn spawn(
     export_dir: &std::path::Path,
     changes: Arc<ChangeLog>,
@@ -239,24 +434,43 @@ pub fn spawn(
         }
     };
     let (raw_tx, raw_rx) = mpsc::channel::<notify::Event>(RAW_QUEUE);
+    let (walk_tx, walk_rx) = std::sync::mpsc::channel::<Walk>();
+    let stopping = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicBool::new(false));
     let dropped_by_handler = dropped.clone();
-    let handler = move |result: notify::Result<notify::Event>| match result {
-        Ok(event) => {
-            // Opens, which the server itself generates in bulk, produce nothing downstream.
-            if matches!(event.kind, EventKind::Access(_)) {
-                return;
+    let handler = {
+        let root = root.clone();
+        let walks = walk_tx.clone();
+        // Watches for new directories are requested from here rather than from the debounce task so that a full raw queue can only ever lose client notifications, never watches. The handler cannot add them itself: a watch request waits on the event loop that is running the handler.
+        let request = move |dir: PathBuf| {
+            if walks.send(Walk::Tree(dir)).is_err() {
+                tracing::debug!("watch walker has stopped; new directories go unwatched");
             }
-            if raw_tx.try_send(event).is_err() {
+        };
+        move |result: notify::Result<notify::Event>| match result {
+            Ok(event) => {
+                // Opens, which the server itself generates in bulk, produce nothing downstream.
+                if matches!(event.kind, EventKind::Access(_)) {
+                    return;
+                }
+                // The kernel dropped events, possibly directory creations: re-walk everything.
+                if event.need_rescan() {
+                    request(root.clone());
+                }
+                for dir in arrivals(&event) {
+                    request(dir);
+                }
+                if raw_tx.try_send(event).is_err() {
+                    dropped_by_handler.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("inotify error: {e}");
                 dropped_by_handler.store(true, Ordering::Relaxed);
             }
         }
-        Err(e) => {
-            tracing::warn!("inotify error: {e}");
-            dropped_by_handler.store(true, Ordering::Relaxed);
-        }
     };
-    let mut watcher = match notify::recommended_watcher(handler) {
+    let watcher = match notify::recommended_watcher(handler) {
         Ok(watcher) => watcher,
         Err(e) => {
             tracing::error!(
@@ -265,14 +479,21 @@ pub fn spawn(
             return None;
         }
     };
-    if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-        tracing::error!("cannot watch {}: {e}; change notification disabled (check fs.inotify.max_user_watches)", root.display());
+    let spawned = std::thread::Builder::new()
+        .name("watch-walker".into())
+        .spawn({
+            let root = root.clone();
+            let stopping = stopping.clone();
+            move || walker(watcher, root, walk_rx, stopping)
+        });
+    if let Err(e) = spawned {
+        tracing::error!("cannot start the watch walker thread: {e}; change notification disabled");
         return None;
     }
-    tracing::info!("watching {} for changes", root.display());
     let task = tokio::spawn(debounce(root, raw_rx, dropped, changes, events));
     Some(WatcherHandle {
-        _watcher: watcher,
+        walks: walk_tx,
+        stopping,
         task,
     })
 }
@@ -479,7 +700,107 @@ mod tests {
         assert!(inner.by_path.contains_key(std::ffi::OsStr::new("f10")));
     }
 
-    /// Create files under `dir` until a batch reports an entry there, failing after 5 s.
+    #[test]
+    fn arrivals_are_directory_creates_and_rename_destinations() {
+        let ev = |kind: EventKind, paths: &[&std::path::Path]| notify::Event {
+            kind,
+            paths: paths.iter().map(PathBuf::from).collect(),
+            attrs: Default::default(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        let file = tmp.path().join("f");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        let gone = tmp.path().join("gone");
+        assert_eq!(
+            arrivals(&ev(EventKind::Create(CreateKind::Folder), &[&gone])),
+            std::slice::from_ref(&gone),
+            "the kernel said directory; no stat needed"
+        );
+        assert_eq!(
+            arrivals(&ev(
+                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+                &[&dir, &file, &gone]
+            )),
+            std::slice::from_ref(&dir),
+            "only rename destinations that are directories"
+        );
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
+            EventKind::Remove(notify::event::RemoveKind::Folder),
+        ] {
+            assert!(
+                arrivals(&ev(kind, &[&dir])).is_empty(),
+                "{kind:?} brings no directory into the tree"
+            );
+        }
+    }
+
+    /// Restores a directory's mode on drop, so a failed assertion does not leave a tempdir that cannot be removed.
+    struct ModeGuard(PathBuf);
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            // Not unwrapped: a panic here during an assertion failure's unwind would abort the whole test binary.
+            if let Err(e) =
+                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755))
+            {
+                eprintln!("cannot restore the mode of {}: {e}", self.0.display());
+            }
+        }
+    }
+
+    #[test]
+    fn watch_tree_skips_unlistable_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(top.join("a/b")).unwrap();
+        let c = top.join("c");
+        std::fs::create_dir(&c).unwrap();
+        std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = ModeGuard(c.clone());
+        if std::fs::read_dir(&c).is_ok() {
+            eprintln!("mode bits are not enforced for this user; nothing to test");
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+                // The receiver is gone once the test has what it needs.
+                let _ = tx.send(result);
+            })
+            .unwrap();
+        let outcome = watch_tree(&mut watcher, &top, &AtomicBool::new(false)).unwrap();
+        assert_eq!(outcome.watched, 3, "top, a and a/b");
+        assert_eq!(outcome.skipped, 1, "c");
+        assert!(outcome.limit_hit.is_none());
+        let err = watch_tree(&mut watcher, &c, &AtomicBool::new(false)).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "the top itself failing is the error"
+        );
+        let file = top.join("a/b/f");
+        std::fs::write(&file, b"x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let event = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("no create event for a/b/f before the deadline")
+                .unwrap();
+            if matches!(event.kind, EventKind::Create(_)) && event.paths.contains(&file) {
+                break;
+            }
+        }
+    }
+
+    /// Create files under `dir` until a batch reports an entry there, failing after 5 s. The walk that watches a new directory runs on its own thread, so the first files may land before the watch does.
     async fn wait_until_watched(
         events: &mut broadcast::Receiver<Arc<EventBatch>>,
         root: &std::path::Path,
@@ -510,6 +831,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn new_directories_are_watched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export = tmp.path().join("export");
+        let staging = tmp.path().join("staging");
+        std::fs::create_dir(&export).unwrap();
+        std::fs::create_dir(&staging).unwrap();
+        let export = export.canonicalize().unwrap();
+        let (events, mut rx) = broadcast::channel(256);
+        let _watcher = spawn(&export, Arc::new(ChangeLog::default()), events).expect("watcher");
+        // Until the root walk has listed the (empty) root, a directory created there would be found by that listing rather than by its own create event, which is the path under test. An event from the root takes at least one debounce window to arrive, by which time the listing is long done.
+        wait_until_watched(&mut rx, &export, "").await;
+
+        std::fs::create_dir(export.join("d")).unwrap();
+        wait_until_watched(&mut rx, &export, "d").await;
+
+        std::fs::create_dir_all(staging.join("e/sub")).unwrap();
+        std::fs::rename(staging.join("e"), export.join("e")).unwrap();
+        wait_until_watched(&mut rx, &export, "e/sub").await;
     }
 
     #[tokio::test]
