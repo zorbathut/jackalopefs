@@ -3,6 +3,7 @@ use clap::Parser;
 use jackalopefs_client::mount::{Mount, MountOptions};
 use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::Auth;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -46,6 +47,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
