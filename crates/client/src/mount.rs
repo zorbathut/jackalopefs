@@ -80,10 +80,19 @@ impl Mount {
     /// Unmount, stop invalidating, and close the connection. Every step is bounded.
     pub async fn unmount(mut self) -> anyhow::Result<()> {
         let outcome = match self.session.take() {
-            Some(session) => tokio::task::spawn_blocking(move || session.umount_and_join())
-                .await
-                .context("unmount task")?
-                .context("unmounting"),
+            Some(session) => {
+                match tokio::task::spawn_blocking(move || session.umount_and_join())
+                    .await
+                    .context("unmount task")?
+                {
+                    // umount2 answers EINVAL when the target is no longer a mount point: someone detached it already (fusermount3 -uz), which is the end state wanted here. The unprivileged path gets the same leniency from fusermount.
+                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                        tracing::info!("the mount point was already detached");
+                        Ok(())
+                    }
+                    outcome => outcome.context("unmounting"),
+                }
+            }
             None => Ok(()),
         };
         if let Some(invalidator) = self.invalidator.take() {
