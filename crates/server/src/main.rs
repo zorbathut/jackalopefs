@@ -20,7 +20,7 @@ struct Args {
     #[arg(long)]
     export: PathBuf,
     /// Address to listen on. Anything but loopback lets every host that can reach it read and write the export as this user unless --token is set.
-    #[arg(long, default_value = "127.0.0.1:4433")]
+    #[arg(long, default_value_t = SocketAddr::from(([127, 0, 0, 1], jackalopefs_proto::DEFAULT_PORT)))]
     listen: SocketAddr,
     /// Where the certificate and key live (default: $XDG_STATE_HOME/jackalopefs or ~/.local/state/jackalopefs).
     #[arg(long)]
@@ -112,5 +112,19 @@ async fn wait_for_shutdown_signal() {
     tokio::select! {
         result = tokio::signal::ctrl_c() => if let Err(e) = result { tracing::error!("cannot listen for SIGINT: {e}"); std::future::pending::<()>().await },
         _ = term.recv() => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listens_on_the_default_port() {
+        let args = Args::parse_from(["jackalopefs-server", "--export", "/x"]);
+        assert_eq!(
+            args.listen,
+            SocketAddr::from(([127, 0, 0, 1], jackalopefs_proto::DEFAULT_PORT))
+        );
     }
 }

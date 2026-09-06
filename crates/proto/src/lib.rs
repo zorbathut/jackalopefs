@@ -34,6 +34,9 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
 /// The revision of the protocol this build speaks, carried in `Hello` and compared by the server: the hash of the schema file's exact bytes, comments included, so any edit to the file is a new revision and peers built from different ones refuse each other. Shown as 16 hex digits.
 pub const PROTO_REVISION: u64 = fnv1a(include_bytes!("../schema/jackalopefs.capnp"));
 
+/// UDP port the server listens on and the client connects to unless told otherwise.
+pub const DEFAULT_PORT: u16 = 1933;
+
 /// TLS ALPN identifier; the QUIC handshake refuses peers that don't offer it. Changing it is a protocol change: edit the schema so the revision moves.
 pub const ALPN: &[u8] = b"jackalopefs/1";
 

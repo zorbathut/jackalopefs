@@ -13,15 +13,15 @@ Jackalope FS has been used by exactly one person in exactly one situation. You s
 Server:
 
 ```
-jackalopefs-server --export /srv/share --listen 0.0.0.0:4433 [--token SECRET]
+jackalopefs-server --export /srv/share --listen 0.0.0.0:1933 [--token SECRET]
 ```
 
-On first start it generates a certificate under `$XDG_STATE_HOME/jackalopefs` (or `~/.local/state/jackalopefs`) and logs its fingerprint. The default listen address is loopback; anything else without `--token` lets every host that can reach the port read and write the export as the server user. On your own head be it.
+On first start it generates a certificate under `$XDG_STATE_HOME/jackalopefs` (or `~/.local/state/jackalopefs`) and logs its fingerprint. The default listen address is loopback, port 1933; anything else without `--token` lets every host that can reach the port read and write the export as the server user. On your own head be it.
 
 Client:
 
 ```
-jackalopefs-client server:4433 /mnt/share --fingerprint sha256:… [--token SECRET]
+jackalopefs-client server:1933 /mnt/share --fingerprint sha256:… [--token SECRET]
 ```
 
 `--fingerprint` pins the server certificate; `--insecure` skips that check (the connection is still encrypted). Other options: `--op-timeout 30s`, `--connect-timeout 10s`, `--entry-timeout 1s`, `--attr-timeout 1s`, `--allow-other`, `--auto-unmount`, `--default-permissions`. The client runs in the foreground and unmounts on `SIGINT`/`SIGTERM`.
