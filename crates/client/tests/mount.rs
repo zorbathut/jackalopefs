@@ -144,7 +144,7 @@ async fn posix_basics_through_the_mount() {
         assert_eq!(fs::read(mnt.join("b.txt")).unwrap(), b"hello world");
         assert!(fs::metadata(mnt.join("a.txt")).is_err());
 
-        // Unlink while open: the handle keeps working, the name is gone.
+        // Unlink while open: the handle keeps working, the name is gone, and fstat and fchmod, which reach the client without a handle, are answered from one it still holds.
         let mut open = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -158,6 +158,11 @@ async fn posix_basics_through_the_mount() {
             fs::metadata(mnt.join("gone")).unwrap_err().kind(),
             std::io::ErrorKind::NotFound
         );
+        let md = open.metadata().unwrap();
+        assert_eq!((md.nlink(), md.len()), (0, 10));
+        open.set_permissions(fs::Permissions::from_mode(0o600))
+            .unwrap();
+        assert_eq!(open.metadata().unwrap().mode() & 0o777, 0o600);
         open.seek(SeekFrom::Start(0)).unwrap();
         let mut back = String::new();
         open.read_to_string(&mut back).unwrap();

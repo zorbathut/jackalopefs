@@ -11,4 +11,5 @@
 
 ### Fixed
 
+- `fstat`, `fchmod`, `fchown` and `futimens` on a file unlinked while open returned `ESTALE`; the kernel sends those requests without a handle, and the client now answers from a handle it still holds on the inode.
 - The server passed the export filesystem's `f_namelen` through unclamped; it is now capped at the protocol's `NAME_MAX` (255), which `pathconf(_PC_NAME_MAX)` is answered from.

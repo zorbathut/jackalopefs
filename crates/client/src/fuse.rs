@@ -180,12 +180,18 @@ impl Shared {
         self.nodes.lock().path_of(ino).ok_or(Errno::ESTALE)
     }
 
-    /// The path for an operation that may also carry a handle: an unlinked-but-open file has no path, and then the handle is all the server gets.
-    fn path_for_handle_op(&self, ino: u64, fh: Option<u64>) -> Result<Option<Path>, Errno> {
-        match (self.nodes.lock().path_of(ino), fh) {
-            (Some(path), _) => Ok(Some(path)),
-            (None, Some(_)) => Ok(None),
-            (None, None) => Err(Errno::ESTALE),
+    /// The path and handle for an operation that may carry a handle. An unlinked-but-open file has no path, and then a handle is all the server gets: the one the kernel sent, or any handle still open on the inode, because `fstat` and the `f*` attribute calls (`fchmod`, `fchown`, `futimens`) arrive without one. Any live handle serves: attributes are read and set through the descriptor whatever it was opened for, and a size change always carries the kernel's own handle.
+    fn path_for_handle_op(
+        &self,
+        ino: u64,
+        fh: Option<u64>,
+    ) -> Result<(Option<Path>, Option<u64>), Errno> {
+        if let Some(path) = self.nodes.lock().path_of(ino) {
+            return Ok((Some(path), fh));
+        }
+        match fh.or_else(|| self.client.handles().any_live_for(ino)) {
+            Some(fh) => Ok((None, Some(fh))),
+            None => Err(Errno::ESTALE),
         }
     }
 
@@ -335,7 +341,7 @@ impl Filesystem for Backend {
         let shared = self.shared.clone();
         let fh = fh.map(|f| f.0);
         self.spawn(async move {
-            let path = match shared.path_for_handle_op(ino.0, fh) {
+            let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
                 Ok(path) => path,
                 Err(e) => return reply.error(e),
             };
@@ -377,7 +383,7 @@ impl Filesystem for Backend {
             mtime: mtime.map(time_or_now),
         };
         self.spawn(async move {
-            let path = match shared.path_for_handle_op(ino.0, fh) {
+            let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
                 Ok(path) => path,
                 Err(e) => return reply.error(e),
             };

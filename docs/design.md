@@ -109,7 +109,7 @@ The server's certificate authenticates the server to a client that pins its fing
 - Multiple clients: cache coherence between them is best-effort (push invalidation plus TTL), and locks are local to each client.
 - No `FUSE_INTERRUPT` handling (a fuser limitation): `SIGKILL` on a blocked process takes effect when the operation completes or times out.
 - Device nodes, `chown` to other users, and `RENAME_WHITEOUT` need privileges the server does not have and fail with the kernel's errno.
-- Metadata operations that reach the server without a handle (xattrs) fail on a file that has been unlinked while open; those with a handle (stat, truncate, times, fsync, read, write) work.
+- Metadata operations that reach the server without a handle (xattrs) fail on a file that has been unlinked while open; those with a handle, or for which the client still holds one (stat, chmod, chown, times, truncate, fsync, read, write through the descriptor), work.
 
 ## Follow-ups
 

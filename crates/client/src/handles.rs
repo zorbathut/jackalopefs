@@ -96,6 +96,15 @@ impl HandleTable {
         self.len() == 0
     }
 
+    /// Any live handle on `nodeid`, for an operation that arrives without one after the node's last name is gone (`fstat`, `fchmod` and the like on an unlinked file).
+    pub fn any_live_for(&self, nodeid: u64) -> Option<u64> {
+        self.map
+            .lock()
+            .iter()
+            .find(|(_, r)| r.nodeid == nodeid && !r.is_dead())
+            .map(|(fh, _)| *fh)
+    }
+
     /// Node ids of every live handle, for post-reconnect invalidation.
     pub fn open_nodeids(&self) -> Vec<u64> {
         self.map
@@ -186,5 +195,20 @@ mod tests {
         assert!(table.open_nodeids().is_empty());
         assert!(table.live().is_empty());
         assert!(table.alloc() > fh);
+    }
+
+    #[test]
+    fn any_live_handle_for_a_node() {
+        let table = HandleTable::default();
+        let a = table.alloc();
+        let rec_a = table.insert(a, 42, Path::root(), libc::O_RDONLY, HandleKind::File);
+        let b = table.alloc();
+        table.insert(b, 43, Path::root(), libc::O_RDONLY, HandleKind::File);
+        assert_eq!(table.any_live_for(42), Some(a));
+        assert_eq!(table.any_live_for(43), Some(b));
+        assert_eq!(table.any_live_for(44), None);
+        table.apply_reopen(a, &rec_a, Ok(Response::Opened { attr: attr(99) }));
+        assert!(rec_a.is_dead());
+        assert_eq!(table.any_live_for(42), None);
     }
 }
