@@ -1,0 +1,116 @@
+# jackalopefs design
+
+A client/server network mount for Linux. One server exports one directory over QUIC; a client mounts it through FUSE. Both run as ordinary users. This document is the durable description of the protocol, the architecture, and the limits; the research notes that motivated it are in `research-fusex.md`.
+
+## Goals
+
+- Correct POSIX semantics with a single attached client; best-effort coherence with several.
+- No dependence on ssh, NFS, or any other authentication system: anonymous by default, an optional shared token, TLS with a pinned server fingerprint.
+- Never deadlock: every wait has a deadline, on both sides. A vanished server produces errors, not hung processes.
+- Parallelism where operations are independent (one QUIC stream per request), ordering only where it matters (the handshake and the event stream).
+- Keep the client's kernel cache honest with server-pushed invalidation, with the cache TTL as the correctness backstop.
+
+## Wire format (`jackalopefs-proto`)
+
+The protocol is defined by two things together: the Cap'n Proto schema in `crates/proto/schema/jackalopefs.capnp`, which is the language-neutral description of every message, and this section, which states what the schema cannot. Cap'n Proto is used for serialization only. Its RPC layer would multiplex calls over one byte stream, which would undo the one-QUIC-stream-per-request design and its per-request cancellation, so it is not used.
+
+**Streams.** Every frame is a little-endian `u32` byte length followed by exactly that many bytes holding one standard Cap'n Proto message (segment table followed by segment data). The body is at most 2 097 152 bytes, not counting the four-byte prefix; a decoder that reads a larger prefix closes the stream without reading the body. A single read or write payload is at most 1 MiB.
+
+| Stream | Direction | Contents |
+|---|---|---|
+| first bidi, opened by the client | client → server | one `Hello` frame, then the client finishes its side; the server answers with one `HelloReply` frame and finishes. `Ack` carries the session id and resume token; `Reject` (unsupported `protoVersion`, bad token) is followed by the server closing the connection once the reply has been read. Request streams must not be opened before the `Ack`. |
+| one bidi per request, opened by the client | client → server | one `Request` frame, client finishes; one `Response` frame, server finishes. A stream that ends before a complete frame arrived is a cancelled request, never a shorter valid message; the length prefix is what makes that detectable. |
+| one uni, opened by the server after the `Ack` | server → client | `Event` frames in order for the life of the connection |
+
+Resumption: a client that reconnects sends its previous session id and resume token in `Hello.resume`; the `Ack` says whether the session was resumed (`resumed = true`, every handle still open) or is new.
+
+**Single segment.** Every frame body carries exactly one segment, so its segment table is the eight bytes `[0, length_in_words]` and the message contains no far pointers. Encoders must produce this (ours pre-sizes the first segment from the message and, if that estimate was short, canonicalizes into one segment; canonical form drops trailing zero words from struct sections, so the same logical message has more than one valid encoding and decoders must accept both). Decoders reject any other segment count. This is the rule that keeps a decoder in another language, or in a kernel, small.
+
+**Reader limits.** A conforming decoder applies a traversal limit of four times the largest frame (1 Mi words), a nesting limit of 16 (the deepest real message is four pointer levels: `Response` → `List(DirEntryPlus)` → `DirEntryPlus` → `Attr`; groups are inline), treats bytes left over after the message inside a frame as an error, and rejects a struct list that declares more elements than the message has words (a zero-sized element type would otherwise let a 40-byte frame declare a million entries). With those checks the memory a frame can produce is bounded by a small multiple of its size.
+
+**Decoders reject.** These are checked while parsing, and a message that fails them is a decode error, not a filesystem error:
+
+- A name (`Data`) is 1 to 255 bytes, contains no `/` and no NUL, and is not `.` or `..`.
+- A path (`List(Data)`) is at most 4096 bytes when joined with `/`. The empty path is the export root, and so is an omitted path pointer: a null list pointer reads as an empty list.
+- A resume token is exactly 16 bytes.
+- `reason` in a rejection is UTF-8. Every other byte field, the auth token included, is arbitrary bytes compared as bytes.
+- An unknown union discriminant or enum value (a peer speaking a newer schema) is a decode error, never a guess.
+
+**Senders guarantee.** These cannot be checked by a decoder; a receiver treats a violation as an ordinary error on that request:
+
+- `getattr` and `setattr` carry a path, a handle, or both, never neither (`EINVAL` otherwise); when both are present the handle wins and there is no fallback to the path.
+- `fh` values are chosen by the client and never reused within a client's lifetime.
+- `err` is a Linux errno (the client clamps unknown values to `EIO`); `flags`, `mode` and `mask` are Linux values; `nextOffset` is a `getdents64` cookie.
+
+**Optionals.** Every optional value is an explicit `none`/`some` union. For primitives that is the only representation Cap'n Proto has (a sentinel like mode 0 or uid 0 would be a real value); for pointer-typed optionals (`Option<Path>`, `Option<Attr>`) a null pointer would also work and is distinguishable from an empty list, but one rule is easier to implement than two and absence shows up in the text form.
+
+**Layout choices.** Request variants are groups inside one union, so a request is a flat struct of three data words and four pointer words whatever its variant; the members overlap. Adding a field to any group can grow every request by eight bytes, the accepted price for one fewer pointer hop and traversal charge per request. Timestamps inside `Attr` are groups, not `TimeSpec` pointers. Replies that carry an `Attr` (`entry`, `opened`) and the `read` reply are groups so per-reply fields can be added later without a break. `err` is the first `Response` member so an all-zero message reads as an error and fails closed. Measured: the smallest request (`release`) is 72 bytes on the wire, `ok` is 32, a 1 MiB write is 1 048 648, and a `readdirPlus` entry with a one-byte name costs 152; on a QUIC stream none of this is worth optimising.
+
+**Evolution.** Union discriminant values follow ordinal order, not declaration order: reordering declarations is safe, renumbering ordinals breaks every peer. A group's position in a union is its lowest member ordinal, so new fields and new union members are appended with fresh, higher ordinals and never inserted. The compiler accepts out-of-order ordinals without complaint, so a renumber will not be caught by it; the golden-bytes test in `crates/proto/src/codec.rs` exists to catch it. A decoder that meets an unknown discriminant or enum value reports a decode error rather than guessing. `PROTO_VERSION` is 1 and means this format; there was never a released version 1 of anything else.
+
+**Generated code.** The Rust readers and builders are generated at build time by `capnpc`, which shells out to the `capnp` compiler; that is a build requirement documented in the README. The generated code is not checked in: it is fifteen thousand lines that would sit in every commit, and a test asserting it matched the schema would need the compiler anyway. Zero-copy delivery of read payloads (handing the kernel a slice of the frame buffer) is a follow-up; today each `Data` field is copied once out of the frame, the same count as before.
+
+## Server (`jackalopefs-server`)
+
+**Export root and path resolution.** The export directory is opened once as an `O_PATH` fd. Every client path is resolved with `openat2(root, path, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`, either to the node itself (an `O_PATH` fd pinning the inode) or to its parent directory plus a single validated component for the `*at` family. No multi-component client path reaches any other syscall, so a symlink or mount point inside the export cannot lead outside it. Operations with no `*at`/`AT_EMPTY_PATH` form (chmod, xattrs, access) re-enter the pinned fd through `/proc/self/fd/N`. Requires Linux 5.6 or later; the server probes `openat2` at startup.
+
+**Inode numbers.** The client uses the server's `st_ino` directly as its FUSE nodeid, so the server maps the export root's inode number to 1 (the FUSE root id) in every attribute and directory entry it sends, and `RESOLVE_NO_XDEV` keeps inode numbers unique by refusing to cross into another filesystem.
+
+**Operations** run on tokio's blocking pool, one task per request stream, and no syscall reachable from a request may block indefinitely: every open is `O_NONBLOCK` (all I/O is positional, so the flag changes nothing for regular files) and only regular files and directories can be opened through a handle, since the FUSE kernel handles FIFOs, sockets and devices itself and never asks the server to open one. Files are read and written positionally (`pread`/`pwrite`), so concurrent requests on one handle need no lock; a directory handle's read position is shared state and is serialised per handle. Directory listings use `getdents64` and return the real `d_off` cookies, so a client `readdir(offset)` is a genuine `seekdir`; the `..` entry carries the parent's mapped inode number and the export root's own for the root. The server runs with `umask(0)` because the client kernel has already applied the caller's umask, and creates its own state files with explicit modes. `mknod` accepts regular files, FIFOs and sockets; device nodes need `CAP_MKNOD` and are refused.
+
+**Sessions and resumption.** Each connection attaches to a session holding the open-handle table. When a connection drops, the session is detached and kept for a 60-second grace period; a client that reconnects with the session id and resume token gets the same handles back, including files that were unlinked while open. The client chooses handle ids and never reuses one, so when an open's outcome is unknown (timeout, lost connection, malformed reply) the client asks the server to release that id: releasing an id that was never opened is a harmless no-op, and releasing one that was closes the fd. A session holds at most 16384 handles (`EMFILE` beyond), at most 64 sessions wait detached at once (the oldest is dropped early), and at most 64 connections are accepted.
+
+**Change notification.** A recursive inotify watch (via the `notify` crate) on the export root feeds a 100 ms debouncer that deduplicates items and broadcasts one batch per window to every session. Each mutating request records `(path, session)` first; the inotify event it produces consumes that record, so the originating session is not told about its own change while a later change to the same path by anyone else is reported normally. A session that falls behind the broadcast, or an inotify queue overflow, produces a single `Overflow`. If the watch cannot be established (watch limit, unusual filesystem) the server logs it and runs without notification.
+
+**Transport.** TLS 1.3 only, ALPN `jackalopefs/1`, a self-signed certificate generated once and persisted in the state directory so its fingerprint is stable. Idle timeout 10 s; per-stream receive window 2 MiB; connection receive and send windows 64 MiB (quinn's default receive window is unbounded, which an anonymous peer could turn into memory exhaustion); at most 1024 request streams per connection and 64 connections. Directory listings are budgeted against the actual Cap'n Proto entry size so a full `MAX_IO` page of entries stays well inside a frame.
+
+## Client (`jackalopefs-client`)
+
+**Connection manager.** One background task owns the QUIC connection. It connects, completes the hello, then either resumes (nothing to do) or reopens every live handle by path, concurrently, and compares the inode number the server reports with the one the handle was opened on, marking mismatches and failures stale and releasing those ids on the server. Only then does it publish the connection; each step carries the operation deadline, so the phase takes at most two of them. When the connection closes it retries with exponential backoff (100 ms to 5 s) forever, until unmount. Keep-alive pings every 3 s detect a vanished server within the 10 s idle timeout.
+
+**Calls and deadlines.** Every call has one deadline (default 30 s) covering waiting for a connection, opening the stream, sending, and receiving. On timeout the client resets its send side and stops its receive side so the server sees a cancellation. A request that was never sent simply waits for the next connection. A request whose reply was lost with the connection is resent once on the next connection only when that cannot change the outcome: lookups, reads, readdir, stat, xattr reads, access, release, fsync, absolute setattr, opens without `O_TRUNC`, creates without `O_EXCL`/`O_TRUNC`, writes on non-append handles. Everything else fails with `EIO`.
+
+Errnos: `ETIMEDOUT` when the deadline passes, `EIO` when the connection was lost mid-request, `ESTALE` when a node or handle no longer refers to the file it did, `ENOTCONN` after unmount.
+
+**Node table.** A nodeid is the server's inode number, so hardlinks share a node and `st_ino` is stable. For each node the table keeps the `(parent, name)` aliases it has been reached through, the kernel's lookup count, and a generation. Paths are reconstructed through the newest alias. When the last known alias disappears through this client (unlink, rmdir, rename-over), the node is marked unlinked; if a later lookup returns the same inode number, the generation is bumped so the kernel treats it as a new file rather than aliasing a recycled inode number to stale cached data. The table is guarded by a `parking_lot::Mutex` that is never held across an await or a notifier call.
+
+**FUSE backend.** Each kernel request is copied out of the session thread and answered from a tokio task; the session thread never waits on the network. `init` asks for 1 MiB `max_write`/`max_readahead`, 64 background requests, and `ATOMIC_O_TRUNC | ASYNC_READ | PARALLEL_DIROPS | AUTO_INVAL_DATA | DO_READDIRPLUS | READDIRPLUS_AUTO`. There is no writeback cache and no `keep_cache`: writes go through immediately, which keeps single-client semantics exact and means a reconnect never loses dirty data, at the cost of one round trip per `write(2)`. Entry and attribute TTLs default to 1 s. Directory reads fetch 256 KiB of entries per server round trip and serve the kernel's smaller pages from a per-handle buffer keyed by cookie. `.` and `..` map to the directory's own and parent nodeids and never take a lookup count; a readdirplus entry takes one only when fuser's buffer accepted it. `flush` completes locally (nothing is buffered); `fsync` and `fsyncdir` go to the server. Locks (`getlk`/`setlk`/`flock`) are not implemented, so the kernel handles them locally, which is correct for a single client.
+
+**Invalidation.** Server events resolve through the node table to `inval_entry(parent, name)` and `inval_inode(ino)` calls. These are blocking writes to `/dev/fuse` that can wait on kernel directory locks, so they run on a dedicated thread fed by a bounded queue. After every reconnect, and on `Overflow`, the client invalidates every open file and up to 4096 known directory entries; the TTL covers anything beyond that.
+
+## Timeouts
+
+| Where | What | Default |
+|---|---|---|
+| client | one filesystem operation, end to end | 30 s (`--op-timeout`) |
+| client | one connection attempt | 10 s (`--connect-timeout`) |
+| both | QUIC idle timeout | 10 s |
+| client | keep-alive interval | 3 s |
+| client | reconnect backoff | 100 ms → 5 s |
+| server | hello after connect | 10 s |
+| server | reading one request | 30 s |
+| server | writing one reply | 30 s, then the stream is reset |
+| server | writing one event batch | 30 s, then the connection is closed |
+| server | detached session grace | 60 s |
+
+fuser 0.18 answers `FUSE_INTERRUPT` with `ENOSYS`, so a process inside a filesystem call waits for our reply; the operation deadline is what bounds that wait. Killing the client daemon fails every pending and future call with `ENOTCONN` immediately, and `fusermount3 -uz` detaches the mount point.
+
+## Security
+
+The server's certificate authenticates the server to a client that pins its fingerprint. Nothing authenticates the client unless `--token` is set. The default listen address is loopback; a routable address without a token gives every host that can reach it read/write access to the export as the server user. `--allow-other` on the client extends the same access to every local user of the client machine. Uids and gids are passed through unchanged: run the server as the user whose files these should appear to be.
+
+## Known limitations
+
+- Mount points inside the export are not exported (`RESOLVE_NO_XDEV`); synthetic ids for foreign devices are a follow-up.
+- `PATH_MAX` (4096 bytes) bounds the depth of the exported tree, because the whole relative path is resolved in one `openat2`.
+- A directory rename racing a lookup inside that directory can produce a spurious `ENOENT`; the kernel does not serialise the two and path-based addressing cannot close the window. The same is true of sshfs.
+- Events are lost during a disconnect (covered by the post-reconnect invalidation and the TTL); inotify does not report `mmap` writes and has per-user watch limits; the event stream is ordered relative to itself but not relative to replies, so a reply can briefly re-cache what an event just invalidated. The TTL is the correctness backstop in all of these cases.
+- Write-through costs one round trip per `write(2)`; a writeback mode is a follow-up.
+- Multiple clients: cache coherence between them is best-effort (push invalidation plus TTL), and locks are local to each client.
+- No `FUSE_INTERRUPT` handling (a fuser limitation): `SIGKILL` on a blocked process takes effect when the operation completes or times out.
+- Device nodes, `chown` to other users, and `RENAME_WHITEOUT` need privileges the server does not have and fail with the kernel's errno.
+- Metadata operations that reach the server without a handle (xattrs) fail on a file that has been unlinked while open; those with a handle (stat, truncate, times, fsync, read, write) work.
+
+## Follow-ups
+
+Kernel-module backend with fsnotify injection (the FUSEX "mode B" in the research notes); `--writeback`/`keep_cache` for throughput; synthetic ids for foreign devices; `lseek(SEEK_HOLE)`, `fallocate`, `copy_file_range`; server-side locks for multi-client use; richer authentication; raw-payload framing to avoid a copy on large I/O.
