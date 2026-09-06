@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod conn;
+pub mod fuse;
 pub mod handles;
 pub mod inodes;
 pub mod transport;
