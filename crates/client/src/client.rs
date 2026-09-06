@@ -225,7 +225,8 @@ impl Caller {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub server_addr: SocketAddr,
+    /// Every address the server name resolved to, in the resolver's order; they are tried in turn.
+    pub server_addrs: Vec<SocketAddr>,
     pub server_name: String,
     pub trust: ServerTrust,
     pub auth: Auth,
@@ -244,7 +245,7 @@ impl Client {
         let handles = Arc::new(HandleTable::default());
         let conn = ConnManager::start(
             ConfigConn {
-                server_addr: cfg.server_addr,
+                server_addrs: cfg.server_addrs,
                 server_name: cfg.server_name,
                 trust: cfg.trust,
                 auth: cfg.auth,

@@ -625,6 +625,51 @@ fn dead_address() -> (std::net::UdpSocket, SocketAddr) {
 }
 
 #[tokio::test]
+async fn connects_past_a_dead_address_and_remembers_the_live_one() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let (_dead_socket, dead) = dead_address();
+    let mut config = server.config(Duration::from_secs(5));
+    config.server_addrs = vec![dead, server.addr];
+    config.connect_timeout = Duration::from_secs(2);
+    let client = jackalopefs_client::Client::connect(config).await.unwrap();
+    assert_eq!(
+        client.getattr(Some(Path::root()), None).await.unwrap().ino,
+        1
+    );
+
+    // The reconnect must go straight to the address that answered, not back through the dead one.
+    let first = wait_for_generation(&client, 1).await;
+    first.conn.close(9u32.into(), b"simulated blip");
+    let start = Instant::now();
+    wait_for_generation(&client, 2).await;
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "the reconnect paid for the dead address again: {:?}",
+        start.elapsed()
+    );
+    client.shutdown().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_unreachable_ipv6_candidate_does_not_stop_the_mount() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let mut config = server.config(Duration::from_secs(5));
+    // Documentation space, so no host routes it; where there is no IPv6 stack at all the candidate is dropped for want of a socket instead.
+    config.server_addrs = vec!["[2001:db8::1]:1933".parse().unwrap(), server.addr];
+    config.connect_timeout = Duration::from_secs(1);
+    let client = jackalopefs_client::Client::connect(config).await.unwrap();
+    assert_eq!(
+        client.getattr(Some(Path::root()), None).await.unwrap().ino,
+        1
+    );
+    client.shutdown().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn a_failed_connection_names_the_address() {
     let (_dead_socket, dead) = dead_address();
     let mut config = config_for(dead, [0u8; 32], Auth::Anonymous, Duration::from_secs(5));
@@ -634,6 +679,57 @@ async fn a_failed_connection_names_the_address() {
         .err()
         .expect("nothing answers there");
     assert!(format!("{err:#}").contains(&dead.to_string()), "{err:#}");
+}
+
+#[tokio::test]
+async fn a_real_failure_is_not_buried_by_a_later_timeout() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let (_dead_socket, dead) = dead_address();
+    // The server answers, and refuses the pinned fingerprint; the address after it answers nothing at all.
+    let mut config = config_for(
+        server.addr,
+        [0u8; 32],
+        Auth::Anonymous,
+        Duration::from_secs(5),
+    );
+    config.server_addrs = vec![server.addr, dead];
+    config.connect_timeout = Duration::from_secs(1);
+    let err = jackalopefs_client::Client::connect(config)
+        .await
+        .err()
+        .expect("a pinned fingerprint that does not match must refuse");
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains(&server.addr.to_string()) && !rendered.contains(&dead.to_string()),
+        "the address that actually answered must be the one reported: {rendered}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_refusal_ends_the_candidate_sweep() {
+    let hole = Blackhole::start_handshaking(vec![HelloReply::RevisionMismatch {
+        revision: PROTO_REVISION ^ 1,
+    }])
+    .await;
+    let (_dead_socket, dead) = dead_address();
+    let mut config = hole.config(Duration::from_secs(5));
+    config.server_addrs = vec![hole.addr, dead];
+    // Long enough that trying the dead address at all would outlast the deadline below.
+    config.connect_timeout = Duration::from_secs(30);
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        jackalopefs_client::Client::connect(config),
+    )
+    .await
+    .expect("a refusal must end the sweep instead of moving on")
+    .err()
+    .expect("a foreign revision must refuse the connection");
+    match err.downcast_ref::<ErrorConnect>().map(|e| &e.kind) {
+        Some(ErrorConnectKind::Revision { .. }) => {}
+        other => panic!("{other:?}: {err}"),
+    }
 }
 
 #[tokio::test]

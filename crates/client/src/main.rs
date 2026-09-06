@@ -5,7 +5,7 @@ use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::Auth;
 use jackalopefs_proto::DEFAULT_PORT;
 use std::io::IsTerminal;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -30,7 +30,7 @@ struct Args {
     /// Longest a single filesystem operation may take before it fails with ETIMEDOUT.
     #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
     op_timeout: Duration,
-    /// Longest one connection attempt may take.
+    /// Longest one connection attempt may take. Each address the server name resolves to gets its own attempt.
     #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]
     connect_timeout: Duration,
     /// How long the kernel may trust a cached directory entry.
@@ -73,14 +73,23 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
     runtime.block_on(async move {
         let (host, port) = server_target(&args.server)?;
-        let server_addr = tokio::net::lookup_host((host.as_str(), port))
+        let server_addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
             .await
             .with_context(|| format!("resolving {host} port {port}"))?
-            .next()
-            .with_context(|| format!("{host} resolves to nothing"))?;
+            .collect();
+        anyhow::ensure!(!server_addrs.is_empty(), "{host} resolves to nothing");
+        tracing::info!(
+            "{} resolves to {}",
+            args.server,
+            server_addrs
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let server_name = host;
         let config = Config {
-            server_addr,
+            server_addrs,
             server_name,
             trust,
             auth: args

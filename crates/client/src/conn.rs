@@ -7,7 +7,7 @@ use jackalopefs_proto::{
     read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Resume, PROTO_REVISION,
 };
 use quinn::{Connection, Endpoint};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -16,6 +16,8 @@ use tokio::time::timeout;
 const BACKOFF_MIN: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 const EVENT_QUEUE: usize = 256;
+const BIND_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+const BIND_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
 
 /// Application error codes sent in CONNECTION_CLOSE.
 pub mod close_code {
@@ -25,7 +27,8 @@ pub mod close_code {
 
 #[derive(Clone, Debug)]
 pub struct ConfigConn {
-    pub server_addr: SocketAddr,
+    /// Every address the server name resolved to, in the resolver's order; they are tried in turn and the one that answers is tried first from then on.
+    pub server_addrs: Vec<SocketAddr>,
     /// SNI name; the server's self-signed certificate is not checked against it, only against the fingerprint.
     pub server_name: String,
     pub trust: ServerTrust,
@@ -57,7 +60,8 @@ pub struct ConnManager {
     events: Option<mpsc::Receiver<Event>>,
     stop: watch::Sender<bool>,
     task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    endpoint: Endpoint,
+    /// One per address family among the candidates; closed at unmount.
+    endpoints: Vec<Endpoint>,
 }
 
 /// A failed connection attempt, naming the address it was made to.
@@ -93,23 +97,18 @@ impl ErrorConnectKind {
 impl ConnManager {
     /// Establish the first connection (failing loudly if it can't be made) and start the reconnect loop.
     pub async fn start(cfg: ConfigConn, handles: Arc<HandleTable>) -> anyhow::Result<ConnManager> {
-        let mut endpoint = Endpoint::client(match cfg.server_addr {
-            SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("valid address"),
-            SocketAddr::V6(_) => "[::]:0".parse().expect("valid address"),
-        })?;
-        endpoint.set_default_client_config(client_config(cfg.trust.clone())?);
+        anyhow::ensure!(
+            !cfg.server_addrs.is_empty(),
+            "no server address to connect to"
+        );
+        let (endpoints, candidates) =
+            bind_candidates(&cfg.server_addrs, client_config(cfg.trust.clone())?)?;
         let (state_tx, state_rx) = watch::channel(ConnState::Connecting);
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
         let (stop_tx, stop_rx) = watch::channel(false);
         let (first_tx, first_rx) = oneshot::channel();
         let task = tokio::spawn(run(
-            cfg,
-            endpoint.clone(),
-            handles,
-            state_tx,
-            events_tx,
-            stop_rx,
-            first_tx,
+            cfg, candidates, handles, state_tx, events_tx, stop_rx, first_tx,
         ));
         match first_rx.await {
             Ok(Ok(())) => Ok(ConnManager {
@@ -117,10 +116,10 @@ impl ConnManager {
                 events: Some(events_rx),
                 stop: stop_tx,
                 task: parking_lot::Mutex::new(Some(task)),
-                endpoint,
+                endpoints,
             }),
             Ok(Err(e)) => {
-                endpoint.close(close_code::UNMOUNT.into(), b"connect failed");
+                close_all(&endpoints, b"connect failed");
                 Err(anyhow::anyhow!(e))
             }
             Err(_) => Err(anyhow::anyhow!(
@@ -139,7 +138,7 @@ impl ConnManager {
         if self.stop.send(true).is_err() {
             tracing::debug!("connection manager already stopped");
         }
-        self.endpoint.close(close_code::UNMOUNT.into(), b"unmount");
+        close_all(&self.endpoints, b"unmount");
     }
 
     /// Close the connection and stop reconnecting; safe to call more than once.
@@ -153,12 +152,14 @@ impl ConnManager {
                 tracing::warn!("connection manager did not stop in time: {e}");
             }
         }
-        self.endpoint.close(close_code::UNMOUNT.into(), b"unmount");
-        if timeout(Duration::from_secs(2), self.endpoint.wait_idle())
-            .await
-            .is_err()
-        {
-            tracing::debug!("endpoint did not drain before shutdown deadline");
+        close_all(&self.endpoints, b"unmount");
+        for endpoint in &self.endpoints {
+            if timeout(Duration::from_secs(2), endpoint.wait_idle())
+                .await
+                .is_err()
+            {
+                tracing::debug!("endpoint did not drain before shutdown deadline");
+            }
         }
     }
 }
@@ -166,7 +167,7 @@ impl ConnManager {
 #[allow(clippy::too_many_arguments)]
 async fn run(
     cfg: ConfigConn,
-    endpoint: Endpoint,
+    mut candidates: Vec<Candidate>,
     handles: Arc<HandleTable>,
     state: watch::Sender<ConnState>,
     events: mpsc::Sender<Event>,
@@ -186,11 +187,11 @@ async fn run(
             break;
         }
         let attempt = tokio::select! {
-            attempt = timeout(cfg.connect_timeout, connect_once(&endpoint, &cfg, resume)) => attempt.unwrap_or(Err(ErrorConnectKind::Timeout)).map_err(|kind| kind.at(cfg.server_addr)),
+            attempt = connect_any(&cfg, &candidates, resume) => attempt,
             _ = stop.changed() => break,
         };
-        let attached = match attempt {
-            Ok(attached) => attached,
+        let (winner, attached) = match attempt {
+            Ok(connected) => connected,
             Err(e) => {
                 if let Some(first) = first.take() {
                     if first.send(Err(e)).is_err() {
@@ -220,13 +221,15 @@ async fn run(
             session_id: attached.session_id,
             token: attached.resume_token,
         });
+        // Try the address that answered first from now on, so a dead candidate ahead of it costs its deadline once instead of on every reconnect.
+        candidates.rotate_left(winner);
         let (conn, resumed) = (attached.conn, attached.resumed);
         tracing::info!(
             session = attached.session_id,
             resumed,
             generation,
             "connected to {}",
-            cfg.server_addr
+            attached.addr
         );
 
         if !resumed {
@@ -272,17 +275,114 @@ async fn run(
 
 struct Handshaken {
     conn: Connection,
+    addr: SocketAddr,
     session_id: u64,
     resume_token: [u8; 16],
     resumed: bool,
 }
 
+/// A resolved server address and the socket that can reach it.
+type Candidate = (SocketAddr, Endpoint);
+
+fn close_all(endpoints: &[Endpoint], reason: &[u8]) {
+    for endpoint in endpoints {
+        endpoint.close(close_code::UNMOUNT.into(), reason);
+    }
+}
+
+/// A socket for each address family the candidates need, and every candidate paired with the socket that can reach it. Two sockets rather than one dual-stack socket, because whether an IPv6 socket also reaches IPv4 peers is the host's decision (`bindv6only`, a sandboxed setsockopt) and quinn reports losing that argument only at debug level; a family that cannot be bound at all then costs its own candidates rather than every candidate.
+fn bind_candidates(
+    addrs: &[SocketAddr],
+    config: quinn::ClientConfig,
+) -> anyhow::Result<(Vec<Endpoint>, Vec<Candidate>)> {
+    let mut refusal = None;
+    let mut bind = |wildcard: SocketAddr, wanted: bool| -> Option<Endpoint> {
+        if !wanted {
+            return None;
+        }
+        match Endpoint::client(wildcard) {
+            Ok(mut endpoint) => {
+                endpoint.set_default_client_config(config.clone());
+                Some(endpoint)
+            }
+            Err(e) => {
+                tracing::warn!("cannot bind {wildcard}: {e}");
+                refusal = Some(e);
+                None
+            }
+        }
+    };
+    let v4 = bind(BIND_V4, addrs.iter().any(|addr| addr.is_ipv4()));
+    let v6 = bind(BIND_V6, addrs.iter().any(|addr| addr.is_ipv6()));
+    let candidates: Vec<Candidate> = addrs
+        .iter()
+        .filter_map(|&addr| {
+            let endpoint = if addr.is_ipv6() {
+                v6.clone()
+            } else {
+                v4.clone()
+            };
+            match endpoint {
+                Some(endpoint) => Some((addr, endpoint)),
+                None => {
+                    tracing::warn!("dropping {addr}: no socket for its address family");
+                    None
+                }
+            }
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(match refusal {
+            Some(e) => anyhow::Error::new(e).context("no usable client socket"),
+            None => anyhow::anyhow!("no server address to connect to"),
+        });
+    }
+    Ok(([v4, v6].into_iter().flatten().collect(), candidates))
+}
+
+/// Try the candidates in order, each on its own connect deadline, and take the first that completes the handshake. A refusal ends the sweep: it is an answer from a reachable server, every address behind the name would give the same one, and a later address's timeout would bury the reason.
+async fn connect_any(
+    cfg: &ConfigConn,
+    candidates: &[Candidate],
+    resume: Option<Resume>,
+) -> Result<(usize, Handshaken), ErrorConnect> {
+    let mut worst: Option<ErrorConnect> = None;
+    for (i, (addr, endpoint)) in candidates.iter().enumerate() {
+        let attempt = timeout(
+            cfg.connect_timeout,
+            connect_once(endpoint, cfg, *addr, resume),
+        )
+        .await
+        .unwrap_or(Err(ErrorConnectKind::Timeout));
+        match attempt {
+            Ok(handshaken) => return Ok((i, handshaken)),
+            Err(kind @ (ErrorConnectKind::Rejected(_) | ErrorConnectKind::Revision { .. })) => {
+                return Err(kind.at(*addr))
+            }
+            Err(kind) => {
+                let e = kind.at(*addr);
+                // Only worth its own line when there is another address to move on to; with one candidate the caller reports this same failure.
+                if candidates.len() > 1 {
+                    tracing::warn!("{e}");
+                }
+                // A timeout says nothing about the server, so it never displaces an address that did answer: a fingerprint or protocol failure has to survive to the caller even when a later address goes unanswered.
+                if worst.is_none() || !matches!(e.kind, ErrorConnectKind::Timeout) {
+                    worst = Some(e);
+                }
+            }
+        }
+    }
+    // bind_candidates refuses a list with nothing reachable in it, so the loop ran at least once.
+    Err(worst.expect("a candidate list is never empty"))
+}
+
 async fn connect_once(
     endpoint: &Endpoint,
     cfg: &ConfigConn,
+    addr: SocketAddr,
     resume: Option<Resume>,
 ) -> Result<Handshaken, ErrorConnectKind> {
-    let conn = endpoint.connect(cfg.server_addr, &cfg.server_name)?.await?;
+    let conn = endpoint.connect(addr, &cfg.server_name)?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
     write_frame(
         &mut send,
@@ -303,6 +403,7 @@ async fn connect_once(
             resumed,
         } => Ok(Handshaken {
             conn,
+            addr,
             session_id,
             resume_token,
             resumed,

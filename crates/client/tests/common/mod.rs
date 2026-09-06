@@ -101,7 +101,7 @@ pub fn config_for(
     op_timeout: Duration,
 ) -> Config {
     Config {
-        server_addr: addr,
+        server_addrs: vec![addr],
         server_name: "jackalopefs".into(),
         trust: ServerTrust::Fingerprint(fingerprint),
         auth,
