@@ -1,0 +1,28 @@
+[package]
+name = "jackalopefs-client"
+description = "jackalopefs client: QUIC connection management and the FUSE mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+fuser = { workspace = true }
+humantime = { workspace = true }
+jackalopefs-proto = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+jackalopefs-server = { workspace = true }
+tempfile = { workspace = true }
