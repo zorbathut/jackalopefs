@@ -584,6 +584,39 @@ async fn handles_are_reopened_and_verified_after_a_server_restart() {
 }
 
 #[tokio::test]
+async fn unmount_interrupts_a_connect_attempt() {
+    let export = tempfile::tempdir().unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let server = TestServer::start_on(export.path(), None, socket).await;
+    let mut config = server.config(Duration::from_secs(5));
+    // Long enough that nothing but the stop signal can end the attempt the unmount lands in.
+    config.connect_timeout = Duration::from_secs(30);
+    let client = jackalopefs_client::Client::connect(config).await.unwrap();
+
+    server.stop().await;
+    // Hold the port for the rest of the test: left free, another test could be handed it and answer the very attempt the unmount has to interrupt.
+    let _dead = wait_for(Duration::from_secs(5), "the port to be free again", || {
+        std::net::UdpSocket::bind(("127.0.0.1", port)).ok()
+    })
+    .await;
+    wait_for(Duration::from_secs(5), "a reconnect attempt", || {
+        matches!(*client.state().borrow(), ConnState::Connecting).then_some(())
+    })
+    .await;
+    // `Connecting` is published just before the attempt begins; unmounting in that gap would pass whatever the manager does with the signal afterwards.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let start = Instant::now();
+    client.shutdown().await;
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "unmount waited on the connect attempt: {:?}",
+        start.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn server_refuses_a_foreign_revision() {
     let export = tempfile::tempdir().unwrap();
     let server = TestServer::start(export.path(), Some("s3cret".into())).await;

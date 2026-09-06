@@ -171,9 +171,10 @@ async fn run(
         if state.send(ConnState::Connecting).is_err() {
             break;
         }
-        let attempt = timeout(cfg.connect_timeout, connect_once(&endpoint, &cfg, resume))
-            .await
-            .unwrap_or(Err(ErrorConnect::Timeout));
+        let attempt = tokio::select! {
+            attempt = timeout(cfg.connect_timeout, connect_once(&endpoint, &cfg, resume)) => attempt.unwrap_or(Err(ErrorConnect::Timeout)),
+            _ = stop.changed() => break,
+        };
         let attached = match attempt {
             Ok(attached) => attached,
             Err(e) => {
