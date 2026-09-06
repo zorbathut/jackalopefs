@@ -6,6 +6,7 @@ pub mod fuse;
 pub mod handles;
 pub mod inodes;
 pub mod invalidate;
+pub mod mount;
 pub mod transport;
 
 pub use client::{Client, Config, Error};
