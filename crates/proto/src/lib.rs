@@ -4,10 +4,16 @@
 
 pub mod msg;
 pub mod types;
+pub mod wire;
 
+/// Readers and builders generated from the schema. capnpc hardcodes `crate::jackalopefs_capnp::…` paths into what it generates, so this module must live at the crate root.
+#[rustfmt::skip]
+#[allow(clippy::all, dead_code, unused_imports, unused_qualifications)]
+pub(crate) mod jackalopefs_capnp { include!(concat!(env!("OUT_DIR"), "/jackalopefs_capnp.rs")); }
 
 pub use msg::*;
 pub use types::*;
+pub use wire::{dir_entry_bytes, ErrorDecode, Message};
 
 use sha2::{Digest, Sha256};
 
