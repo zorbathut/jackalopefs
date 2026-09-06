@@ -2,6 +2,7 @@
 //!
 //! Every client path is resolved by `openat2` confined to the export root ([`export`]); filesystem work runs on the blocking pool ([`ops`]); each QUIC bidi stream carries exactly one request ([`session`]).
 
+pub mod dirents;
 pub mod export;
 
 use std::sync::Arc;
