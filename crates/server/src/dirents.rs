@@ -1,7 +1,7 @@
 //! Directory reading with real `getdents64` cookies, so a client `readdir(offset)` is a genuine `seekdir` and stays correct while the directory changes underneath it.
 
 use crate::export::{kind_from_mode, Export};
-use jackalopefs_proto::{DirEntry, DirEntryPlus, FileKind};
+use jackalopefs_proto::{DirEntry, DirEntryPlus, FileKind, Name};
 use nix::errno::Errno;
 use nix::fcntl::AtFlags;
 use nix::sys::stat::{fstat, fstatat};
@@ -80,11 +80,6 @@ fn getdents64(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
     }
 }
 
-/// Wire cost per entry, used to honour `max_bytes`. `max_bytes` is clamped to `MAX_IO`, half of `MAX_FRAME`, so even a budget that under-counted by two would still fit a frame.
-fn entry_cost(name_len: usize, plus: bool) -> usize {
-    jackalopefs_proto::dir_entry_bytes(name_len, plus)
-}
-
 pub enum Listing {
     Plain(Vec<DirEntry>),
     Plus(Vec<DirEntryPlus>),
@@ -142,17 +137,33 @@ pub fn read_dir(
                 }
             };
             let attr = if plus && !is_dot {
-                match stat().and_then(|st| export.attr_from_stat(&st)) {
+                let described = Name::new(name.as_slice())
+                    .map_err(|_| Errno::EINVAL)
+                    .and_then(|component| export.attr_in(dir, &component));
+                match described {
                     Ok(attr) => Some(attr),
+                    Err(Errno::ENOENT) => {
+                        tracing::debug!(name = %String::from_utf8_lossy(&name), "skipping entry that vanished during readdirplus");
+                        continue;
+                    }
+                    Err(Errno::EXDEV) => {
+                        tracing::debug!(name = %String::from_utf8_lossy(&name), "skipping a mount point, which is not exported");
+                        continue;
+                    }
                     Err(e) => {
-                        tracing::debug!(name = %String::from_utf8_lossy(&name), "skipping entry that vanished during readdirplus: {e}");
+                        tracing::warn!(name = %String::from_utf8_lossy(&name), "skipping entry that cannot be described: {e}");
                         continue;
                     }
                 }
             } else {
                 None
             };
-            used += entry_cost(name.len(), plus);
+            // `max_bytes` is clamped to `MAX_IO`, half of `MAX_FRAME`, so a budget that overshoots by one entry still fits a frame.
+            used += jackalopefs_proto::dir_entry_bytes(
+                name.len(),
+                plus,
+                attr.as_ref().and_then(|a| a.xattr_names.as_deref()),
+            );
             let entry = DirEntry {
                 ino,
                 next_offset: raw.off,
@@ -255,7 +266,7 @@ mod tests {
         }
     }
 
-    /// `read_dir` fills up to `max_bytes` using `entry_cost`; the reply for a full `MAX_IO` budget must still fit in a frame.
+    /// `read_dir` fills up to `max_bytes` using `dir_entry_bytes`; the reply for a full `MAX_IO` budget must still fit in a frame, in one segment.
     #[test]
     fn a_full_page_of_entries_fits_in_a_frame() {
         use jackalopefs_proto::{
@@ -271,7 +282,7 @@ mod tests {
         let mut used = 0;
         while used < MAX_IO {
             plain.push(entry());
-            used += entry_cost(1, false);
+            used += jackalopefs_proto::dir_entry_bytes(1, false, None);
         }
         let frame = encode(&Response::Readdir(plain)).unwrap();
         assert!(frame.len() - 4 <= MAX_FRAME, "{} bytes", frame.len());
@@ -291,18 +302,26 @@ mod tests {
             gid: 0,
             rdev: 0,
             blksize: 4096,
+            // The most names the server sends for one node, in the shape that costs the most words: many one-byte names, each with its own pointer word.
+            xattr_names: Some(vec![vec![b'x']; 512]),
         };
         let mut plus = Vec::new();
         let mut used = 0;
         while used < MAX_IO {
             plus.push(DirEntryPlus {
                 entry: entry(),
-                attr: Some(attr),
+                attr: Some(attr.clone()),
             });
-            used += entry_cost(1, true);
+            used += jackalopefs_proto::dir_entry_bytes(1, true, attr.xattr_names.as_deref());
         }
         let frame = encode(&Response::ReaddirPlus(plus)).unwrap();
         assert!(frame.len() - 4 <= MAX_FRAME, "{} bytes", frame.len());
+        // A full page also fits the encoder's first-segment estimate: the segment table's count is zero, so no canonicalizing copy was needed.
+        assert_eq!(
+            &frame[4..8],
+            &[0, 0, 0, 0],
+            "a full page spilled into a second segment"
+        );
     }
 
     #[test]
@@ -337,7 +356,7 @@ mod tests {
                 for e in entries {
                     assert_eq!(e.attr.is_none(), e.entry.is_dot_or_dotdot());
                     if e.entry.name.as_slice() == b"subdir" {
-                        assert_eq!(e.attr.unwrap().kind, FileKind::Directory);
+                        assert_eq!(e.attr.as_ref().unwrap().kind, FileKind::Directory);
                     }
                 }
             }

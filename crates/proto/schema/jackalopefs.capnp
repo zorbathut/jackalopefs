@@ -65,6 +65,15 @@ struct Attr {
   gid @13 :UInt32;
   rdev @14 :UInt64;
   blksize @15 :UInt32;
+  # The node's extended attribute names, as listxattr returns them, sent so a client can answer getxattr and listxattr
+  # for what is *not* there without a round trip: `some` with an empty list states the node has no extended attributes.
+  # `unknown` means the server did not look (or could not say: too many names, or a filesystem without xattr support,
+  # whose errno the client must fetch) and obliges the client to ask. A client answers only absence from this list;
+  # a name that is present is always fetched, and no value is ever cached.
+  xattrNames :union {
+    unknown @16 :Void;
+    some @17 :List(Data);
+  }
 }
 
 struct Statfs {

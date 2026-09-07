@@ -5,10 +5,11 @@
 use anyhow::Context;
 use jackalopefs_proto::{Attr, FileKind, Name, Path, TimeSpec};
 use nix::errno::Errno;
-use nix::fcntl::{openat2, OFlag, OpenHow, ResolveFlag};
-use nix::sys::stat::{fstat, FileStat, Mode};
+use nix::fcntl::{openat2, AtFlags, OFlag, OpenHow, ResolveFlag};
+use nix::sys::stat::{fstat, fstatat, FileStat, Mode};
 use std::ffi::OsStr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 /// The nodeid the client uses for the export root, by FUSE convention.
@@ -123,6 +124,30 @@ impl Export {
     }
 
     /// Convert a `stat` result, mapping the inode number for the client.
+    /// The attributes of a pinned node, xattr names included.
+    pub fn attr_of(&self, fd: BorrowedFd<'_>) -> Result<Attr, Errno> {
+        let st = fstatat(
+            fd,
+            "",
+            AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        let mut attr = self.attr_from_stat(&st)?;
+        attr.xattr_names = xattr_names(fd);
+        Ok(attr)
+    }
+
+    /// The attributes of `dir/name`, the single component resolved under the same rules as every path (no symlink is followed, so a symlink describes itself and never a target; a mount point is refused with `EXDEV`).
+    pub fn attr_in(&self, dir: BorrowedFd<'_>, name: &Name) -> Result<Attr, Errno> {
+        let node = openat2(
+            dir,
+            name.as_os_str(),
+            OpenHow::new()
+                .flags(OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC)
+                .resolve(RESOLVE),
+        )?;
+        self.attr_of(node.as_fd())
+    }
+
     pub fn attr_from_stat(&self, st: &FileStat) -> Result<Attr, Errno> {
         Ok(Attr {
             ino: self.map_ino(st.st_ino)?,
@@ -147,8 +172,49 @@ impl Export {
             gid: st.st_gid,
             rdev: st.st_rdev,
             blksize: st.st_blksize as u32,
+            xattr_names: None,
         })
     }
+}
+
+/// Most names a node may carry in an `Attr`; beyond this the client asks. Bounds the readdirplus page and the memory a name list can take.
+const XATTR_NAMES_MAX: usize = 1024;
+
+/// The node's extended attribute names for its `Attr`, through the pinned fd's `/proc` path (which follows the magic link to the node itself; `llistxattr` would describe the link). `None` when the client has to ask instead: more than [`XATTR_NAMES_MAX`] bytes of names, or a filesystem without xattr support, whose errno a `getxattr` must return rather than the ENODATA an empty list would imply.
+pub(crate) fn xattr_names(fd: BorrowedFd<'_>) -> Option<Vec<Vec<u8>>> {
+    let path = std::ffi::CString::new(proc_path(fd).as_os_str().as_bytes())
+        .expect("a /proc/self/fd path has no NUL");
+    let mut buf = [0u8; XATTR_NAMES_MAX];
+    // SAFETY: the path is NUL-terminated and the buffer is valid for its length.
+    let got = unsafe {
+        libc::listxattr(
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+        )
+    };
+    if got < 0 {
+        let errno = Errno::last();
+        match errno {
+            Errno::ERANGE => tracing::debug!(
+                fd = fd.as_raw_fd(),
+                "more than {XATTR_NAMES_MAX} bytes of xattr names; the client will ask"
+            ),
+            Errno::EOPNOTSUPP => tracing::debug!(
+                fd = fd.as_raw_fd(),
+                "no xattr support on this node; the client will ask"
+            ),
+            _ => tracing::warn!(fd = fd.as_raw_fd(), "listxattr for the attributes: {errno}"),
+        }
+        return None;
+    }
+    Some(
+        buf[..got as usize]
+            .split(|b| *b == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_vec())
+            .collect(),
+    )
 }
 
 /// File type from `st_mode`; `None` for a type Linux doesn't have a name for.
@@ -305,5 +371,39 @@ mod tests {
         let fd = export.resolve(&path("sub/deep/file")).unwrap();
         assert_eq!(fs::read(proc_path(fd.as_fd())).unwrap(), b"x");
         assert_eq!(fs::read(dir.path().join("sub/deep/file")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn xattr_names_of_a_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f");
+        fs::write(&file, b"").unwrap();
+        let target = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let set = |name: &str| unsafe {
+            libc::setxattr(
+                target.as_ptr(),
+                std::ffi::CString::new(name).unwrap().as_ptr(),
+                b"v".as_ptr() as *const libc::c_void,
+                1,
+                0,
+            )
+        };
+        if set("user.k") != 0 {
+            eprintln!("skipping: filesystem does not support user xattrs");
+            return;
+        }
+        let fd = nix::fcntl::open(&file, OFlag::O_PATH, Mode::empty()).unwrap();
+        assert_eq!(xattr_names(fd.as_fd()), Some(vec![b"user.k".to_vec()]));
+        // A symlink to the file has names of its own (none), never the target's.
+        let link = dir.path().join("l");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let link_fd =
+            nix::fcntl::open(&link, OFlag::O_PATH | OFlag::O_NOFOLLOW, Mode::empty()).unwrap();
+        assert_eq!(xattr_names(link_fd.as_fd()), Some(Vec::new()));
+        // More names than fit the cap are left for the client to ask about.
+        for i in 0..8 {
+            assert_eq!(set(&format!("user.{}{i}", "n".repeat(200))), 0);
+        }
+        assert_eq!(xattr_names(fd.as_fd()), None);
     }
 }

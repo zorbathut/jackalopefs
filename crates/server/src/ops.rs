@@ -112,15 +112,11 @@ fn stat_fd<F: AsFd>(fd: &F) -> Result<nix::sys::stat::FileStat, Errno> {
 
 impl Ops {
     fn attr_of<F: AsFd>(&self, fd: &F) -> Result<Attr, Errno> {
-        self.export.attr_from_stat(&stat_fd(fd)?)
+        self.export.attr_of(fd.as_fd())
     }
 
     fn attr_in<F: AsFd>(&self, dir: &F, name: &Name) -> Result<Attr, Errno> {
-        self.export.attr_from_stat(&fstatat(
-            dir,
-            name.as_os_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        )?)
+        self.export.attr_in(dir.as_fd(), name)
     }
 
     fn run(&self, req: Request) -> Result<Response, Errno> {
@@ -1093,6 +1089,36 @@ mod tests {
             eprintln!("skipping xattr assertions: filesystem does not support user xattrs");
         } else {
             assert_eq!(set, Response::Ok);
+            // The attributes carry the names, from every reply shape that has them.
+            let by_path = expect_attr(dispatch(
+                &ops,
+                Request::Getattr {
+                    path: Some(path("f")),
+                    fh: None,
+                },
+            ));
+            assert_eq!(by_path.xattr_names, Some(vec![b"user.k".to_vec()]));
+            let by_lookup = expect_attr(dispatch(
+                &ops,
+                Request::Lookup {
+                    parent: Path::root(),
+                    name: name("f"),
+                },
+            ));
+            assert_eq!(by_lookup.xattr_names, Some(vec![b"user.k".to_vec()]));
+            fs::write(dir.path().join("plain"), b"").unwrap();
+            let plain = expect_attr(dispatch(
+                &ops,
+                Request::Lookup {
+                    parent: Path::root(),
+                    name: name("plain"),
+                },
+            ));
+            assert_eq!(
+                plain.xattr_names,
+                Some(Vec::new()),
+                "no names is a statement, not an unknown"
+            );
             assert_eq!(
                 dispatch(
                     &ops,

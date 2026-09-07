@@ -171,6 +171,7 @@ mod tests {
             gid: 0,
             rdev: 0,
             blksize: 4096,
+            xattr_names: None,
         }
     }
 

@@ -285,6 +285,8 @@ async fn rename_link_symlink_xattr_statfs_access() {
                 b"v"
             );
             assert_eq!(client.listxattr(path("a")).await.unwrap(), b"user.k\0");
+            let looked = client.lookup(Path::root(), name("a")).await.unwrap();
+            assert_eq!(looked.xattr_names, Some(vec![b"user.k".to_vec()]));
             client
                 .removexattr(path("a"), b"user.k".to_vec())
                 .await

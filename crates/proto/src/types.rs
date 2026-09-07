@@ -159,7 +159,7 @@ pub struct TimeSpec {
 }
 
 /// A `stat` result. `ino` is the server's real inode number; the client uses it directly as the FUSE nodeid.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Attr {
     pub ino: u64,
     pub size: u64,
@@ -174,6 +174,8 @@ pub struct Attr {
     pub gid: u32,
     pub rdev: u64,
     pub blksize: u32,
+    /// The node's extended attribute names when the server looked: an empty list means it has none, which a client may answer `getxattr` and `listxattr` from; `None` means the client must ask.
+    pub xattr_names: Option<Vec<Vec<u8>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

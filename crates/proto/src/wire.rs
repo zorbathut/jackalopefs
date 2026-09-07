@@ -73,9 +73,17 @@ fn checked_len(declared: u32, message_words: usize) -> Result<usize, ErrorDecode
     Ok(declared as usize)
 }
 
-/// Wire size of one directory entry in a `readdir`/`readdirPlus` reply: four words of `DirEntry` plus the name rounded up to a word, and fourteen more words with an `Attr`. The server budgets listings with this. Changing it is a protocol change: edit the schema so the revision moves.
-pub fn dir_entry_bytes(name_len: usize, plus: bool) -> usize {
-    32 + name_len.next_multiple_of(8) + if plus { 112 } else { 0 }
+/// Wire size of one directory entry in a `readdir`/`readdirPlus` reply: four words of `DirEntry` plus the name rounded up to a word; with an `Attr`, sixteen more words (three for `DirEntryPlus`, thirteen for the `Attr`) and, when it carries xattr names, a pointer word per name plus each name rounded up to a word. The server budgets listings with this. Changing it is a protocol change: edit the schema so the revision moves.
+pub fn dir_entry_bytes(name_len: usize, plus: bool, xattr_names: Option<&[Vec<u8>]>) -> usize {
+    let names = xattr_names.map_or(0, |names| {
+        names.iter().map(|n| 8 + n.len().next_multiple_of(8)).sum()
+    });
+    32 + name_len.next_multiple_of(8) + if plus { 128 + names } else { 0 }
+}
+
+/// Words the names an `Attr` carries add to it: a pointer word per name and the name rounded up to a word.
+fn words_for_xattr_names(names: Option<&[Vec<u8>]>) -> u32 {
+    names.map_or(0, |names| names.iter().map(|n| words_for(n.len())).sum())
 }
 
 // ---------- value helpers ----------
@@ -151,6 +159,15 @@ fn build_attr(mut b: schema::attr::Builder<'_>, attr: &Attr) {
     b.set_gid(attr.gid);
     b.set_rdev(attr.rdev);
     b.set_blksize(attr.blksize);
+    match &attr.xattr_names {
+        None => b.init_xattr_names().set_unknown(()),
+        Some(names) => {
+            let mut list = b.init_xattr_names().init_some(names.len() as u32);
+            for (i, name) in names.iter().enumerate() {
+                list.set(i as u32, name);
+            }
+        }
+    }
 }
 
 fn parse_attr(r: schema::attr::Reader<'_>) -> Result<Attr, ErrorDecode> {
@@ -180,6 +197,17 @@ fn parse_attr(r: schema::attr::Reader<'_>) -> Result<Attr, ErrorDecode> {
         gid: r.get_gid(),
         rdev: r.get_rdev(),
         blksize: r.get_blksize(),
+        xattr_names: match r.get_xattr_names().which()? {
+            schema::attr::xattr_names::Unknown(()) => None,
+            schema::attr::xattr_names::Some(list) => {
+                let list = list?;
+                let mut names = Vec::with_capacity(list.len() as usize);
+                for i in 0..list.len() {
+                    names.push(list.get(i)?.to_vec());
+                }
+                Some(names)
+            }
+        },
     })
 }
 
@@ -843,9 +871,11 @@ impl Message for Request {
 
 // ---------- Response ----------
 
-/// Words per directory entry in a composite list, excluding the name's data words: `DirEntry` is three data words and one pointer; `DirEntryPlus` adds a pointer and a fourteen-word `Attr`.
+/// Words per directory entry in a composite list, excluding the name data; a `DirEntryPlus` adds its own three words and a thirteen-word `Attr`, whose names are added per name.
 const DIR_ENTRY_WORDS: u32 = 4;
-const DIR_ENTRY_PLUS_WORDS: u32 = 18;
+const DIR_ENTRY_PLUS_WORDS: u32 = 20;
+/// An `Attr` in a reply, with the reply's own words; a word or two over, on purpose, since an under-estimate costs a canonicalizing copy.
+const ATTR_WORDS: u32 = 18;
 
 /// Words per `EventItem` in a composite list, excluding path and name data.
 const EVENT_ITEM_WORDS: u32 = 3;
@@ -932,7 +962,9 @@ impl Message for Response {
     fn size_hint(&self) -> u32 {
         let payload = match self {
             Response::Err(_) | Response::Ok | Response::Written(_) => 0,
-            Response::Entry(_) | Response::Attr(_) | Response::Opened { .. } => 16,
+            Response::Entry(attr) | Response::Attr(attr) | Response::Opened { attr } => {
+                ATTR_WORDS + words_for_xattr_names(attr.xattr_names.as_deref())
+            }
             Response::Readlink(b) | Response::Read(b) | Response::Xattr(b) => words_for(b.len()),
             Response::Readdir(entries) => entries
                 .iter()
@@ -940,7 +972,13 @@ impl Message for Response {
                 .sum(),
             Response::ReaddirPlus(entries) => entries
                 .iter()
-                .map(|e| DIR_ENTRY_PLUS_WORDS + e.entry.name.len().div_ceil(8) as u32)
+                .map(|e| {
+                    DIR_ENTRY_PLUS_WORDS
+                        + e.entry.name.len().div_ceil(8) as u32
+                        + words_for_xattr_names(
+                            e.attr.as_ref().and_then(|a| a.xattr_names.as_deref()),
+                        )
+                })
                 .sum(),
             Response::Statfs(_) => 8,
         };

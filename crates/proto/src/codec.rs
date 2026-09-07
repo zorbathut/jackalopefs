@@ -19,7 +19,7 @@ const READ_CHUNK: usize = 64 * 1024;
 /// Words a decoder may traverse per frame. Four times the largest frame: pointer aliasing stays bounded, but a legitimately maximal message never trips it even though the reader charges every getter call and double-counts re-reads. Changing it is a protocol change: edit the schema so the revision moves.
 const TRAVERSAL_LIMIT_WORDS: usize = 4 * MAX_FRAME / 8;
 
-/// The deepest real message is five levels (Response → List(DirEntryPlus) → DirEntryPlus → Attr → group); sixteen leaves room without inviting recursion abuse. Changing it is a protocol change: edit the schema so the revision moves.
+/// The deepest real message is six pointer levels (Response → List(DirEntryPlus) → DirEntryPlus → Attr → List(Data) → Data); sixteen leaves room without inviting recursion abuse. Changing it is a protocol change: edit the schema so the revision moves.
 const NESTING_LIMIT: i32 = 16;
 
 #[derive(Debug, thiserror::Error)]
@@ -183,6 +183,7 @@ mod tests {
             gid: 1000,
             rdev: 0,
             blksize: 4096,
+            xattr_names: Some(vec![b"user.k".to_vec(), b"security.selinux".to_vec()]),
         }
     }
 
@@ -379,6 +380,10 @@ mod tests {
             Response::Err(2),
             Response::Entry(sample_attr(9)),
             Response::Attr(sample_attr(10)),
+            Response::Attr(Attr {
+                xattr_names: None,
+                ..sample_attr(11)
+            }),
             Response::Readlink(b"target".to_vec()),
             Response::Ok,
             Response::Opened {
@@ -924,6 +929,49 @@ mod tests {
         assert!(schema.contains(&format!("write payload is at most {MAX_IO} bytes")));
     }
 
+    /// `dir_entry_bytes` is what the server budgets a page with, so it must be the true marginal cost of an entry.
+    #[test]
+    fn dir_entry_bytes_is_the_marginal_cost_of_an_entry() {
+        let entry = |n: usize| DirEntry {
+            ino: n as u64,
+            next_offset: n as u64,
+            kind: FileKind::Regular,
+            name: format!("name{n}").into_bytes(),
+        };
+        let plain: Vec<DirEntry> = (0..8).map(entry).collect();
+        let cost =
+            |entries: &[DirEntry]| encode(&Response::Readdir(entries.to_vec())).unwrap().len();
+        assert_eq!(
+            cost(&plain[..8]) - cost(&plain[..7]),
+            dir_entry_bytes(5, false, None)
+        );
+        for names in [
+            None,
+            Some(Vec::new()),
+            Some(vec![b"user.k".to_vec(), b"security.selinux".to_vec()]),
+        ] {
+            let plus: Vec<DirEntryPlus> = (0..8)
+                .map(|n| DirEntryPlus {
+                    entry: entry(n),
+                    attr: Some(Attr {
+                        xattr_names: names.clone(),
+                        ..sample_attr(n as u64)
+                    }),
+                })
+                .collect();
+            let cost = |entries: &[DirEntryPlus]| {
+                encode(&Response::ReaddirPlus(entries.to_vec()))
+                    .unwrap()
+                    .len()
+            };
+            assert_eq!(
+                cost(&plus[..8]) - cost(&plus[..7]),
+                dir_entry_bytes(5, true, names.as_deref()),
+                "{names:?}"
+            );
+        }
+    }
+
     #[test]
     fn golden_bytes() {
         let (hellos, replies, event) = control_messages();
@@ -931,7 +979,7 @@ mod tests {
             ("hello", frame_body(&hellos[1]), "000000000a0000000000000002000200080706050403020101000100000000000500000032000000040000000100010073656372657400000300000000000000010000008200000007070707070707070707070707070707"),
             ("reply", frame_body(&replies[0]), "0000000006000000000000000200010001000000000000000100000000000000010000008200000001010101010101010101010101010101"),
             ("request", frame_body(&Request::Rename { parent: path("a"), name: name("b"), newparent: path("c"), newname: name("d"), flags: 1 }), "000000000e00000000000000030004000900000000000000010000000000000000000000000000000d0000000e000000110000000a000000110000000e000000150000000a000000010000000a00000061000000000000006200000000000000010000000a00000063000000000000006400000000000000"),
-            ("response", frame_body(&Response::Entry(sample_attr(9))), "000000000e00000000000000010001000000000001000000000000000b00000009000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e8030000001000000000000000000000"),
+            ("response", frame_body(&Response::Entry(sample_attr(9))), "000000001500000000000000010001000000000001000000000000000c00010009000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e80300000010000000000000000000000100000000000000010000001600000005000000320000000500000082000000757365722e6b000073656375726974792e73656c696e7578"),
             ("event", frame_body(&event), "00000000110000000000000000000100010000004f0000000c0000000100020000000000000000001d00000006000000190000000a0000000100000000000000150000001600000000000000000000000200000000000000000000000000000000000000000000006600000000000000050000000a000000050000000a00000061000000000000006600000000000000"),
         ];
         for (what, actual, expected) in cases {
