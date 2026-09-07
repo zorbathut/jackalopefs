@@ -3,9 +3,10 @@
 use crate::export::Export;
 use crate::handles::Handles;
 use crate::ops::{self, Ops};
-use crate::perf::{fmt_bytes, fmt_duration, Outcome, Perf, Phases, TRACE_TARGET};
+use crate::perf::{Outcome, Perf, Phases, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch};
 use crate::SESSION_GRACE;
+use jackalopefs_perf::line_quic;
 use jackalopefs_proto::{
     read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Request, Response,
     PROTO_REVISION,
@@ -207,22 +208,14 @@ impl Server {
     }
 }
 
-/// A connection's QUIC statistics: round-trip time, congestion window and MTU as they stand, and losses, congestion events and bytes each way since it was made.
 fn log_quic(session: u64, conn: &Connection) {
-    let stats = conn.stats();
     tracing::info!(
         target: TRACE_TARGET,
-        "perf quic session={session} remote={} rtt={} cwnd={} mtu={} since connect: lost_packets={} congestion_events={} tx={}/{} datagrams rx={}/{} datagrams",
-        conn.remote_address(),
-        fmt_duration(stats.path.rtt),
-        fmt_bytes(stats.path.cwnd),
-        stats.path.current_mtu,
-        stats.path.lost_packets,
-        stats.path.congestion_events,
-        fmt_bytes(stats.udp_tx.bytes),
-        stats.udp_tx.datagrams,
-        fmt_bytes(stats.udp_rx.bytes),
-        stats.udp_rx.datagrams,
+        "{}",
+        line_quic(
+            &format!("session={session} remote={}", conn.remote_address()),
+            &conn.stats()
+        )
     );
 }
 

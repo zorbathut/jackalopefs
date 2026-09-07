@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/server", "crates/client"]
+members = ["crates/proto", "crates/perf", "crates/server", "crates/client"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/zorba/jackalopefs"
 
 [workspace.dependencies]
 jackalopefs-proto = { path = "crates/proto" }
+jackalopefs-perf = { path = "crates/perf" }
 jackalopefs-server = { path = "crates/server" }
 jackalopefs-client = { path = "crates/client" }
 

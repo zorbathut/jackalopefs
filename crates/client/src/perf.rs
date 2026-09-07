@@ -1,5 +1,6 @@
 //! Per-op accounting at the two levels of the client: what the kernel asked for and how long the answer took (`fuse`), and every request to the server with the time spent in each of its phases (`call`). Counting is always on and costs one mutex lock per op; the report is logged on demand and starts a new window.
 
+use jackalopefs_perf::{fmt_bytes, fmt_duration};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -301,32 +302,6 @@ fn fmt_row(row: &Row, window: Duration) -> String {
     out
 }
 
-pub fn fmt_duration(d: Duration) -> String {
-    let us = d.as_micros();
-    if us < 1_000 {
-        format!("{us}us")
-    } else if us < 1_000_000 {
-        format!("{:.2}ms", us as f64 / 1_000.0)
-    } else {
-        format!("{:.2}s", us as f64 / 1_000_000.0)
-    }
-}
-
-pub fn fmt_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n}B")
-    } else {
-        format!("{value:.1}{}", UNITS[unit])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,16 +391,5 @@ mod tests {
         perf.record_fuse("read", &Outcome::bytes(1), ms(1));
         assert_eq!(perf.report().fuse.len(), 1);
         assert!(perf.report().fuse.is_empty());
-    }
-
-    #[test]
-    fn formatting_helpers() {
-        assert_eq!(fmt_duration(Duration::from_micros(999)), "999us");
-        assert_eq!(fmt_duration(ms(1)), "1.00ms");
-        assert_eq!(fmt_duration(Duration::from_millis(1500)), "1.50s");
-        assert_eq!(fmt_bytes(512), "512B");
-        assert_eq!(fmt_bytes(1536), "1.5KiB");
-        assert_eq!(fmt_bytes(200 * 1024 * 1024), "200.0MiB");
-        assert_eq!(fmt_bytes(3 * 1024 * 1024 * 1024), "3.0GiB");
     }
 }

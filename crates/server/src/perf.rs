@@ -1,5 +1,6 @@
 //! Per-op accounting for every request the server answers, split into reading it off the stream, waiting for a blocking thread, the filesystem work, and sending the reply. Counting is always on and costs one mutex lock per request; the report is logged on demand and starts a new window.
 
+use jackalopefs_perf::{fmt_bytes, fmt_duration};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -217,32 +218,6 @@ impl Perf {
             );
         }
         snapshot
-    }
-}
-
-pub(crate) fn fmt_duration(d: Duration) -> String {
-    let us = d.as_micros();
-    if us < 1_000 {
-        format!("{us}us")
-    } else if us < 1_000_000 {
-        format!("{:.2}ms", us as f64 / 1_000.0)
-    } else {
-        format!("{:.2}s", us as f64 / 1_000_000.0)
-    }
-}
-
-pub(crate) fn fmt_bytes(n: u64) -> String {
-    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
-    let mut value = n as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit + 1 < UNITS.len() {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{n}B")
-    } else {
-        format!("{value:.1}{}", UNITS[unit])
     }
 }
 
