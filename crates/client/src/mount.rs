@@ -6,7 +6,9 @@ use crate::invalidate::Invalidator;
 use crate::perf::{Perf, TRACE_TARGET};
 use anyhow::Context;
 use fuser::{BackgroundSession, MountOption, SessionACL};
-use jackalopefs_perf::line_quic;
+use jackalopefs_perf::{
+    line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, TrackerQuic,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -161,6 +163,15 @@ pub struct Mount {
     invalidator: Option<Invalidator>,
     shared: Arc<Shared>,
     limits: Option<KernelLimits>,
+    meters: Meters,
+}
+
+/// What a report samples besides the tables: the host's ports, its UDP drop counters, and the connection's window, which belongs to one generation and starts over on a reconnect.
+struct Meters {
+    link: MeterLink,
+    udp: MeterUdp,
+    generation: u64,
+    quic: TrackerQuic,
 }
 
 impl Mount {
@@ -215,6 +226,12 @@ impl Mount {
             invalidator: Some(invalidator),
             shared,
             limits,
+            meters: Meters {
+                link: MeterLink::system(),
+                udp: MeterUdp::system(),
+                generation: 0,
+                quic: TrackerQuic::default(),
+            },
         })
     }
 
@@ -222,18 +239,35 @@ impl Mount {
         self.shared.client.perf()
     }
 
-    /// Log the per-op tables for the window since the last report, the kernel's queue depth, and the connection's QUIC statistics.
-    pub fn report(&self) {
+    /// Log the per-op tables for the window since the last report, the kernel's queue depth, the host's physical ports and UDP drop counters, the connection's QUIC statistics with its window, and the verdict when a port is full, in that order so the verdict follows the lines it is drawn from.
+    pub fn report(&mut self) {
         self.perf().report();
         if let Some(waiting) = self.limits.as_ref().and_then(KernelLimits::waiting) {
             tracing::info!(target: TRACE_TARGET, "perf kernel queue waiting={waiting}");
         }
-        match self.shared.client.conn_stats() {
-            Some((generation, stats)) => tracing::info!(
-                target: TRACE_TARGET,
-                "{}",
-                line_quic(&format!("generation={generation}"), &stats)
-            ),
+        let links = self.meters.link.sample();
+        for line in lines_link(&links) {
+            tracing::info!(target: TRACE_TARGET, "{line}");
+        }
+        if let Some(udp) = self.meters.udp.sample() {
+            tracing::info!(target: TRACE_TARGET, "{}", line_udp(&udp));
+        }
+        match self.shared.client.connection() {
+            Some((generation, conn)) => {
+                if self.meters.generation != generation {
+                    self.meters.generation = generation;
+                    self.meters.quic = TrackerQuic::default();
+                }
+                let sample = self.meters.quic.sample(conn.stats());
+                tracing::info!(
+                    target: TRACE_TARGET,
+                    "{}",
+                    line_quic(&format!("generation={generation}"), &sample)
+                );
+                if let Some(verdict) = verdict(&links, &sample) {
+                    tracing::info!(target: TRACE_TARGET, "{}", verdict.describe());
+                }
+            }
             None => tracing::info!(target: TRACE_TARGET, "perf quic: not connected"),
         }
     }

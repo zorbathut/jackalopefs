@@ -6,7 +6,9 @@ use crate::ops::{self, Ops};
 use crate::perf::{Outcome, Perf, Phases, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch};
 use crate::SESSION_GRACE;
-use jackalopefs_perf::line_quic;
+use jackalopefs_perf::{
+    line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, SampleLink, TrackerQuic,
+};
 use jackalopefs_proto::{
     read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Request, Response,
     PROTO_REVISION,
@@ -36,6 +38,14 @@ pub mod close_code {
     pub const SHUTDOWN: u32 = 0;
     pub const HANDSHAKE: u32 = 1;
     pub const EVENT_STREAM_STALLED: u32 = 2;
+}
+
+/// An attached session's connection, the attachment epoch it belongs to, and the tracker of its last sample.
+#[derive(Clone)]
+pub struct ConnectionEntry {
+    pub epoch: u64,
+    pub conn: Connection,
+    pub tracker: Arc<Mutex<TrackerQuic>>,
 }
 
 pub struct SessionState {
@@ -151,8 +161,10 @@ pub struct Server {
     pub changes: Arc<ChangeLog>,
     /// Request accounting across every session.
     pub perf: Arc<Perf>,
-    /// The connection of every attached session with the attachment epoch it belongs to, so a report can ask each for its QUIC statistics; the epoch keeps a takeover's newer connection from being displaced or removed by the older one.
-    pub connections: Mutex<HashMap<u64, (u64, Connection)>>,
+    /// The connection of every attached session with the attachment epoch it belongs to and the tracker of its last sample, so a report can ask each for its QUIC statistics over the window; the epoch keeps a takeover's newer connection from being displaced or removed by the older one.
+    pub connections: Mutex<HashMap<u64, ConnectionEntry>>,
+    /// The host's ports and UDP drop counters, sampled once per report.
+    meters: Mutex<Meters>,
     token: Option<String>,
     connection_permits: Arc<Semaphore>,
 }
@@ -172,6 +184,10 @@ impl Server {
             changes,
             perf: Arc::new(Perf::default()),
             connections: Mutex::new(HashMap::new()),
+            meters: Mutex::new(Meters {
+                link: MeterLink::system(),
+                udp: MeterUdp::system(),
+            }),
             token,
             connection_permits: Arc::new(Semaphore::new(max_connections)),
         }
@@ -190,33 +206,53 @@ impl Server {
         }
     }
 
-    /// Log the per-op table for the window since the last report, then one line per attached session with its connection's QUIC statistics. The server is the sending side of every read a client makes, so its window and losses are what bound a download.
+    /// Log the per-op table for the window since the last report, the host's physical ports and UDP drop counters, and then, per attached session, its connection's QUIC statistics with the window and the verdict against those ports, so a verdict follows the lines it is drawn from. The server is the sending side of every read a client makes, so its window and losses are what bound a download.
     pub fn report(&self) {
         self.perf.report();
-        let connections: Vec<(u64, Connection)> = self
+        let (links, udp) = {
+            let mut meters = self.meters.lock();
+            (meters.link.sample(), meters.udp.sample())
+        };
+        for line in lines_link(&links) {
+            tracing::info!(target: TRACE_TARGET, "{line}");
+        }
+        if let Some(udp) = udp {
+            tracing::info!(target: TRACE_TARGET, "{}", line_udp(&udp));
+        }
+        let connections: Vec<(u64, ConnectionEntry)> = self
             .connections
             .lock()
             .iter()
-            .map(|(id, (_, conn))| (*id, conn.clone()))
+            .map(|(id, entry)| (*id, entry.clone()))
             .collect();
         if connections.is_empty() {
             tracing::info!(target: TRACE_TARGET, "perf quic: no attached sessions");
         }
-        for (session, conn) in connections {
-            log_quic(session, &conn);
+        for (session, entry) in connections {
+            log_quic(session, &entry.conn, &entry.tracker, &links);
         }
     }
 }
 
-fn log_quic(session: u64, conn: &Connection) {
+struct Meters {
+    link: MeterLink,
+    udp: MeterUdp,
+}
+
+/// One connection's QUIC line for the window since its last sample, and the verdict against the ports when there is one to give.
+fn log_quic(session: u64, conn: &Connection, tracker: &Mutex<TrackerQuic>, links: &[SampleLink]) {
+    let sample = tracker.lock().sample(conn.stats());
     tracing::info!(
         target: TRACE_TARGET,
         "{}",
         line_quic(
             &format!("session={session} remote={}", conn.remote_address()),
-            &conn.stats()
+            &sample
         )
     );
+    if let Some(verdict) = verdict(links, &sample) {
+        tracing::info!(target: TRACE_TARGET, "{}", verdict.describe());
+    }
 }
 
 /// Accept connections until the endpoint is closed.
@@ -279,19 +315,28 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         }
     };
     tracing::info!(%remote, session = session.id, resumed, "session attached");
+    let tracker = Arc::new(Mutex::new(TrackerQuic::default()));
     {
         let mut connections = server.connections.lock();
         if connections
             .get(&session.id)
-            .is_none_or(|(attached, _)| *attached < epoch)
+            .is_none_or(|entry| entry.epoch < epoch)
         {
-            connections.insert(session.id, (epoch, conn.clone()));
+            connections.insert(
+                session.id,
+                ConnectionEntry {
+                    epoch,
+                    conn: conn.clone(),
+                    tracker: tracker.clone(),
+                },
+            );
         }
     }
     let _detach = DetachOnDrop {
         server: server.clone(),
         session: session.clone(),
         conn: conn.clone(),
+        tracker,
         epoch,
         remote,
     };
@@ -325,6 +370,7 @@ struct DetachOnDrop {
     server: Arc<Server>,
     session: Arc<SessionState>,
     conn: Connection,
+    tracker: Arc<Mutex<TrackerQuic>>,
     epoch: u64,
     remote: std::net::SocketAddr,
 }
@@ -335,14 +381,15 @@ impl Drop for DetachOnDrop {
             let mut connections = self.server.connections.lock();
             if connections
                 .get(&self.session.id)
-                .is_some_and(|(attached, _)| *attached == self.epoch)
+                .is_some_and(|entry| entry.epoch == self.epoch)
             {
                 connections.remove(&self.session.id);
             }
         }
         self.server.sessions.detach(self.session.id, self.epoch);
         tracing::info!(remote = %self.remote, session = self.session.id, open_handles = self.session.handles.len(), "session detached");
-        log_quic(self.session.id, &self.conn);
+        // The final window, with no port sample to judge it against: the totals are what matter here.
+        log_quic(self.session.id, &self.conn, &self.tracker, &[]);
     }
 }
 

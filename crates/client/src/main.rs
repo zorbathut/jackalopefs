@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
         let client = Client::connect(config)
             .await
             .with_context(|| format!("connecting to {}", args.server))?;
-        let mount = Mount::start(
+        let mut mount = Mount::start(
             client,
             &args.mountpoint,
             MountOptions {

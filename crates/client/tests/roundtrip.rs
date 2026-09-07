@@ -513,7 +513,7 @@ async fn session_resumes_after_a_connection_drop() {
         "the old connection to leave the table",
         || {
             let connections = server.server.connections.lock();
-            (connections.len() == 1).then(|| connections[&first.session_id].0)
+            (connections.len() == 1).then(|| connections[&first.session_id].epoch)
         },
     )
     .await;

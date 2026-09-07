@@ -366,10 +366,10 @@ impl Client {
         &self.caller.perf
     }
 
-    /// The current connection's generation and QUIC statistics, if there is one; the counters are cumulative since that connection was made.
-    pub fn conn_stats(&self) -> Option<(u64, quinn::ConnectionStats)> {
+    /// The current connection and its generation, if there is one.
+    pub fn connection(&self) -> Option<(u64, Connection)> {
         match &*self.conn.state.borrow() {
-            ConnState::Connected(attached) => Some((attached.generation, attached.conn.stats())),
+            ConnState::Connected(attached) => Some((attached.generation, attached.conn.clone())),
             _ => None,
         }
     }

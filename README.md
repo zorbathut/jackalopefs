@@ -30,7 +30,7 @@ The server is a host name or an IP address, with or without a port (an IPv6 addr
 
 Set `RUST_LOG=debug` (or `trace`) on either side for more detail.
 
-To see what is slow: `SIGUSR1` to either binary, or `--perf-interval 5s` on either, logs a per-operation summary of the window since the last one (count, mean concurrency, mean and maximum latency, bytes, errnos, and the time spent in each phase: on the client waiting for a connection, opening the stream, sending, and waiting for the reply; on the server reading the request, waiting for a thread, the filesystem work, and sending). The client adds the kernel's request queue depth and the connection's QUIC round-trip time and congestion window, and at mount it logs the readahead and queue limits the kernel actually granted, which are not what it asked for. `RUST_LOG=info,jackalopefs_client::perf=trace` (server: `jackalopefs_server::perf=trace`) logs every request with the same breakdown, the client's lines carrying the pid that made the request. `scripts/perf/workload.sh <mountpoint>` runs the standard workloads against a live mount with a banner around each.
+To see what is slow: `SIGUSR1` to either binary, or `--perf-interval 5s` on either, logs a per-operation summary of the window since the last one (count, mean concurrency, mean and maximum latency, bytes, errnos, and the time spent in each phase: on the client waiting for a connection, opening the stream, sending, and waiting for the reply; on the server reading the request, waiting for a thread, the filesystem work, and sending). The client adds the kernel's request queue depth and the connection's QUIC round-trip time and congestion window, and at mount it logs the readahead and queue limits the kernel actually granted, which are not what it asked for. Both sides add the load, speed and drop counters of the host's physical ports, the UDP socket drop counters, each connection's rates and losses over the window, and a verdict naming the port when it is full and saying whether the traffic filling it is this connection's. `RUST_LOG=info,jackalopefs_client::perf=trace` (server: `jackalopefs_server::perf=trace`) logs every request with the same breakdown, the client's lines carrying the pid that made the request. `scripts/perf/workload.sh <mountpoint>` runs the standard workloads against a live mount with a banner around each.
 
 ## Wow! That sounds amazing and with absolutely no qualifiers or concerns. Wait, hold on. Don't other solutions exist? Why shouldn't you use them? Claude, write a convicting explanation for why someone should use this crazy thing, make no mistakes.
 
@@ -52,15 +52,15 @@ sshfs is a pretty clever solution - I can't imagine an easier way to implement a
 
 ### rclone
 
-rclone provides a whole bunch of various mount solutions and the only one I've used is the ssh one. My tl;dr is "another sshfs, but better at some stuff and worse at others".
+rclone provides a whole bunch of various mount solutions and the only one I've used is the ssh one. My tl;dr is "another sshfs, but better at some stuff and worse at others". One specific place it has trouble: it has speculative readahead, but the behavior is crummy, giving you a choice between "bad performance" and "far too much bandwidth usage".
 
 ### Jackalope
 
-Jackalope uses QUIC for better handling of contention and far more transparent parallel transfers. It's designed from the ground up to support its own login semantics (right now it *just* mounts as the user - don't run as root unless you really mean it! - but future versions may add more). It is intended for the server to vanish at any moment without serious stability problems (obviously your file transfers will fail, deal with it). It can in the future support encryptionless connections. It supports *multiple* giant chunky POSIX test suites and 100%'s them aside from the parts that aren't relevant (mostly around stuff like `chown` which is currently not supported at all due to the whole single-user thing.)
+Jackalope uses QUIC for better handling of contention and far more transparent parallel transfers. It's designed from the ground up to support its own login semantics (right now it *just* mounts as the user - don't run as root unless you really mean it! - but future versions may add more). It is intended for the server to vanish at any moment without serious stability problems (obviously your file transfers will fail, deal with it). It can in the future support encryptionless connections. It supports *multiple* giant chunky POSIX test suites and 100%'s them aside from the parts that aren't relevant (mostly around stuff like `chown` which is currently not supported at all due to the whole single-user thing.) And while I'm sure I'll be tweaking adaptive speculative readahead forever, the beginnings of it are there.
 
 There's a lot of "it could, someday" here, and that's intended. I'm not claiming this is the best solution for everyone. I'm claiming that *with enough work, this could, theoretically, be the best solution for everyone*. But it isn't yet.
 
-It probably won't ever be. But that's OK. Maybe it's a better solution for you.
+It probably won't ever be. But that's OK. Maybe it's already a better solution for you.
 
 # Okay let's get back to the tech stuff I guess
 
