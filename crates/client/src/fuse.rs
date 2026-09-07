@@ -51,11 +51,25 @@ struct AttrReported {
     mtime: TimeSpec,
 }
 
-/// Entries fetched from the server but not yet handed to the kernel, each tagged with the cookie that yields it.
-#[derive(Default)]
-struct DirBuffer {
-    plain: VecDeque<(u64, DirEntry)>,
-    plus: VecDeque<(u64, DirEntryPlus)>,
+/// Entries fetched from the server but not yet handed to the kernel, each tagged with the cookie that yields it. The variant says what the fetch carried: a plain page can be served from either, a readdirplus page only from `Plus`. An empty `Plain` is also the state with nothing buffered.
+enum DirBuffer {
+    Plain(VecDeque<(u64, DirEntry)>),
+    Plus(VecDeque<(u64, DirEntryPlus)>),
+}
+
+impl Default for DirBuffer {
+    fn default() -> Self {
+        DirBuffer::Plain(VecDeque::new())
+    }
+}
+
+impl DirBuffer {
+    fn front_cookie(&self) -> Option<u64> {
+        match self {
+            DirBuffer::Plain(entries) => entries.front().map(|(cookie, _)| *cookie),
+            DirBuffer::Plus(entries) => entries.front().map(|(cookie, _)| *cookie),
+        }
+    }
 }
 
 pub struct Backend {
@@ -460,51 +474,75 @@ impl Shared {
         }
     }
 
-    /// Serve one page of entries for `fh` starting at `offset`, from the buffer when it continues where the kernel left off and from the server otherwise. A handle without a buffer has been released.
-    async fn dir_page(&self, fh: u64, offset: u64) -> Result<Vec<(u64, DirEntry)>, Error> {
+    /// A page for a plain readdir starting at `offset`: the buffer when it continues where the kernel left off, whatever kind of fetch filled it, and the server otherwise. A handle without a buffer has been released.
+    async fn dir_page(&self, fh: u64, offset: u64) -> Result<DirBuffer, Error> {
         {
             let mut dirs = self.dirs.lock();
             let buffer = dirs.get_mut(&fh).ok_or(Error::Remote(libc::EBADF))?;
-            if buffer
-                .plain
-                .front()
-                .is_some_and(|(cookie, _)| *cookie == offset)
-            {
-                return Ok(buffer.plain.drain(..).collect());
+            if buffer.front_cookie() == Some(offset) {
+                return Ok(std::mem::take(buffer));
             }
-            buffer.plain.clear();
+            *buffer = DirBuffer::default();
         }
         let entries = self.client.readdir(fh, offset, READDIR_FETCH).await?;
-        Ok(tag_with_cookies(entries, offset, |e| e.next_offset))
+        Ok(DirBuffer::Plain(
+            tag_with_cookies(entries, offset, |e| e.next_offset).into(),
+        ))
     }
 
+    /// A page for a readdirplus starting at `offset`: the buffer only when a readdirplus fetch filled it, since the kernel is about to link every entry, and the server otherwise.
     async fn dir_page_plus(&self, fh: u64, offset: u64) -> Result<Vec<(u64, DirEntryPlus)>, Error> {
         {
             let mut dirs = self.dirs.lock();
             let buffer = dirs.get_mut(&fh).ok_or(Error::Remote(libc::EBADF))?;
-            if buffer
-                .plus
-                .front()
-                .is_some_and(|(cookie, _)| *cookie == offset)
-            {
-                return Ok(buffer.plus.drain(..).collect());
+            if let DirBuffer::Plus(entries) = buffer {
+                if entries.front().is_some_and(|(cookie, _)| *cookie == offset) {
+                    return Ok(entries.drain(..).collect());
+                }
             }
-            buffer.plus.clear();
+            *buffer = DirBuffer::default();
         }
         let entries = self.client.readdirplus(fh, offset, READDIR_FETCH).await?;
         Ok(tag_with_cookies(entries, offset, |e| e.entry.next_offset))
     }
 
-    fn stash_plain(&self, fh: u64, rest: Vec<(u64, DirEntry)>) {
+    /// Keep what the kernel's buffer did not take for its next request on the handle.
+    fn stash(&self, fh: u64, rest: DirBuffer) {
         if let Some(buffer) = self.dirs.lock().get_mut(&fh) {
-            buffer.plain = rest.into_iter().collect();
+            *buffer = rest;
         }
     }
 
-    fn stash_plus(&self, fh: u64, rest: Vec<(u64, DirEntryPlus)>) {
-        if let Some(buffer) = self.dirs.lock().get_mut(&fh) {
-            buffer.plus = rest.into_iter().collect();
+    /// Hand a plain page to the kernel until its buffer is full; what it did not take comes back, in the buffer's own kind, to be stashed.
+    fn add_plain<T>(
+        &self,
+        reply: &mut ReplyDirectory,
+        ino: u64,
+        entries: VecDeque<(u64, T)>,
+        entry_of: impl Fn(&T) -> &DirEntry,
+    ) -> (usize, VecDeque<(u64, T)>) {
+        let mut entries = entries.into_iter();
+        let mut added = 0;
+        while let Some((cookie, item)) = entries.next() {
+            let entry = entry_of(&item);
+            let entry_ino = match entry.name.as_slice() {
+                b"." => ino,
+                b".." => self.parent_of(ino),
+                _ => entry.ino,
+            };
+            if reply.add(
+                INodeNo(entry_ino),
+                entry.next_offset,
+                file_type(entry.kind),
+                OsStr::from_bytes(&entry.name),
+            ) {
+                let mut rest = VecDeque::from([(cookie, item)]);
+                rest.extend(entries);
+                return (added, rest);
+            }
+            added += 1;
         }
+        (added, VecDeque::new())
     }
 }
 
@@ -1122,30 +1160,21 @@ impl Filesystem for Backend {
             ..KeyPerf::of("readdir", req, ino.0)
         };
         self.spawn(key, async move {
-            let mut entries = match shared.dir_page(fh.0, offset).await {
-                Ok(entries) => entries.into_iter(),
+            let page = match shared.dir_page(fh.0, offset).await {
+                Ok(page) => page,
                 Err(e) => return fail(reply, errno(&e)),
             };
-            let mut added = 0;
-            for (cookie, entry) in entries.by_ref() {
-                let entry_ino = match entry.name.as_slice() {
-                    b"." => ino.0,
-                    b".." => shared.parent_of(ino.0),
-                    _ => entry.ino,
-                };
-                if reply.add(
-                    INodeNo(entry_ino),
-                    entry.next_offset,
-                    file_type(entry.kind),
-                    OsStr::from_bytes(&entry.name),
-                ) {
-                    let mut rest = vec![(cookie, entry)];
-                    rest.extend(entries);
-                    shared.stash_plain(fh.0, rest);
-                    break;
+            let (added, rest) = match page {
+                DirBuffer::Plain(entries) => {
+                    let (added, rest) = shared.add_plain(&mut reply, ino.0, entries, |e| e);
+                    (added, DirBuffer::Plain(rest))
                 }
-                added += 1;
-            }
+                DirBuffer::Plus(entries) => {
+                    let (added, rest) = shared.add_plain(&mut reply, ino.0, entries, |e| &e.entry);
+                    (added, DirBuffer::Plus(rest))
+                }
+            };
+            shared.stash(fh.0, rest);
             reply.ok();
             Outcome::items(added)
         });
@@ -1222,9 +1251,9 @@ impl Filesystem for Backend {
                     }
                 };
                 if full {
-                    let mut rest = vec![(cookie, item)];
+                    let mut rest = VecDeque::from([(cookie, item)]);
                     rest.extend(entries);
-                    shared.stash_plus(fh.0, rest);
+                    shared.stash(fh.0, DirBuffer::Plus(rest));
                     break;
                 }
                 added += 1;

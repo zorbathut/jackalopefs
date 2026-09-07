@@ -20,6 +20,7 @@
 
 ### Improved
 
+- The pages the kernel asks for as plain readdir after its first readdirplus page are served from that first fetch instead of fetching the directory again without attributes. As a consequence an entry the server cannot describe (a mount point) is absent from a plain listing that came out of a readdirplus fetch, as it already was from the readdirplus page.
 - Writes onto the mount reach the server as requests of up to 1 MiB with many in flight instead of one round trip per `write(2)`, and the kernel's per-write `security.capability` probe is answered from the metadata cache; a copy onto the mount is no longer bound by the round-trip time.
 - A change to a file on the server, or by another client, is seen through the mount by dropping the file from the kernel's cache by name, which is what works when the kernel keeps its own size for files it holds.
 

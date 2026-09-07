@@ -323,6 +323,55 @@ async fn large_directory_pages_through_the_kernel_correctly() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_listing_longer_than_one_kernel_page_is_fetched_once() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    // Past one kernel readdir page (the caller's getdents buffer, 32 KiB for glibc) and well inside one client fetch, on a host where every file carries ACL names too.
+    for i in 0..400 {
+        fs::write(export.join(format!("d/entry-{i:04}")), b"").unwrap();
+    }
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    // The kernel asks for the first page as readdirplus and later pages as plain readdir; every page must come out of the one fetch.
+    for stat in [false, true] {
+        perf.report();
+        let mnt = mnt.clone();
+        let count = blocking(move || {
+            let mut count = 0;
+            for entry in fs::read_dir(mnt.join("d")).unwrap() {
+                let entry = entry.unwrap();
+                if stat {
+                    assert!(entry.metadata().unwrap().is_file());
+                }
+                count += 1;
+            }
+            count
+        })
+        .await;
+        assert_eq!(count, 400);
+        wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+            (perf.inflight() == 0).then_some(())
+        })
+        .await;
+        let snap = perf.report();
+        let fetched: u64 = ["readdir", "readdirplus"]
+            .iter()
+            .filter_map(|op| snap.call.get(op))
+            .map(|r| r.row.items)
+            .sum();
+        assert_eq!(
+            fetched, 402,
+            "stat={stat}: every entry, `.` and `..` included, crosses the network once: {:?}",
+            snap.call
+        );
+    }
+    m.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failing_test_body_still_leaves_no_mount_behind() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
