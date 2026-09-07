@@ -21,6 +21,7 @@ pub enum Work {
 }
 
 pub struct Invalidator {
+    shared: Arc<Shared>,
     task: tokio::task::JoinHandle<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -33,13 +34,15 @@ impl Invalidator {
         notifier: Notifier,
     ) -> Invalidator {
         let (tx, rx) = sync_channel(QUEUE);
+        shared.invalidations_set(tx.clone());
         let thread_shared = shared.clone();
         let thread = std::thread::Builder::new()
             .name("jackalopefs-inval".into())
             .spawn(move || notifier_loop(rx, notifier, thread_shared))
             .expect("spawn notifier thread");
-        let task = tokio::spawn(translate(shared, events, state, tx));
+        let task = tokio::spawn(translate(shared.clone(), events, state, tx));
         Invalidator {
+            shared,
             task,
             thread: Some(thread),
         }
@@ -53,7 +56,8 @@ impl Invalidator {
 
 impl Drop for Invalidator {
     fn drop(&mut self) {
-        // Aborting the translator drops the queue's sender, which ends the notifier thread's receive loop.
+        // The notifier thread's receive loop ends when every sender is gone: the translator's with the task, and the FUSE layer's here.
+        self.shared.invalidations_clear();
         self.task.abort();
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() {
@@ -88,6 +92,12 @@ async fn translate(
                         EventItem::Data { path } => {
                             if let Some(ino) = nodes.resolve_path(&path) {
                                 work.push(Work::Inode(ino));
+                                // The kernel keeps its own size and mtime for a regular file it holds, so the file is also taken away from it by name: an unopened file is then evicted and looked up afresh.
+                                if let Some(node) = nodes.get(ino).filter(|n| n.kind == FileKind::Regular) {
+                                    for (parent, name) in &node.aliases {
+                                        work.push(Work::Entry(*parent, name.clone()));
+                                    }
+                                }
                             }
                         }
                         EventItem::Overflow => work.push(Work::Sweep),
@@ -136,7 +146,7 @@ fn notifier_loop(rx: Receiver<Work>, notifier: Notifier, shared: Arc<Shared>) {
             Work::Entry(parent, name) => inval_entry(&notifier, parent, &name),
             Work::Inode(ino) => {
                 shared.xattr_forget(ino);
-                inval_inode(&notifier, ino)
+                inval_inode(&notifier, &shared, ino)
             }
             Work::Sweep => {
                 shared.xattr_clear();
@@ -153,10 +163,13 @@ fn inval_entry(notifier: &Notifier, parent: u64, name: &Name) {
     }
 }
 
-fn inval_inode(notifier: &Notifier, ino: u64) {
-    match notifier.inval_inode(INodeNo(ino), 0, 0) {
-        Ok(()) => tracing::trace!(ino, "inval_inode"),
-        Err(e) => tracing::debug!(ino, "inval_inode: {e}"),
+/// Drop the kernel's attributes for `ino`, and its pages unless this client is writing the file: invalidating pages first writes the dirty ones back, which would park this thread on the network for as long as that takes, and the kernel's copy of a file we are writing is the authority anyway.
+fn inval_inode(notifier: &Notifier, shared: &Shared, ino: u64) {
+    let pages = !shared.client.handles().has_writer(ino);
+    let offset = if pages { 0 } else { -1 };
+    match notifier.inval_inode(INodeNo(ino), offset, 0) {
+        Ok(()) => tracing::trace!(ino, pages, "inval_inode"),
+        Err(e) => tracing::debug!(ino, pages, "inval_inode: {e}"),
     }
 }
 
@@ -183,7 +196,7 @@ fn sweep(notifier: &Notifier, shared: &Shared) {
         "sweeping kernel cache"
     );
     for ino in open.into_iter().chain(files) {
-        inval_inode(notifier, ino);
+        inval_inode(notifier, shared, ino);
     }
     for (parent, name, _) in entries {
         inval_entry(notifier, parent, &name);

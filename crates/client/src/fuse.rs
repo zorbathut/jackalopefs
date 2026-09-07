@@ -2,6 +2,7 @@
 
 use crate::client::{Client, Error};
 use crate::inodes::{NodeTable, ROOT};
+use crate::invalidate::Work;
 use crate::perf::{Outcome, REQUEST_ID, TRACE_TARGET};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
@@ -31,6 +32,10 @@ pub struct Shared {
     dirs: Mutex<HashMap<u64, DirBuffer>>,
     /// What the last attributes said about each inode's extended attribute names, kept for the attribute TTL; answers only the absence of a name and the list itself, never a value. Bounded by the node table: an entry leaves when the kernel forgets the inode.
     xattrs: Mutex<HashMap<u64, KnownXattrs>>,
+    /// The size and mtime the server last reported for each regular file. The kernel discards both for a file it already holds (its writeback cache may be ahead of the server), so when a fresh reply disagrees and this client does not hold the file open, the file is taken away from the kernel by name and looked up afresh; that is what bounds an external change to the attribute TTL. A file this client wrote is dropped from the kernel, record included, when its last handle closes: what the server reported while our own writes were landing says nothing about what the kernel holds, and the kernel's own mtime may be behind the server's.
+    reported: Mutex<HashMap<u64, AttrReported>>,
+    /// Where to queue such invalidations; set while the invalidator runs.
+    invalidations: Mutex<Option<std::sync::mpsc::SyncSender<Work>>>,
     pub entry_ttl: Duration,
     pub attr_ttl: Duration,
 }
@@ -38,6 +43,12 @@ pub struct Shared {
 struct KnownXattrs {
     names: Vec<Vec<u8>>,
     until: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AttrReported {
+    size: u64,
+    mtime: TimeSpec,
 }
 
 /// Entries fetched from the server but not yet handed to the kernel, each tagged with the cookie that yields it.
@@ -89,6 +100,8 @@ impl Backend {
             nodes: Mutex::new(NodeTable::new()),
             dirs: Mutex::new(HashMap::new()),
             xattrs: Mutex::new(HashMap::new()),
+            reported: Mutex::new(HashMap::new()),
+            invalidations: Mutex::new(None),
             entry_ttl,
             attr_ttl,
         });
@@ -321,6 +334,69 @@ impl Shared {
         self.xattrs.lock().remove(&ino);
     }
 
+    pub fn invalidations_set(&self, tx: std::sync::mpsc::SyncSender<Work>) {
+        *self.invalidations.lock() = Some(tx);
+    }
+
+    pub fn invalidations_clear(&self) {
+        *self.invalidations.lock() = None;
+    }
+
+    /// Record what the server reports about a regular file's size and mtime; when that differs from last time and this client is not writing the file, someone else changed it, and the kernel, which keeps its own view of a file it holds, is made to drop the file by name so an unopened one is looked up afresh.
+    fn attr_reported(&self, attr: &Attr) {
+        if attr.kind != FileKind::Regular {
+            return;
+        }
+        let now = AttrReported {
+            size: attr.size,
+            mtime: attr.mtime,
+        };
+        let changed = {
+            let mut reported = self.reported.lock();
+            match reported.get(&attr.ino) {
+                Some(before) => *before != now,
+                None => {
+                    reported.insert(attr.ino, now);
+                    false
+                }
+            }
+        };
+        // A file held open cannot be evicted, and while we write it the server's view is noise; the record stays behind so the first reply after the last close detects the change and drops the file then.
+        if !changed || self.client.handles().any_live_for(attr.ino).is_some() {
+            return;
+        }
+        // The record moves only once the invalidation is queued; until then it stays behind so the next reply detects the same change again.
+        if self.drop_by_name(attr.ino) {
+            self.reported.lock().insert(attr.ino, now);
+        }
+    }
+
+    /// Queue an entry invalidation for every name the kernel knows `ino` by, which evicts the inode if nothing holds it, so the next access looks it up afresh; false if the queue is full or gone, with the reason logged.
+    fn drop_by_name(&self, ino: u64) -> bool {
+        let aliases = self
+            .nodes
+            .lock()
+            .get(ino)
+            .map(|node| node.aliases.clone())
+            .unwrap_or_default();
+        let invalidations = self.invalidations.lock();
+        let Some(tx) = invalidations.as_ref() else {
+            tracing::debug!(ino, "no invalidation queue to drop the file through");
+            return false;
+        };
+        for (parent, name) in aliases {
+            if let Err(e) = tx.try_send(Work::Entry(parent, name)) {
+                tracing::debug!(ino, "cannot queue an entry invalidation: {e}");
+                return false;
+            }
+        }
+        true
+    }
+
+    fn reported_forget(&self, ino: u64) {
+        self.reported.lock().remove(&ino);
+    }
+
     pub fn xattr_clear(&self) {
         self.xattrs.lock().clear();
     }
@@ -350,6 +426,7 @@ impl Shared {
     /// Register a successful entry reply and return the generation to send.
     fn register(&self, parent: u64, name: Name, attr: &Attr) -> Result<Generation, Errno> {
         self.xattr_remember(attr);
+        self.attr_reported(attr);
         self.nodes
             .lock()
             .insert_lookup(parent, name, attr.ino, attr.kind)
@@ -494,6 +571,7 @@ impl Filesystem for Backend {
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
         if self.shared.nodes.lock().forget(ino.0, nlookup) {
             self.shared.xattr_forget(ino.0);
+            self.shared.reported_forget(ino.0);
         }
     }
 
@@ -512,6 +590,7 @@ impl Filesystem for Backend {
             match shared.client.getattr(path, fh).await {
                 Ok(attr) => {
                     shared.xattr_remember(&attr);
+                    shared.attr_reported(&attr);
                     reply.attr(&shared.attr_ttl, &file_attr(&attr));
                     Outcome::default()
                 }
@@ -542,6 +621,8 @@ impl Filesystem for Backend {
         // ctime cannot be set on Linux and the remaining fields are macOS-only; they are dropped on purpose.
         let shared = self.shared.clone();
         let fh = fh.map(|f| f.0);
+        // A setattr that sets neither size nor mtime only observes them, and what it observes is checked like any other reply.
+        let observes_only = size.is_none() && mtime.is_none();
         let set = SetAttr {
             mode,
             uid,
@@ -563,6 +644,18 @@ impl Filesystem for Backend {
             match shared.client.setattr(path, fh, set).await {
                 Ok(attr) => {
                     shared.xattr_remember(&attr);
+                    if observes_only {
+                        shared.attr_reported(&attr);
+                    } else {
+                        // Our own change: the kernel already knows the new size and time, so only the record moves.
+                        shared.reported.lock().insert(
+                            attr.ino,
+                            AttrReported {
+                                size: attr.size,
+                                mtime: attr.mtime,
+                            },
+                        );
+                    }
                     reply.attr(&shared.attr_ttl, &file_attr(&attr));
                     Outcome::default()
                 }
@@ -794,6 +887,7 @@ impl Filesystem for Backend {
             match shared.client.open(ino.0, path, flags).await {
                 Ok((fh, attr)) => {
                     shared.xattr_remember(&attr);
+                    shared.attr_reported(&attr);
                     reply.opened(FileHandle(fh), FopenFlags::empty());
                     Outcome::default()
                 }

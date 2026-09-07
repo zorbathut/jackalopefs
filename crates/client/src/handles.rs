@@ -105,6 +105,13 @@ impl HandleTable {
             .map(|(fh, _)| *fh)
     }
 
+    /// Whether a live handle on `nodeid` was opened for writing, in which case the kernel may hold dirty pages for it.
+    pub fn has_writer(&self, nodeid: u64) -> bool {
+        self.map.lock().values().any(|r| {
+            r.nodeid == nodeid && !r.is_dead() && r.flags & libc::O_ACCMODE != libc::O_RDONLY
+        })
+    }
+
     /// Node ids of every live handle, for post-reconnect invalidation.
     pub fn open_nodeids(&self) -> Vec<u64> {
         self.map
@@ -211,5 +218,39 @@ mod tests {
         table.apply_reopen(a, &rec_a, Ok(Response::Opened { attr: attr(99) }));
         assert!(rec_a.is_dead());
         assert_eq!(table.any_live_for(42), None);
+    }
+
+    #[test]
+    fn a_writer_is_a_live_file_handle_that_can_write() {
+        let table = HandleTable::default();
+        let r = table.alloc();
+        table.insert(r, 42, Path::root(), libc::O_RDONLY, HandleKind::File);
+        let d = table.alloc();
+        table.insert(
+            d,
+            42,
+            Path::root(),
+            libc::O_RDONLY | libc::O_DIRECTORY,
+            HandleKind::Dir,
+        );
+        assert!(!table.has_writer(42));
+        let w = table.alloc();
+        let rec_w = table.insert(w, 42, Path::root(), libc::O_RDWR, HandleKind::File);
+        assert!(table.has_writer(42));
+        assert!(!table.has_writer(43));
+        table.apply_reopen(w, &rec_w, Ok(Response::Opened { attr: attr(99) }));
+        assert!(rec_w.is_dead());
+        assert!(!table.has_writer(42));
+        let w2 = table.alloc();
+        table.insert(
+            w2,
+            42,
+            Path::root(),
+            libc::O_WRONLY | libc::O_CREAT,
+            HandleKind::File,
+        );
+        assert!(table.has_writer(42));
+        table.remove(w2);
+        assert!(!table.has_writer(42));
     }
 }
