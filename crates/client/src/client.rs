@@ -146,8 +146,8 @@ fn outcome_of(result: &Result<Response, Error>) -> Outcome {
     match result {
         Ok(Response::Read(data)) => Outcome::bytes(data.len()),
         Ok(Response::Written(n)) => Outcome::bytes(*n as usize),
-        Ok(Response::Readdir(entries)) => Outcome::items(entries.len()),
-        Ok(Response::ReaddirPlus(entries)) => Outcome::items(entries.len()),
+        Ok(Response::Readdir { entries, .. }) => Outcome::items(entries.len()),
+        Ok(Response::ReaddirPlus { entries, .. }) => Outcome::items(entries.len()),
         Ok(_) => Outcome::default(),
         Err(e) => Outcome::errno(e.errno()),
     }
@@ -608,12 +608,13 @@ impl Client {
         .await
     }
 
+    /// A page of entries and whether the directory ended with its last one.
     pub async fn readdir(
         &self,
         fh: u64,
         offset: u64,
         max_bytes: u32,
-    ) -> Result<Vec<DirEntry>, Error> {
+    ) -> Result<(Vec<DirEntry>, bool), Error> {
         match self
             .call(Request::Readdir {
                 fh,
@@ -623,17 +624,18 @@ impl Client {
             })
             .await?
         {
-            Response::Readdir(entries) => Ok(entries),
+            Response::Readdir { entries, end } => Ok((entries, end)),
             other => Err(unexpected(other)),
         }
     }
 
+    /// A page of entries with attributes and whether the directory ended with its last one.
     pub async fn readdirplus(
         &self,
         fh: u64,
         offset: u64,
         max_bytes: u32,
-    ) -> Result<Vec<DirEntryPlus>, Error> {
+    ) -> Result<(Vec<DirEntryPlus>, bool), Error> {
         match self
             .call(Request::Readdir {
                 fh,
@@ -643,7 +645,7 @@ impl Client {
             })
             .await?
         {
-            Response::ReaddirPlus(entries) => Ok(entries),
+            Response::ReaddirPlus { entries, end } => Ok((entries, end)),
             other => Err(unexpected(other)),
         }
     }
@@ -714,8 +716,8 @@ fn response_name(resp: &Response) -> &'static str {
         Response::Opened { .. } => "Opened",
         Response::Read(_) => "Read",
         Response::Written(_) => "Written",
-        Response::Readdir(_) => "Readdir",
-        Response::ReaddirPlus(_) => "ReaddirPlus",
+        Response::Readdir { .. } => "Readdir",
+        Response::ReaddirPlus { .. } => "ReaddirPlus",
         Response::Statfs(_) => "Statfs",
         Response::Xattr(_) => "Xattr",
     }

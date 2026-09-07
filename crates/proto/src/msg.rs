@@ -252,8 +252,16 @@ pub enum Response {
     },
     Read(Vec<u8>),
     Written(u32),
-    Readdir(Vec<DirEntry>),
-    ReaddirPlus(Vec<DirEntryPlus>),
+    /// `end`: no entry follows the last one, so the client may answer a read at its `next_offset` itself; meaningless with no entries.
+    Readdir {
+        entries: Vec<DirEntry>,
+        end: bool,
+    },
+    /// `end` as for `Readdir`.
+    ReaddirPlus {
+        entries: Vec<DirEntryPlus>,
+        end: bool,
+    },
     Statfs(Statfs),
     /// getxattr value, or the NUL-separated listxattr names
     Xattr(Vec<u8>),

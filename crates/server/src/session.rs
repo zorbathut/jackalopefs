@@ -545,8 +545,8 @@ fn outcome_of(resp: &Response) -> Outcome {
         Response::Err(errno) => Outcome::errno(*errno),
         Response::Read(data) => Outcome::bytes(data.len()),
         Response::Written(n) => Outcome::bytes(*n as usize),
-        Response::Readdir(entries) => Outcome::items(entries.len()),
-        Response::ReaddirPlus(entries) => Outcome::items(entries.len()),
+        Response::Readdir { entries, .. } => Outcome::items(entries.len()),
+        Response::ReaddirPlus { entries, .. } => Outcome::items(entries.len()),
         _ => Outcome::default(),
     }
 }

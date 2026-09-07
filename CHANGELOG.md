@@ -16,16 +16,18 @@
 
 ### Breaking
 
+- Protocol revision: a `readdir` reply says whether the directory ended with the last entry it carries. Client and server must be rebuilt together.
 - The kernel now caches writes (`FUSE_WRITEBACK_CACHE`). A `write(2)` returns once the page cache has the data; a failure to reach the server surfaces at `fsync(2)` or `close(2)` (as `EIO` at close), and a server that vanishes takes the pages not yet flushed with it, except those the reconnect retry delivers. `O_APPEND` is positioned by the client's kernel, so two clients appending to one file no longer interleave cleanly. The server opens every file for writing as `O_RDWR`, so a file writable but not readable cannot be opened for writing through the mount. A file this client holds open keeps the size and mtime the kernel has for it until it is closed, whatever changes on the server; a file it wrote is looked up afresh after the close, and a file nobody holds open is seen afresh within the attribute TTL plus one access. The mtime of a file written through the mount can be the time the server received the data rather than the time of the `write(2)`.
 
 ### Improved
 
-- The pages the kernel asks for as plain readdir after its first readdirplus page are served from that first fetch instead of fetching the directory again without attributes. As a consequence an entry the server cannot describe (a mount point) is absent from a plain listing that came out of a readdirplus fetch, as it already was from the readdirplus page.
+- A complete directory listing costs one server round trip: the kernel's empty read past the last entry is answered from the end the fetch reported, and the pages the kernel asks for as plain readdir after its first readdirplus page are served from that first fetch instead of fetching the directory again without attributes.
 - Writes onto the mount reach the server as requests of up to 1 MiB with many in flight instead of one round trip per `write(2)`, and the kernel's per-write `security.capability` probe is answered from the metadata cache; a copy onto the mount is no longer bound by the round-trip time.
 - A change to a file on the server, or by another client, is seen through the mount by dropping the file from the kernel's cache by name, which is what works when the kernel keeps its own size for files it holds.
 
 ### Fixed
 
+- KDE's directory chooser (qBittorrent's folder dialog) probes every visible directory on every repaint by listing it until it meets a subdirectory; a files-only directory cost three round trips per probe and now costs two.
 - Opening a large directory in Dolphin, or in the KDE file dialog, took seconds because KIO asks every entry for its POSIX ACLs through two `getxattr` calls that FUSE never caches; those are now answered on the client from the names the listing already carried.
 - The client logged the kernel's cap on readahead (128 KiB on an ordinary mount, against the 1 MiB it asks for) only at `debug`, with a note calling it a tuning fact; it bounds every read the kernel issues and is now logged at `info` with the other FUSE parameters. The warning that the kernel had limited `max_write` could never fire (the limit it checked is fuser's own) and is gone.
 - A `SIGUSR1` sent to either binary killed it; both now handle it, and the client subscribes to its signals before connecting so one during the connect window is not lost.

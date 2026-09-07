@@ -179,11 +179,15 @@ async fn directory_listing_in_pages_and_concurrently() {
     let mut seen = Vec::new();
     let mut offset = 0;
     let mut pages = 0;
+    let mut ended = false;
     loop {
-        let page = client.readdir(fh, offset, 4096).await.unwrap();
+        let (page, end) = client.readdir(fh, offset, 4096).await.unwrap();
         if page.is_empty() {
             break;
         }
+        // Which page says `end` depends on whether the budget ran out exactly at the last entry, so only this direction is asserted.
+        assert!(!ended, "no page follows one that said the directory ended");
+        ended = end;
         pages += 1;
         offset = page.last().unwrap().next_offset;
         seen.extend(page.into_iter().map(|e| e.name));
@@ -197,7 +201,7 @@ async fn directory_listing_in_pages_and_concurrently() {
     let mut plus_seen = 0;
     let mut offset = 0;
     loop {
-        let page = client.readdirplus(fh, offset, 1 << 20).await.unwrap();
+        let (page, _) = client.readdirplus(fh, offset, 1 << 20).await.unwrap();
         if page.is_empty() {
             break;
         }
@@ -213,8 +217,8 @@ async fn directory_listing_in_pages_and_concurrently() {
         client.readdir(fh, 0, 1 << 20),
         client.readdir(fh, 0, 1 << 20)
     );
-    assert_eq!(a.unwrap().len(), 5002);
-    assert_eq!(b.unwrap().len(), 5002);
+    assert_eq!(a.unwrap().0.len(), 5002);
+    assert_eq!(b.unwrap().0.len(), 5002);
     client.releasedir(fh).await.unwrap();
     client.shutdown().await;
     server.stop().await;
@@ -583,7 +587,7 @@ async fn handles_are_reopened_and_verified_after_a_server_restart() {
         "handle to a replaced inode must not silently read the new file: {err}"
     );
     assert_eq!(err.errno(), libc::ESTALE);
-    assert!(client.readdir(dir_fh, 0, 1 << 20).await.unwrap().len() >= 4);
+    assert!(client.readdir(dir_fh, 0, 1 << 20).await.unwrap().0.len() >= 4);
     assert_eq!(
         second.server.sessions.get(1).unwrap().handles.len(),
         2,
@@ -883,7 +887,7 @@ async fn perf_tables_count_what_was_done() {
         assert_eq!(client.read(fh, 0, 1024).await.unwrap().len(), 1024);
     }
     let (dh, _) = client.opendir(1, Path::root()).await.unwrap();
-    let entries = client.readdir(dh, 0, 1 << 20).await.unwrap();
+    let (entries, _) = client.readdir(dh, 0, 1 << 20).await.unwrap();
     assert_eq!(entries.len(), 13, "10 entries, f, and the two dots");
     assert_eq!(
         client

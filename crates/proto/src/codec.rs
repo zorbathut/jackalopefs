@@ -362,8 +362,8 @@ mod tests {
             Response::Opened { .. } => 5,
             Response::Read(_) => 6,
             Response::Written(_) => 7,
-            Response::Readdir(_) => 8,
-            Response::ReaddirPlus(_) => 9,
+            Response::Readdir { .. } => 8,
+            Response::ReaddirPlus { .. } => 9,
             Response::Statfs(_) => 10,
             Response::Xattr(_) => 11,
         }
@@ -391,19 +391,25 @@ mod tests {
             },
             Response::Read(vec![0u8; 100]),
             Response::Written(100),
-            Response::Readdir(vec![entry.clone()]),
-            Response::ReaddirPlus(vec![
-                DirEntryPlus { entry, attr: None },
-                DirEntryPlus {
-                    entry: DirEntry {
-                        ino: 6,
-                        next_offset: 78,
-                        kind: FileKind::Symlink,
-                        name: b"x".to_vec(),
+            Response::Readdir {
+                entries: vec![entry.clone()],
+                end: true,
+            },
+            Response::ReaddirPlus {
+                entries: vec![
+                    DirEntryPlus { entry, attr: None },
+                    DirEntryPlus {
+                        entry: DirEntry {
+                            ino: 6,
+                            next_offset: 78,
+                            kind: FileKind::Symlink,
+                            name: b"x".to_vec(),
+                        },
+                        attr: Some(sample_attr(6)),
                     },
-                    attr: Some(sample_attr(6)),
-                },
-            ]),
+                ],
+                end: false,
+            },
             Response::Statfs(Statfs {
                 blocks: 1,
                 bfree: 2,
@@ -745,7 +751,10 @@ mod tests {
             kind: FileKind::BlockDevice,
             name: b"n".to_vec(),
         };
-        let mut body = frame_body(&Response::Readdir(vec![entry]));
+        let mut body = frame_body(&Response::Readdir {
+            entries: vec![entry],
+            end: false,
+        });
         let kind_at = ROOT_DATA + 16 + 8 + 16;
         assert_eq!(
             &body[kind_at..kind_at + 2],
@@ -763,7 +772,10 @@ mod tests {
     #[test]
     fn a_list_cannot_declare_more_elements_than_the_frame_has_words() {
         // Response { readdir = [] }: root data (8), root pointer to the list (8), then the list tag word at body offset 32 for a zero-length composite list.
-        let mut body = frame_body(&Response::Readdir(Vec::new()));
+        let mut body = frame_body(&Response::Readdir {
+            entries: Vec::new(),
+            end: false,
+        });
         let list_ptr = ROOT_DATA + 8;
         // A composite list pointer: kind 1, element size 7 (composite), word count in the upper 29 bits; the tag word after it holds the element count.
         let tag_at = list_ptr + 8;
@@ -939,8 +951,14 @@ mod tests {
             name: format!("name{n}").into_bytes(),
         };
         let plain: Vec<DirEntry> = (0..8).map(entry).collect();
-        let cost =
-            |entries: &[DirEntry]| encode(&Response::Readdir(entries.to_vec())).unwrap().len();
+        let cost = |entries: &[DirEntry]| {
+            encode(&Response::Readdir {
+                entries: entries.to_vec(),
+                end: false,
+            })
+            .unwrap()
+            .len()
+        };
         assert_eq!(
             cost(&plain[..8]) - cost(&plain[..7]),
             dir_entry_bytes(5, false, None)
@@ -960,9 +978,12 @@ mod tests {
                 })
                 .collect();
             let cost = |entries: &[DirEntryPlus]| {
-                encode(&Response::ReaddirPlus(entries.to_vec()))
-                    .unwrap()
-                    .len()
+                encode(&Response::ReaddirPlus {
+                    entries: entries.to_vec(),
+                    end: false,
+                })
+                .unwrap()
+                .len()
             };
             assert_eq!(
                 cost(&plus[..8]) - cost(&plus[..7]),
@@ -975,7 +996,17 @@ mod tests {
     #[test]
     fn golden_bytes() {
         let (hellos, replies, event) = control_messages();
-        let cases: [(&str, Vec<u8>, &str); 5] = [
+        let readdir = Response::Readdir {
+            entries: vec![DirEntry {
+                ino: 3,
+                next_offset: 4,
+                kind: FileKind::Directory,
+                name: b"n".to_vec(),
+            }],
+            end: true,
+        };
+        let cases: [(&str, Vec<u8>, &str); 6] = [
+            ("readdir", frame_body(&readdir), "00000000090000000000000001000100010000000800000001000000270000000400000003000100030000000000000004000000000000000100000000000000010000000a0000006e00000000000000"),
             ("hello", frame_body(&hellos[1]), "000000000a0000000000000002000200080706050403020101000100000000000500000032000000040000000100010073656372657400000300000000000000010000008200000007070707070707070707070707070707"),
             ("reply", frame_body(&replies[0]), "0000000006000000000000000200010001000000000000000100000000000000010000008200000001010101010101010101010101010101"),
             ("request", frame_body(&Request::Rename { parent: path("a"), name: name("b"), newparent: path("c"), newname: name("d"), flags: 1 }), "000000000e00000000000000030004000900000000000000010000000000000000000000000000000d0000000e000000110000000a000000110000000e000000150000000a000000010000000a00000061000000000000006200000000000000010000000a00000063000000000000006400000000000000"),

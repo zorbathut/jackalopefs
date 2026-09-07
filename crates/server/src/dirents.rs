@@ -80,7 +80,13 @@ fn getdents64(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
     }
 }
 
-pub enum Listing {
+/// One page of a directory. `end` says the directory ended with the last entry returned, which stays true across the entries this page skipped after it (a vanished entry, a mount point): a seek to that entry's cookie re-reads and re-skips them and finds nothing.
+pub struct Listing {
+    pub entries: Entries,
+    pub end: bool,
+}
+
+pub enum Entries {
     Plain(Vec<DirEntry>),
     Plus(Vec<DirEntryPlus>),
 }
@@ -99,9 +105,11 @@ pub fn read_dir(
     let mut plain = Vec::new();
     let mut with_attr = Vec::new();
     let mut used = 0;
+    let mut end = false;
     'outer: loop {
         let n = getdents64(dir, &mut buf)?;
         if n == 0 {
+            end = true;
             break;
         }
         for raw in parse(&buf[..n]) {
@@ -180,10 +188,13 @@ pub fn read_dir(
             }
         }
     }
-    Ok(if plus {
-        Listing::Plus(with_attr)
-    } else {
-        Listing::Plain(plain)
+    Ok(Listing {
+        entries: if plus {
+            Entries::Plus(with_attr)
+        } else {
+            Entries::Plain(plain)
+        },
+        end,
     })
 }
 
@@ -253,16 +264,16 @@ mod tests {
     }
 
     fn names(listing: &Listing) -> Vec<Vec<u8>> {
-        match listing {
-            Listing::Plain(v) => v.iter().map(|e| e.name.to_vec()).collect(),
-            Listing::Plus(v) => v.iter().map(|e| e.entry.name.to_vec()).collect(),
+        match &listing.entries {
+            Entries::Plain(v) => v.iter().map(|e| e.name.to_vec()).collect(),
+            Entries::Plus(v) => v.iter().map(|e| e.entry.name.to_vec()).collect(),
         }
     }
 
     fn last_offset(listing: &Listing) -> Option<u64> {
-        match listing {
-            Listing::Plain(v) => v.last().map(|e| e.next_offset),
-            Listing::Plus(v) => v.last().map(|e| e.entry.next_offset),
+        match &listing.entries {
+            Entries::Plain(v) => v.last().map(|e| e.next_offset),
+            Entries::Plus(v) => v.last().map(|e| e.entry.next_offset),
         }
     }
 
@@ -284,7 +295,11 @@ mod tests {
             plain.push(entry());
             used += jackalopefs_proto::dir_entry_bytes(1, false, None);
         }
-        let frame = encode(&Response::Readdir(plain)).unwrap();
+        let frame = encode(&Response::Readdir {
+            entries: plain,
+            end: false,
+        })
+        .unwrap();
         assert!(frame.len() - 4 <= MAX_FRAME, "{} bytes", frame.len());
 
         let t = TimeSpec { sec: 0, nsec: 0 };
@@ -314,7 +329,11 @@ mod tests {
             });
             used += jackalopefs_proto::dir_entry_bytes(1, true, attr.xattr_names.as_deref());
         }
-        let frame = encode(&Response::ReaddirPlus(plus)).unwrap();
+        let frame = encode(&Response::ReaddirPlus {
+            entries: plus,
+            end: false,
+        })
+        .unwrap();
         assert!(frame.len() - 4 <= MAX_FRAME, "{} bytes", frame.len());
         // A full page also fits the encoder's first-segment estimate: the segment table's count is zero, so no canonicalizing copy was needed.
         assert_eq!(
@@ -342,17 +361,22 @@ mod tests {
         let all = read_dir_fd(&export, &fd, 0, usize::MAX, false).unwrap();
         let all_names: BTreeSet<Vec<u8>> = names(&all).into_iter().collect();
         assert_eq!(all_names.len(), 203);
+        assert!(all.end, "an unbudgeted read reaches the end");
         assert!(all_names.contains(b".".as_slice()) && all_names.contains(b"..".as_slice()));
 
         let mut paged = Vec::new();
         let mut offset = 0;
+        let mut ended = false;
         loop {
             let page = read_dir_fd(&export, &fd, offset, 1000, true).unwrap();
             let page_names = names(&page);
             if page_names.is_empty() {
                 break;
             }
-            if let Listing::Plus(entries) = &page {
+            // Which page says `end` depends on whether the budget ran out exactly at the last entry, so only this direction is asserted.
+            assert!(!ended, "no page follows one that said the directory ended");
+            ended = page.end;
+            if let Entries::Plus(entries) = &page.entries {
                 for e in entries {
                     assert_eq!(e.attr.is_none(), e.entry.is_dot_or_dotdot());
                     if e.entry.name.as_slice() == b"subdir" {

@@ -15,8 +15,9 @@
 # the wire format (though it is still a new revision, see above) and renumbering
 # ordinals breaks every peer; a group's position in a union
 # is its lowest member ordinal, so new fields and new union members are always
-# appended with fresh, higher ordinals, never inserted; out-of-order ordinals
-# compile without complaint, so the compiler will not catch a renumber.
+# appended with fresh, higher ordinals, never inserted, and a field grows into
+# a group by keeping its own ordinal as the group's lowest member; out-of-order
+# ordinals compile without complaint, so the compiler will not catch a renumber.
 #
 # Rules the schema cannot express (docs/design.md, "Wire format", is normative):
 #
@@ -197,8 +198,11 @@ struct Response {
     opened :group { attr @5 :Attr; }
     read :group { data @6 :Data; }
     written @7 :UInt32;
-    readdir @8 :List(DirEntry);
-    readdirPlus @9 :List(DirEntryPlus);
+    # end: no entry follows the last one in entries, so a client may answer a
+    # further read at that entry's nextOffset itself; says nothing when
+    # entries is empty.
+    readdir :group { entries @8 :List(DirEntry); end @12 :Bool; }
+    readdirPlus :group { entries @9 :List(DirEntryPlus); end @13 :Bool; }
     statfs @10 :Statfs;
     xattr @11 :Data;
   }

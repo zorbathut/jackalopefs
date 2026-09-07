@@ -1,6 +1,6 @@
 //! One synchronous function per request, run on the blocking pool. Every path goes through [`Export`]; every open file goes through [`Handles`].
 
-use crate::dirents::{read_dir_fd, Listing};
+use crate::dirents::{read_dir_fd, Entries};
 use crate::export::{kind_from_mode, proc_path, Export};
 use crate::handles::{Handle, Handles};
 use crate::watch::ChangeLog;
@@ -346,9 +346,10 @@ impl Ops {
                     (max_bytes as usize).min(MAX_IO),
                     plus,
                 )?;
-                Ok(match listing {
-                    Listing::Plain(entries) => Response::Readdir(entries),
-                    Listing::Plus(entries) => Response::ReaddirPlus(entries),
+                let end = listing.end;
+                Ok(match listing.entries {
+                    Entries::Plain(entries) => Response::Readdir { entries, end },
+                    Entries::Plus(entries) => Response::ReaddirPlus { entries, end },
                 })
             }
             Request::Statfs { path } => {
@@ -1041,7 +1042,8 @@ mod tests {
                 plus: false,
             },
         ) {
-            Response::Readdir(entries) => {
+            Response::Readdir { entries, end } => {
+                assert!(end, "a one-page listing ends");
                 let names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_slice()).collect();
                 assert!(
                     names.contains(&b".".as_slice())

@@ -893,14 +893,18 @@ impl Message for Response {
             Response::Opened { attr } => build_attr(b.init_opened().init_attr(), attr),
             Response::Read(data) => b.init_read().set_data(data),
             Response::Written(n) => b.set_written(*n),
-            Response::Readdir(entries) => {
-                let mut list = b.init_readdir(entries.len() as u32);
+            Response::Readdir { entries, end } => {
+                let mut g = b.init_readdir();
+                g.set_end(*end);
+                let mut list = g.init_entries(entries.len() as u32);
                 for (i, e) in entries.iter().enumerate() {
                     build_dir_entry(list.reborrow().get(i as u32), e);
                 }
             }
-            Response::ReaddirPlus(entries) => {
-                let mut list = b.init_readdir_plus(entries.len() as u32);
+            Response::ReaddirPlus { entries, end } => {
+                let mut g = b.init_readdir_plus();
+                g.set_end(*end);
+                let mut list = g.init_entries(entries.len() as u32);
                 for (i, e) in entries.iter().enumerate() {
                     let mut item = list.reborrow().get(i as u32);
                     build_dir_entry(item.reborrow().init_entry(), &e.entry);
@@ -929,17 +933,20 @@ impl Message for Response {
             },
             rs::Which::Read(g) => Response::Read(g.get_data()?.to_vec()),
             rs::Which::Written(n) => Response::Written(n),
-            rs::Which::Readdir(list) => {
-                let list = list?;
+            rs::Which::Readdir(g) => {
+                let list = g.get_entries()?;
                 let mut entries =
                     Vec::with_capacity(checked_len(list.len(), message.size_in_words())?);
                 for item in list.iter() {
                     entries.push(parse_dir_entry(item)?);
                 }
-                Response::Readdir(entries)
+                Response::Readdir {
+                    entries,
+                    end: g.get_end(),
+                }
             }
-            rs::Which::ReaddirPlus(list) => {
-                let list = list?;
+            rs::Which::ReaddirPlus(g) => {
+                let list = g.get_entries()?;
                 let mut entries =
                     Vec::with_capacity(checked_len(list.len(), message.size_in_words())?);
                 for item in list.iter() {
@@ -952,7 +959,10 @@ impl Message for Response {
                         attr,
                     });
                 }
-                Response::ReaddirPlus(entries)
+                Response::ReaddirPlus {
+                    entries,
+                    end: g.get_end(),
+                }
             }
             rs::Which::Statfs(s) => Response::Statfs(parse_statfs(s?)),
             rs::Which::Xattr(value) => Response::Xattr(value?.to_vec()),
@@ -966,11 +976,11 @@ impl Message for Response {
                 ATTR_WORDS + words_for_xattr_names(attr.xattr_names.as_deref())
             }
             Response::Readlink(b) | Response::Read(b) | Response::Xattr(b) => words_for(b.len()),
-            Response::Readdir(entries) => entries
+            Response::Readdir { entries, .. } => entries
                 .iter()
                 .map(|e| DIR_ENTRY_WORDS + e.name.len().div_ceil(8) as u32)
                 .sum(),
-            Response::ReaddirPlus(entries) => entries
+            Response::ReaddirPlus { entries, .. } => entries
                 .iter()
                 .map(|e| {
                     DIR_ENTRY_PLUS_WORDS

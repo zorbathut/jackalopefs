@@ -96,24 +96,48 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.unwrap()
 }
 
-fn list_with_dots(dir: &Path) -> Vec<Vec<u8>> {
-    let cpath = CString::new(dir.as_os_str().as_bytes()).unwrap();
-    let mut names = Vec::new();
-    // SAFETY: plain libc directory iteration; `dir` is a valid open handle until `closedir`.
-    unsafe {
-        let handle = libc::opendir(cpath.as_ptr());
-        assert!(!handle.is_null(), "opendir failed");
+/// A libc directory stream, closed when dropped so a failed assertion cannot leave a handle open on a mount the test still has to unmount.
+struct DirStream(*mut libc::DIR);
+
+impl DirStream {
+    fn open(dir: &Path) -> DirStream {
+        let cpath = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `cpath` is a valid C string; the handle is closed exactly once, by `Drop`.
+        let handle = unsafe { libc::opendir(cpath.as_ptr()) };
+        assert!(!handle.is_null(), "opendir {} failed", dir.display());
+        DirStream(handle)
+    }
+
+    /// Every name `readdir(3)` still yields, dots included.
+    fn read_names(&self) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
         loop {
-            let entry = libc::readdir(handle);
+            // SAFETY: `self.0` is an open stream until `Drop`, and `d_name` is NUL-terminated.
+            let entry = unsafe { libc::readdir(self.0) };
             if entry.is_null() {
                 break;
             }
-            let name = std::ffi::CStr::from_ptr((*entry).d_name.as_ptr());
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
             names.push(name.to_bytes().to_vec());
         }
-        libc::closedir(handle);
+        names
     }
-    names
+
+    fn rewind(&self) {
+        // SAFETY: `self.0` is an open stream until `Drop`.
+        unsafe { libc::rewinddir(self.0) }
+    }
+}
+
+impl Drop for DirStream {
+    fn drop(&mut self) {
+        // SAFETY: opened by `open`, closed only here.
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+fn list_with_dots(dir: &Path) -> Vec<Vec<u8>> {
+    DirStream::open(dir).read_names()
 }
 
 fn process_umask() -> u32 {
@@ -368,6 +392,144 @@ async fn a_listing_longer_than_one_kernel_page_is_fetched_once() {
             snap.call
         );
     }
+    m.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_complete_listing_does_not_read_past_its_end() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    for i in 0..5 {
+        fs::write(export.join(format!("d/f{i}")), b"").unwrap();
+    }
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    // The kernel reads until a page comes back empty; that empty page is answered from the end the fetch reported, whether the kernel asks for it plain or, after stats, as readdirplus.
+    for stat in [false, true] {
+        perf.report();
+        let mnt = mnt.clone();
+        let count = blocking(move || {
+            let mut count = 0;
+            for entry in fs::read_dir(mnt.join("d")).unwrap() {
+                let entry = entry.unwrap();
+                if stat {
+                    assert!(entry.metadata().unwrap().is_file());
+                }
+                count += 1;
+            }
+            count
+        })
+        .await;
+        assert_eq!(count, 5);
+        // The request that answered the process is recorded a moment after the process moves on.
+        wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+            (perf.inflight() == 0).then_some(())
+        })
+        .await;
+        let snap = perf.report();
+        let calls: u64 = ["readdir", "readdirplus"]
+            .iter()
+            .filter_map(|op| snap.call.get(op))
+            .map(|r| r.row.n)
+            .sum();
+        assert_eq!(
+            calls, 1,
+            "stat={stat}: one fetch, no empty tail: {:?}",
+            snap.call
+        );
+        let asked: u64 = ["readdir", "readdirplus"]
+            .iter()
+            .filter_map(|op| snap.fuse.get(op))
+            .map(|r| r.n)
+            .sum();
+        assert!(
+            asked >= 2,
+            "the kernel did ask past the end: {:?}",
+            snap.fuse
+        );
+    }
+    m.finish().await;
+}
+
+/// The recorded end is per handle and only short-circuits a read at that exact cookie; `rewinddir` starts at offset 0, which always goes to the server, so a directory that grew is re-read in full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rewinding_a_directory_handle_sees_entries_added_after_its_end() {
+    let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(60)).await
+    else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    fs::write(export.join("d/a"), b"").unwrap();
+    let mnt = m.mnt();
+    let names = blocking(move || {
+        let handle = DirStream::open(&mnt.join("d"));
+        let first = handle.read_names();
+        assert_eq!(
+            handle.read_names(),
+            Vec::<Vec<u8>>::new(),
+            "a handle at its end stays there"
+        );
+        fs::write(export.join("d/b"), b"").unwrap();
+        handle.rewind();
+        let second = handle.read_names();
+        (first, second)
+    })
+    .await;
+    assert_eq!(names.0.len(), 3, "{:?}", names.0);
+    assert_eq!(names.1.len(), 4, "{:?}", names.1);
+    assert!(names.1.contains(&b"b".to_vec()));
+    m.finish().await;
+}
+
+/// A handle left at its end after a full listing reads there again, as a directory poller does. Whether a name added afterwards shows up there is the export filesystem's decision (a hashed or newest-first order puts it before the cursor), so the mount is held to what a handle on the export itself yields; what this client owes is to ask the server again once a name was added, by this client or in a server event, instead of answering from the end it recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handle_parked_at_the_end_reads_like_one_on_the_export() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(60)).await else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    fs::write(export.join("d/a"), b"").unwrap();
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    let probes = perf.clone();
+    blocking(move || {
+        let through = DirStream::open(&mnt.join("d"));
+        let direct = DirStream::open(&export.join("d"));
+        assert_eq!(through.read_names().len(), 3);
+        assert_eq!(direct.read_names().len(), 3);
+        probes.report();
+        fs::write(mnt.join("d/through-the-mount"), b"").unwrap();
+        assert_eq!(
+            through.read_names(),
+            direct.read_names(),
+            "after this client's own addition"
+        );
+        assert!(
+            probes.report().call.contains_key("readdir"),
+            "the parked handle asked the server again"
+        );
+        fs::write(export.join("d/on-the-export"), b"").unwrap();
+        // The server's event for the new name arrives within its debounce window; after it the parked handle must go to the server again.
+        let started = Instant::now();
+        while !probes.report().call.contains_key("readdir") {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the server's event did not reach the parked handle"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+            through.read_names();
+        }
+        through.rewind();
+        direct.rewind();
+        assert_eq!(through.read_names(), direct.read_names(), "after a rewind");
+    })
+    .await;
+    let _ = perf;
     m.finish().await;
 }
 

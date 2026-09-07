@@ -29,7 +29,7 @@ const MAX_BACKGROUND: u16 = 64;
 pub struct Shared {
     pub client: Arc<Client>,
     pub nodes: Mutex<NodeTable>,
-    dirs: Mutex<HashMap<u64, DirBuffer>>,
+    dirs: Mutex<HashMap<u64, DirState>>,
     /// What the last attributes said about each inode's extended attribute names, kept for the attribute TTL; answers only the absence of a name and the list itself, never a value. Bounded by the node table: an entry leaves when the kernel forgets the inode.
     xattrs: Mutex<HashMap<u64, KnownXattrs>>,
     /// The size and mtime the server last reported for each regular file. The kernel discards both for a file it already holds (its writeback cache may be ahead of the server), so when a fresh reply disagrees and this client does not hold the file open, the file is taken away from the kernel by name and looked up afresh; that is what bounds an external change to the attribute TTL. A file this client wrote is dropped from the kernel, record included, when its last handle closes: what the server reported while our own writes were landing says nothing about what the kernel holds, and the kernel's own mtime may be behind the server's.
@@ -61,6 +61,14 @@ impl Default for DirBuffer {
     fn default() -> Self {
         DirBuffer::Plain(VecDeque::new())
     }
+}
+
+/// What a directory handle holds between kernel requests.
+struct DirState {
+    ino: u64,
+    buffer: DirBuffer,
+    /// The cookie after the last entry of a fetch that said the directory ended; a read there is answered empty without a round trip. A handle left at its end after a full listing reads there again, so a name added under the directory, by this client or reported by the server, clears it; the next fetch replaces it, and offset 0 always goes to the server so `rewinddir` sees everything regardless.
+    end: Option<u64>,
 }
 
 impl DirBuffer {
@@ -458,6 +466,12 @@ impl Shared {
             .ok_or(Errno::EIO)
     }
 
+    /// Answer a request that created `name` under `parent`: the directory grew, then as `reply_entry`.
+    fn reply_created(&self, reply: ReplyEntry, parent: u64, name: Name, attr: &Attr) -> Outcome {
+        self.dir_grew(parent);
+        self.reply_entry(reply, parent, name, attr)
+    }
+
     /// Answer an entry-producing request: register the node and reply with its attributes and generation.
     fn reply_entry(&self, reply: ReplyEntry, parent: u64, name: Name, attr: &Attr) -> Outcome {
         match self.register(parent, name, attr) {
@@ -478,13 +492,17 @@ impl Shared {
     async fn dir_page(&self, fh: u64, offset: u64) -> Result<DirBuffer, Error> {
         {
             let mut dirs = self.dirs.lock();
-            let buffer = dirs.get_mut(&fh).ok_or(Error::Remote(libc::EBADF))?;
-            if buffer.front_cookie() == Some(offset) {
-                return Ok(std::mem::take(buffer));
+            let state = dirs.get_mut(&fh).ok_or(Error::Remote(libc::EBADF))?;
+            if offset != 0 && state.buffer.front_cookie() == Some(offset) {
+                return Ok(std::mem::take(&mut state.buffer));
             }
-            *buffer = DirBuffer::default();
+            state.buffer = DirBuffer::default();
+            if offset != 0 && state.end == Some(offset) {
+                return Ok(DirBuffer::default());
+            }
         }
-        let entries = self.client.readdir(fh, offset, READDIR_FETCH).await?;
+        let (entries, end) = self.client.readdir(fh, offset, READDIR_FETCH).await?;
+        self.note_end(fh, entries.last().map(|e| e.next_offset), end);
         Ok(DirBuffer::Plain(
             tag_with_cookies(entries, offset, |e| e.next_offset).into(),
         ))
@@ -494,22 +512,43 @@ impl Shared {
     async fn dir_page_plus(&self, fh: u64, offset: u64) -> Result<Vec<(u64, DirEntryPlus)>, Error> {
         {
             let mut dirs = self.dirs.lock();
-            let buffer = dirs.get_mut(&fh).ok_or(Error::Remote(libc::EBADF))?;
-            if let DirBuffer::Plus(entries) = buffer {
-                if entries.front().is_some_and(|(cookie, _)| *cookie == offset) {
+            let state = dirs.get_mut(&fh).ok_or(Error::Remote(libc::EBADF))?;
+            if let DirBuffer::Plus(entries) = &mut state.buffer {
+                if offset != 0 && entries.front().is_some_and(|(cookie, _)| *cookie == offset) {
                     return Ok(entries.drain(..).collect());
                 }
             }
-            *buffer = DirBuffer::default();
+            state.buffer = DirBuffer::default();
+            if offset != 0 && state.end == Some(offset) {
+                return Ok(Vec::new());
+            }
         }
-        let entries = self.client.readdirplus(fh, offset, READDIR_FETCH).await?;
+        let (entries, end) = self.client.readdirplus(fh, offset, READDIR_FETCH).await?;
+        self.note_end(fh, entries.last().map(|e| e.entry.next_offset), end);
         Ok(tag_with_cookies(entries, offset, |e| e.entry.next_offset))
     }
 
     /// Keep what the kernel's buffer did not take for its next request on the handle.
     fn stash(&self, fh: u64, rest: DirBuffer) {
-        if let Some(buffer) = self.dirs.lock().get_mut(&fh) {
-            *buffer = rest;
+        if let Some(state) = self.dirs.lock().get_mut(&fh) {
+            state.buffer = rest;
+        }
+    }
+
+    /// Record where a fetch said the directory ended, or that it did not end at its last entry. A fetch with no entries says nothing about the cookies it did not cover, and it has already paid the round trip that recording could save.
+    fn note_end(&self, fh: u64, last: Option<u64>, end: bool) {
+        let Some(last) = last else { return };
+        if let Some(state) = self.dirs.lock().get_mut(&fh) {
+            state.end = end.then_some(last);
+        }
+    }
+
+    /// A name was added under `ino`: a handle parked at the directory's end must ask the server again.
+    pub(crate) fn dir_grew(&self, ino: u64) {
+        for state in self.dirs.lock().values_mut() {
+            if state.ino == ino {
+                state.end = None;
+            }
         }
     }
 
@@ -755,7 +794,7 @@ impl Filesystem for Backend {
                 .mknod(path, name.clone(), mode, rdev as u64)
                 .await
             {
-                Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
+                Ok(attr) => shared.reply_created(reply, parent.0, name, &attr),
                 Err(e) => fail(reply, errno(&e)),
             }
         });
@@ -781,7 +820,7 @@ impl Filesystem for Backend {
                 Err(e) => return fail(reply, e),
             };
             match shared.client.mkdir(path, name.clone(), mode).await {
-                Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
+                Ok(attr) => shared.reply_created(reply, parent.0, name, &attr),
                 Err(e) => fail(reply, errno(&e)),
             }
         });
@@ -851,7 +890,7 @@ impl Filesystem for Backend {
                 Err(e) => return fail(reply, e),
             };
             match shared.client.symlink(path, name.clone(), target).await {
-                Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
+                Ok(attr) => shared.reply_created(reply, parent.0, name, &attr),
                 Err(e) => fail(reply, errno(&e)),
             }
         });
@@ -892,6 +931,7 @@ impl Filesystem for Backend {
                         nodes.rename(parent.0, &name, newparent.0, newname);
                     }
                     drop(nodes);
+                    shared.dir_grew(newparent.0);
                     reply.ok();
                     Outcome::default()
                 }
@@ -919,7 +959,7 @@ impl Filesystem for Backend {
                 (Err(e), _) | (_, Err(e)) => return fail(reply, e),
             };
             match shared.client.link(path, newpath, newname.clone()).await {
-                Ok(attr) => shared.reply_entry(reply, newparent.0, newname, &attr),
+                Ok(attr) => shared.reply_created(reply, newparent.0, newname, &attr),
                 Err(e) => fail(reply, errno(&e)),
             }
         });
@@ -967,19 +1007,22 @@ impl Filesystem for Backend {
                 Err(e) => return fail(reply, e),
             };
             match shared.client.create(path, name.clone(), mode, flags).await {
-                Ok((fh, attr)) => match shared.register(parent.0, name, &attr) {
-                    Ok(generation) => {
-                        reply.created(
-                            &shared.entry_ttl.min(shared.attr_ttl),
-                            &file_attr(&attr),
-                            generation,
-                            FileHandle(fh),
-                            FopenFlags::empty(),
-                        );
-                        Outcome::default()
+                Ok((fh, attr)) => {
+                    shared.dir_grew(parent.0);
+                    match shared.register(parent.0, name, &attr) {
+                        Ok(generation) => {
+                            reply.created(
+                                &shared.entry_ttl.min(shared.attr_ttl),
+                                &file_attr(&attr),
+                                generation,
+                                FileHandle(fh),
+                                FopenFlags::empty(),
+                            );
+                            Outcome::default()
+                        }
+                        Err(e) => fail(reply, e),
                     }
-                    Err(e) => fail(reply, e),
-                },
+                }
                 Err(e) => fail(reply, errno(&e)),
             }
         });
@@ -1136,7 +1179,14 @@ impl Filesystem for Backend {
             };
             match shared.client.opendir(ino.0, path).await {
                 Ok((fh, _)) => {
-                    shared.dirs.lock().insert(fh, DirBuffer::default());
+                    shared.dirs.lock().insert(
+                        fh,
+                        DirState {
+                            ino: ino.0,
+                            buffer: DirBuffer::default(),
+                            end: None,
+                        },
+                    );
                     reply.opened(FileHandle(fh), FopenFlags::empty());
                     Outcome::default()
                 }

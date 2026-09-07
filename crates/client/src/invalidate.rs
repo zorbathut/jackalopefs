@@ -143,7 +143,10 @@ async fn translate(
 fn notifier_loop(rx: Receiver<Work>, notifier: Notifier, shared: Arc<Shared>) {
     while let Ok(work) = rx.recv() {
         match work {
-            Work::Entry(parent, name) => inval_entry(&notifier, parent, &name),
+            Work::Entry(parent, name) => {
+                shared.dir_grew(parent);
+                inval_entry(&notifier, parent, &name)
+            }
             Work::Inode(ino) => {
                 shared.xattr_forget(ino);
                 inval_inode(&notifier, &shared, ino)
