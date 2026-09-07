@@ -1196,6 +1196,7 @@ impl Filesystem for Backend {
                     }
                     (_, Some(attr)) => {
                         let Ok(entry_name) = Name::new(entry.name.as_slice()) else {
+                            tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.name), "readdirplus entry with an invalid name; skipped");
                             continue;
                         };
                         let generation = shared.nodes.lock().generation_for_lookup(attr.ino);
@@ -1215,7 +1216,10 @@ impl Filesystem for Backend {
                         }
                         full
                     }
-                    (_, None) => continue,
+                    (_, None) => {
+                        tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.name), "readdirplus entry without attributes; skipped");
+                        continue;
+                    }
                 };
                 if full {
                     let mut rest = vec![(cookie, item)];
