@@ -274,19 +274,17 @@ fn tag_with_cookies<T>(entries: Vec<T>, first: u64, next: impl Fn(&T) -> u64) ->
 }
 
 impl Filesystem for Backend {
+    /// Each setter answers with the previous value when it accepts and the ceiling when it refuses, so what is logged is the value asked for or the ceiling it hit. The kernel proposes its own readahead (the mount's `bdi` setting, 128 KiB by default) and lets the daemon only lower it, so the readahead cap is the usual outcome and it bounds every read the kernel will ever issue; the effective values are read from sysfs after mounting.
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
-        match config.set_max_write(MAX_IO as u32) {
-            Ok(_) => {}
-            Err(limit) => tracing::warn!(limit, "kernel limits max_write below {MAX_IO}"),
-        }
-        // Kernels commonly cap readahead at 128 KiB; that is a tuning fact, not a problem.
-        match config.set_max_readahead(MAX_IO as u32) {
-            Ok(_) => {}
-            Err(limit) => tracing::debug!(limit, "kernel limits max_readahead below {MAX_IO}"),
-        }
-        if let Err(limit) = config.set_max_background(MAX_BACKGROUND) {
-            tracing::debug!(limit, "kernel adjusted max_background");
-        }
+        let max_write = config
+            .set_max_write(MAX_IO as u32)
+            .map_or_else(|limit| limit, |_| MAX_IO as u32);
+        let max_readahead = config
+            .set_max_readahead(MAX_IO as u32)
+            .map_or_else(|limit| limit, |_| MAX_IO as u32);
+        let max_background = config
+            .set_max_background(MAX_BACKGROUND)
+            .map_or_else(|limit| limit, |_| MAX_BACKGROUND);
         let wanted = InitFlags::FUSE_ATOMIC_O_TRUNC
             | InitFlags::FUSE_ASYNC_READ
             | InitFlags::FUSE_PARALLEL_DIROPS
@@ -304,6 +302,13 @@ impl Filesystem for Backend {
         if let Err(rejected) = config.add_capabilities(supported) {
             tracing::debug!(?rejected, "kernel rejected capabilities it advertised");
         }
+        tracing::info!(
+            max_write,
+            max_readahead,
+            max_background,
+            capabilities = ?supported,
+            "FUSE parameters: asked for {MAX_IO} bytes of write and readahead and {MAX_BACKGROUND} background requests"
+        );
         Ok(())
     }
 

@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- The client logged the kernel's cap on readahead (128 KiB on an ordinary mount, against the 1 MiB it asks for) only at `debug`, with a note calling it a tuning fact; it bounds every read the kernel issues and is now logged at `info` with the other FUSE parameters. The warning that the kernel had limited `max_write` could never fire (the limit it checked is fuser's own) and is gone.
 - Both binaries wrote terminal colour codes into redirected logs; colour is now used only on a terminal.
 - A client running as root exited with status 1 (`unmounting: Invalid argument`) when its mount point had already been detached with `fusermount3 -uz`; that is now a clean exit, as it already was for an unprivileged client.
 - `fstat`, `fchmod`, `fchown` and `futimens` on a file unlinked while open returned `ESTALE`; the kernel sends those requests without a handle, and the client now answers from a handle it still holds on the inode.
