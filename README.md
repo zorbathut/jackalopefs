@@ -30,6 +30,8 @@ The server is a host name or an IP address, with or without a port (an IPv6 addr
 
 Set `RUST_LOG=debug` (or `trace`) on either side for more detail.
 
+To see what is slow: `SIGUSR1` to either binary, or `--perf-interval 5s` on either, logs a per-operation summary of the window since the last one (count, mean concurrency, mean and maximum latency, bytes, errnos, and the time spent in each phase: on the client waiting for a connection, opening the stream, sending, and waiting for the reply; on the server reading the request, waiting for a thread, the filesystem work, and sending). The client adds the kernel's request queue depth and the connection's QUIC round-trip time and congestion window, and at mount it logs the readahead and queue limits the kernel actually granted, which are not what it asked for. `RUST_LOG=info,jackalopefs_client::perf=trace` (server: `jackalopefs_server::perf=trace`) logs every request with the same breakdown, the client's lines carrying the pid that made the request. `scripts/perf/workload.sh <mountpoint>` runs the standard workloads against a live mount with a banner around each.
+
 ## Wow! That sounds amazing and with absolutely no qualifiers or concerns. Wait, hold on. Don't other solutions exist? Why shouldn't you use them? Claude, write a convicting explanation for why someone should use this crazy thing, make no mistakes.
 
 All the other solutions do exist and I'm gonna be honest, you should probably use them. But here's why I don't like them.

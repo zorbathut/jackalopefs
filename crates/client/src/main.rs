@@ -48,6 +48,45 @@ struct Args {
     /// Have the kernel enforce mode bits against the attributes the server reports. Without it every request is forwarded and only the server's own access rights apply, so a mount shared through --allow-other enforces nothing.
     #[arg(long)]
     default_permissions: bool,
+    /// Log a per-operation performance summary this often (e.g. `5s`); SIGUSR1 logs one at any time.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    perf_interval: Option<Duration>,
+}
+
+/// The signals the client answers, subscribed before anything that takes time so none is missed (and so SIGUSR1, whose default disposition is to terminate, cannot kill a client that is still connecting).
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    usr1: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn subscribe() -> anyhow::Result<Signals> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Signals {
+            term: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
+            int: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+            usr1: signal(SignalKind::user_defined1()).context("listening for SIGUSR1")?,
+        })
+    }
+}
+
+/// Waits for the next signal; a stream that ends (which tokio documents as not happening in practice) waits forever rather than spinning.
+async fn next_signal(signal: &mut tokio::signal::unix::Signal) {
+    if signal.recv().await.is_none() {
+        tracing::warn!("signal stream ended; no longer listening for it");
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Waits for the next report tick, or forever when no interval was asked for.
+async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -72,6 +111,7 @@ fn main() -> anyhow::Result<()> {
     };
     let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
     runtime.block_on(async move {
+        let mut signals = Signals::subscribe()?;
         let (host, port) = server_target(&args.server)?;
         let server_addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
             .await
@@ -119,29 +159,23 @@ fn main() -> anyhow::Result<()> {
         )
         .await?;
         tracing::info!("mounted {} at {}", args.server, args.mountpoint.display());
-        wait_for_shutdown_signal().await;
+        // The first tick of an interval is immediate; the first report is due one period from now. A tick delayed by a stalled process is taken late rather than as a burst of near-empty windows.
+        let mut ticks = args.perf_interval.map(|every| {
+            let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticks
+        });
+        loop {
+            tokio::select! {
+                _ = next_signal(&mut signals.term) => break,
+                _ = next_signal(&mut signals.int) => break,
+                _ = next_signal(&mut signals.usr1) => mount.report(),
+                _ = next_tick(&mut ticks) => mount.report(),
+            }
+        }
         tracing::info!("unmounting");
         mount.unmount().await
     })
-}
-
-async fn wait_for_shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(term) => term,
-        Err(e) => {
-            tracing::error!("cannot listen for SIGTERM: {e}");
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                tracing::error!("cannot listen for SIGINT: {e}");
-                std::future::pending::<()>().await;
-            }
-            return;
-        }
-    };
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => if let Err(e) = result { tracing::error!("cannot listen for SIGINT: {e}"); std::future::pending::<()>().await },
-        _ = term.recv() => {},
-    }
 }
 
 /// The server as typed: `host`, `host:port`, an IPv4 or IPv6 address, or `[v6]:port`; a missing port is [`DEFAULT_PORT`]. A bare IPv6 address is taken whole, so one with a port needs the brackets.
