@@ -3,7 +3,7 @@
 use crate::export::Export;
 use crate::handles::Handles;
 use crate::ops::{self, Ops};
-use crate::perf::{Outcome, Perf, Phases, TRACE_TARGET};
+use crate::perf::{fmt_bytes, fmt_duration, Outcome, Perf, Phases, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch};
 use crate::SESSION_GRACE;
 use jackalopefs_proto::{
@@ -150,6 +150,8 @@ pub struct Server {
     pub changes: Arc<ChangeLog>,
     /// Request accounting across every session.
     pub perf: Arc<Perf>,
+    /// The connection of every attached session with the attachment epoch it belongs to, so a report can ask each for its QUIC statistics; the epoch keeps a takeover's newer connection from being displaced or removed by the older one.
+    pub connections: Mutex<HashMap<u64, (u64, Connection)>>,
     token: Option<String>,
     connection_permits: Arc<Semaphore>,
 }
@@ -168,6 +170,7 @@ impl Server {
             events,
             changes,
             perf: Arc::new(Perf::default()),
+            connections: Mutex::new(HashMap::new()),
             token,
             connection_permits: Arc::new(Semaphore::new(max_connections)),
         }
@@ -185,6 +188,42 @@ impl Server {
             (Some(_), Auth::Anonymous) => Err("this server requires a token".to_string()),
         }
     }
+
+    /// Log the per-op table for the window since the last report, then one line per attached session with its connection's QUIC statistics. The server is the sending side of every read a client makes, so its window and losses are what bound a download.
+    pub fn report(&self) {
+        self.perf.report();
+        let connections: Vec<(u64, Connection)> = self
+            .connections
+            .lock()
+            .iter()
+            .map(|(id, (_, conn))| (*id, conn.clone()))
+            .collect();
+        if connections.is_empty() {
+            tracing::info!(target: TRACE_TARGET, "perf quic: no attached sessions");
+        }
+        for (session, conn) in connections {
+            log_quic(session, &conn);
+        }
+    }
+}
+
+/// A connection's QUIC statistics: round-trip time, congestion window and MTU as they stand, and losses, congestion events and bytes each way since it was made.
+fn log_quic(session: u64, conn: &Connection) {
+    let stats = conn.stats();
+    tracing::info!(
+        target: TRACE_TARGET,
+        "perf quic session={session} remote={} rtt={} cwnd={} mtu={} since connect: lost_packets={} congestion_events={} tx={}/{} datagrams rx={}/{} datagrams",
+        conn.remote_address(),
+        fmt_duration(stats.path.rtt),
+        fmt_bytes(stats.path.cwnd),
+        stats.path.current_mtu,
+        stats.path.lost_packets,
+        stats.path.congestion_events,
+        fmt_bytes(stats.udp_tx.bytes),
+        stats.udp_tx.datagrams,
+        fmt_bytes(stats.udp_rx.bytes),
+        stats.udp_rx.datagrams,
+    );
 }
 
 /// Accept connections until the endpoint is closed.
@@ -247,9 +286,19 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         }
     };
     tracing::info!(%remote, session = session.id, resumed, "session attached");
+    {
+        let mut connections = server.connections.lock();
+        if connections
+            .get(&session.id)
+            .is_none_or(|(attached, _)| *attached < epoch)
+        {
+            connections.insert(session.id, (epoch, conn.clone()));
+        }
+    }
     let _detach = DetachOnDrop {
-        sessions: server.sessions.clone(),
+        server: server.clone(),
         session: session.clone(),
+        conn: conn.clone(),
         epoch,
         remote,
     };
@@ -278,18 +327,29 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     events.abort();
 }
 
-/// Starts the session's grace period however the connection task ends, including by panic.
+/// Starts the session's grace period however the connection task ends, including by panic, and logs the connection's final QUIC statistics, since a report after this point can no longer ask for them.
 struct DetachOnDrop {
-    sessions: Arc<Sessions>,
+    server: Arc<Server>,
     session: Arc<SessionState>,
+    conn: Connection,
     epoch: u64,
     remote: std::net::SocketAddr,
 }
 
 impl Drop for DetachOnDrop {
     fn drop(&mut self) {
-        self.sessions.detach(self.session.id, self.epoch);
+        {
+            let mut connections = self.server.connections.lock();
+            if connections
+                .get(&self.session.id)
+                .is_some_and(|(attached, _)| *attached == self.epoch)
+            {
+                connections.remove(&self.session.id);
+            }
+        }
+        self.server.sessions.detach(self.session.id, self.epoch);
         tracing::info!(remote = %self.remote, session = self.session.id, open_handles = self.session.handles.len(), "session detached");
+        log_quic(self.session.id, &self.conn);
     }
 }
 

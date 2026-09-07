@@ -220,7 +220,7 @@ impl Perf {
     }
 }
 
-fn fmt_duration(d: Duration) -> String {
+pub(crate) fn fmt_duration(d: Duration) -> String {
     let us = d.as_micros();
     if us < 1_000 {
         format!("{us}us")
@@ -231,7 +231,7 @@ fn fmt_duration(d: Duration) -> String {
     }
 }
 
-fn fmt_bytes(n: u64) -> String {
+pub(crate) fn fmt_bytes(n: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
     let mut value = n as f64;
     let mut unit = 0;

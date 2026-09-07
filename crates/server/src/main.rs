@@ -124,7 +124,7 @@ fn main() -> anyhow::Result<()> {
 
         let closer = {
             let endpoint = endpoint.clone();
-            let perf = server.perf.clone();
+            let server = server.clone();
             // The first tick of an interval is immediate; the first report is due one period from now. A tick delayed by a stalled process is taken late rather than as a burst of near-empty windows.
             let mut ticks = args.perf_interval.map(|every| {
                 let mut ticks =
@@ -137,8 +137,8 @@ fn main() -> anyhow::Result<()> {
                     tokio::select! {
                         _ = next_signal(&mut signals.term) => break,
                         _ = next_signal(&mut signals.int) => break,
-                        _ = next_signal(&mut signals.usr1) => { perf.report(); }
-                        _ = next_tick(&mut ticks) => { perf.report(); }
+                        _ = next_signal(&mut signals.usr1) => server.report(),
+                        _ = next_tick(&mut ticks) => server.report(),
                     }
                 }
                 tracing::info!("shutting down");
@@ -148,7 +148,7 @@ fn main() -> anyhow::Result<()> {
         session::serve(endpoint.clone(), server.clone()).await;
         closer.abort();
         endpoint.wait_idle().await;
-        server.perf.report();
+        server.report();
         Ok(())
     })
 }

@@ -507,6 +507,17 @@ async fn session_resumes_after_a_connection_drop() {
         "an unlinked-but-open file survives a resumed session"
     );
     assert_eq!(server.server.sessions.len(), 1);
+    // The first connection's task ends after the second has attached; its cleanup must leave the newer attachment in place.
+    let attached = wait_for(
+        Duration::from_secs(3),
+        "the old connection to leave the table",
+        || {
+            let connections = server.server.connections.lock();
+            (connections.len() == 1).then(|| connections[&first.session_id].0)
+        },
+    )
+    .await;
+    assert_eq!(attached, 2, "the table holds the resumed attachment");
     client.release(fh).await.unwrap();
     client.shutdown().await;
     server.stop().await;
@@ -919,7 +930,18 @@ async fn perf_tables_count_what_was_done() {
         served.rows["lookup"].errnos,
         std::collections::BTreeMap::from([(libc::ENOENT, 1)])
     );
+    assert_eq!(
+        server.server.connections.lock().len(),
+        1,
+        "the report has one connection to ask"
+    );
     client.shutdown().await;
+    wait_for(
+        Duration::from_secs(3),
+        "the connection to leave the table",
+        || server.server.connections.lock().is_empty().then_some(()),
+    )
+    .await;
     server.stop().await;
 }
 
