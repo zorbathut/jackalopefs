@@ -5,7 +5,9 @@ export JFS_OP_TIMEOUT=3s
 source "$(dirname "$0")/lib.sh"
 
 fs_start resilience
-head -c 1048576 /dev/urandom > "$EXPORT/fixed"
+# The fixture is renamed into place: anything listing the mount root while it is written (the desktop probes a new mount) would instantiate the file empty, and the kernel keeps that size for the attribute TTL.
+head -c 1048576 /dev/urandom > "$EXPORT/.fixed.tmp"
+mv "$EXPORT/.fixed.tmp" "$EXPORT/fixed"
 : > "$EXPORT/log.txt"
 cmp -s "$MNT/fixed" "$EXPORT/fixed" || fail "cannot read through the mount"
 
