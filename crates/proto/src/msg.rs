@@ -184,6 +184,23 @@ impl Request {
         }
     }
 
+    /// The handle, offset and size (or byte count) this request names, for logs.
+    pub fn perf_fields(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        match self {
+            Request::Read { fh, offset, size } => (Some(*fh), Some(*offset), Some(*size as u64)),
+            Request::Write { fh, offset, data } => {
+                (Some(*fh), Some(*offset), Some(data.len() as u64))
+            }
+            Request::Readdir {
+                fh,
+                offset,
+                max_bytes,
+                ..
+            } => (Some(*fh), Some(*offset), Some(*max_bytes as u64)),
+            other => (other.fh(), None, None),
+        }
+    }
+
     /// Short operation name for logs.
     pub fn op_name(&self) -> &'static str {
         match self {
@@ -205,7 +222,8 @@ impl Request {
             Request::Release { .. } => "release",
             Request::Fsync { .. } => "fsync",
             Request::Opendir { .. } => "opendir",
-            Request::Readdir { .. } => "readdir",
+            Request::Readdir { plus: false, .. } => "readdir",
+            Request::Readdir { plus: true, .. } => "readdirplus",
             Request::Releasedir { .. } => "releasedir",
             Request::Statfs { .. } => "statfs",
             Request::Setxattr { .. } => "setxattr",
