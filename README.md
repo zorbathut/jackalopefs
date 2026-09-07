@@ -71,11 +71,12 @@ Be aware that this was mostly Claude-coded. I've been thinking about this genera
 - A filesystem call blocked on the server fails with `ETIMEDOUT` after `--op-timeout`; a call that was in flight when the connection dropped fails with `EIO` unless it is safe to retry, in which case it is retried once on the next connection.
 - The client reconnects with exponential backoff for as long as it is mounted. If the server kept the session (up to 60 s), open files continue exactly where they were; otherwise each open file is reopened by path and verified to be the same inode, and a handle whose file changed underneath it fails with `ESTALE`.
 - A server and client built from different protocol revisions refuse each other before any authentication, and both log the two revisions (`jackalopefs-client` exits with them when it is the first connection). While mounted, the client keeps retrying so that a server rollback recovers the mount, but calls fail with `ETIMEDOUT` until one side is rebuilt or the mount is given up as below.
-- To give up on a mount: `fusermount3 -uz /mnt/share` detaches the mount point, and killing `jackalopefs-client` fails every pending and future call with `ENOTCONN` immediately. Nothing needs root and nothing can wedge in uninterruptible sleep beyond the operation deadline.
+- A write that the kernel had cached when the server went away fails at the next `fsync(2)` or `close(2)` with `EIO` unless it was safe to retry and the reconnect delivered it; a close with much unflushed data waits one operation deadline per batch the kernel tries to flush.
+- To give up on a mount: `fusermount3 -uz /mnt/share` detaches the mount point, and killing `jackalopefs-client` fails every pending and future call with `ENOTCONN` immediately. Nothing needs root and nothing can wedge in uninterruptible sleep beyond the operation deadline, or a few of them for a close with cached data.
 
 ## Semantics
 
-Single client: hardlinks share `st_ino`, `st_ino` is stable, unlink-while-open works, `O_APPEND` appends atomically, `readdir` uses real directory cookies, POSIX and BSD locks are handled by the local kernel. Writes go through immediately (no writeback cache), so a reconnect never loses data, at the cost of one round trip per `write(2)`.
+Single client: hardlinks share `st_ino`, `st_ino` is stable, unlink-while-open works, `readdir` uses real directory cookies, POSIX and BSD locks are handled by the local kernel. The kernel caches writes: a `write(2)` returns once the page cache has the data, the kernel sends it in 1 MiB requests with many in flight, and a failure to reach the server surfaces at `fsync(2)` or `close(2)` rather than at the write. `O_APPEND` is positioned by the client's kernel, which is exact for one client per file.
 
 Several clients: each sees the others' changes through server push plus the cache TTL; locks are not shared. See `docs/design.md` for the full list of limitations.
 

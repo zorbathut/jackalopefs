@@ -1,7 +1,7 @@
 //! The typed request API. Every call has a deadline that covers waiting for a connection, opening the stream, and the exchange itself; a call whose reply was lost to a dropped connection is retried once on the next connection only when that is safe.
 
 use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
-use crate::handles::{HandleKind, HandleRec, HandleTable};
+use crate::handles::{HandleKind, HandleTable};
 use crate::perf::{current_request, AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_proto::{
@@ -164,13 +164,14 @@ fn codec_error(e: ErrorCodec, on_io: ErrorExchange) -> ErrorExchange {
 }
 
 /// Whether a request whose reply was lost may be sent again without changing the outcome.
-fn retry_safe(req: &Request, handle: Option<&HandleRec>) -> bool {
+fn retry_safe(req: &Request) -> bool {
     match req {
         Request::Lookup { .. }
         | Request::Getattr { .. }
         | Request::Setattr { .. }
         | Request::Readlink { .. }
         | Request::Read { .. }
+        | Request::Write { .. }
         | Request::Release { .. }
         | Request::Fsync { .. }
         | Request::Opendir { .. }
@@ -182,7 +183,6 @@ fn retry_safe(req: &Request, handle: Option<&HandleRec>) -> bool {
         | Request::Access { .. } => true,
         Request::Open { flags, .. } => flags & libc::O_TRUNC == 0,
         Request::Create { flags, .. } => flags & (libc::O_EXCL | libc::O_TRUNC) == 0,
-        Request::Write { .. } => handle.is_some_and(|h| h.flags & libc::O_APPEND == 0),
         Request::Setxattr { flags, .. } => *flags == 0,
         Request::Mknod { .. }
         | Request::Mkdir { .. }
@@ -286,7 +286,7 @@ impl Caller {
                     min_generation = attached.generation + 1;
                 }
                 Ok(Err(ErrorExchange::Lost)) => {
-                    if lost_once || !retry_safe(req, handle.as_deref()) {
+                    if lost_once || !retry_safe(req) {
                         return Err(Error::Disconnected);
                     }
                     tracing::debug!(
@@ -739,107 +739,55 @@ mod tests {
 
     #[test]
     fn retry_policy() {
-        let table = HandleTable::default();
-        let plain = table.insert(1, 10, Path::root(), libc::O_RDWR, HandleKind::File);
-        let append = table.insert(
-            2,
-            11,
-            Path::root(),
-            libc::O_WRONLY | libc::O_APPEND,
-            HandleKind::File,
-        );
         let name = Name::new(b"x").unwrap();
-        assert!(retry_safe(
-            &Request::Read {
-                fh: 1,
-                offset: 0,
-                size: 1
-            },
-            Some(&plain)
-        ));
-        assert!(retry_safe(
-            &Request::Write {
-                fh: 1,
-                offset: 0,
-                data: Vec::new()
-            },
-            Some(&plain)
-        ));
-        assert!(!retry_safe(
-            &Request::Write {
-                fh: 2,
-                offset: 0,
-                data: Vec::new()
-            },
-            Some(&append)
-        ));
-        assert!(!retry_safe(
-            &Request::Write {
-                fh: 3,
-                offset: 0,
-                data: Vec::new()
-            },
-            None
-        ));
-        assert!(retry_safe(
-            &Request::Open {
-                fh: 4,
-                path: Path::root(),
-                flags: libc::O_RDWR
-            },
-            None
-        ));
-        assert!(!retry_safe(
-            &Request::Open {
-                fh: 4,
-                path: Path::root(),
-                flags: libc::O_RDWR | libc::O_TRUNC
-            },
-            None
-        ));
-        assert!(!retry_safe(
-            &Request::Create {
-                fh: 4,
-                parent: Path::root(),
-                name: name.clone(),
-                mode: 0,
-                flags: libc::O_EXCL
-            },
-            None
-        ));
-        assert!(retry_safe(
-            &Request::Setattr {
-                path: Some(Path::root()),
-                fh: None,
-                set: SetAttr::default()
-            },
-            None
-        ));
-        assert!(retry_safe(&Request::Release { fh: 1 }, Some(&plain)));
-        assert!(!retry_safe(
-            &Request::Unlink {
-                parent: Path::root(),
-                name: name.clone()
-            },
-            None
-        ));
-        assert!(!retry_safe(
-            &Request::Rename {
-                parent: Path::root(),
-                name: name.clone(),
-                newparent: Path::root(),
-                newname: name.clone(),
-                flags: 0
-            },
-            None
-        ));
-        assert!(!retry_safe(
-            &Request::Mkdir {
-                parent: Path::root(),
-                name,
-                mode: 0
-            },
-            None
-        ));
+        assert!(retry_safe(&Request::Read {
+            fh: 1,
+            offset: 0,
+            size: 1
+        }));
+        assert!(retry_safe(&Request::Write {
+            fh: 1,
+            offset: 0,
+            data: Vec::new()
+        }));
+        assert!(retry_safe(&Request::Open {
+            fh: 4,
+            path: Path::root(),
+            flags: libc::O_RDWR
+        }));
+        assert!(!retry_safe(&Request::Open {
+            fh: 4,
+            path: Path::root(),
+            flags: libc::O_RDWR | libc::O_TRUNC
+        }));
+        assert!(!retry_safe(&Request::Create {
+            fh: 4,
+            parent: Path::root(),
+            name: name.clone(),
+            mode: 0,
+            flags: libc::O_EXCL
+        }));
+        assert!(retry_safe(&Request::Setattr {
+            path: Some(Path::root()),
+            fh: None,
+            set: SetAttr::default()
+        }));
+        assert!(retry_safe(&Request::Release { fh: 1 }));
+        assert!(!retry_safe(&Request::Unlink {
+            parent: Path::root(),
+            name: name.clone()
+        }));
+        assert!(!retry_safe(&Request::Rename {
+            parent: Path::root(),
+            name: name.clone(),
+            newparent: Path::root(),
+            newname: name.clone(),
+            flags: 0
+        }));
+        assert!(!retry_safe(&Request::Mkdir {
+            parent: Path::root(),
+            name,
+            mode: 0
+        }));
     }
 }

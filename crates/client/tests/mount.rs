@@ -36,12 +36,25 @@ struct Mounted {
 
 impl Mounted {
     async fn start(op_timeout: Duration, ttl: Duration) -> Option<Mounted> {
+        Mounted::start_full(op_timeout, ttl, true).await
+    }
+
+    /// A mount whose server sends no change events.
+    async fn start_unwatched(op_timeout: Duration, ttl: Duration) -> Option<Mounted> {
+        Mounted::start_full(op_timeout, ttl, false).await
+    }
+
+    async fn start_full(op_timeout: Duration, ttl: Duration, watched: bool) -> Option<Mounted> {
         if !fuse_available() {
             return None;
         }
         let export = tempfile::tempdir().unwrap();
         let mountpoint = tempfile::tempdir().unwrap();
-        let server = TestServer::start(export.path(), None).await;
+        let server = if watched {
+            TestServer::start(export.path(), None).await
+        } else {
+            TestServer::start_unwatched(export.path()).await
+        };
         let client = jackalopefs_client::Client::connect(server.config(op_timeout))
             .await
             .unwrap();
@@ -589,6 +602,229 @@ async fn absent_xattrs_are_answered_from_the_listing() {
         assert_eq!(xattr_get(&f0, "user.mine"), Err(libc::ENODATA));
         xattr_set(&f0, "user.mine", b"m").unwrap();
         assert_eq!(xattr_get(&f0, "user.mine"), Ok(b"m".to_vec()));
+    })
+    .await;
+    m.finish().await;
+}
+
+/// The kernel caches writes: many small `write(2)` calls reach the server as few large requests, and the file is complete once closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_are_merged_by_the_kernel_before_they_reach_the_server() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let export = m.export.path().to_path_buf();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    let size = 8 << 20;
+    let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let written = data.clone();
+    perf.report();
+    blocking(move || {
+        let mut file = fs::File::create(mnt.join("big")).unwrap();
+        for chunk in written.chunks(4096) {
+            file.write_all(chunk).unwrap();
+        }
+        file.sync_all().unwrap();
+    })
+    .await;
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
+    })
+    .await;
+    let snap = perf.report();
+    let write = &snap.fuse["write"];
+    // Page-aligned writes to a fresh file are flushed once each, so the bytes are exact; the merge shows in the request size.
+    assert_eq!(write.bytes, size as u64);
+    assert!(
+        write.bytes / write.n > 4096,
+        "mean request {} bytes over {} requests",
+        write.bytes / write.n,
+        write.n
+    );
+    assert_eq!(fs::read(export.join("big")).unwrap(), data);
+    m.finish().await;
+}
+
+/// With the kernel positioning appends and the server's descriptor not appending on its own, re-flushed pages land where they belong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appends_through_the_mount_land_once_and_in_order() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let export = m.export.path().to_path_buf();
+    let expected = blocking(move || {
+        let mut expected = Vec::new();
+        for i in 0..50 {
+            let line = format!("line {i:03}\n");
+            fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(mnt.join("log"))
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+            expected.extend_from_slice(line.as_bytes());
+        }
+        assert_eq!(
+            fs::read(mnt.join("log")).unwrap(),
+            expected,
+            "through the mount"
+        );
+        expected
+    })
+    .await;
+    assert_eq!(
+        fs::read(export.join("log")).unwrap(),
+        expected,
+        "on the export"
+    );
+    m.finish().await;
+}
+
+/// The kernel reads the rest of a partially rewritten page through the handle it has, so a write-only open must be readable on the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_only_handle_can_rewrite_part_of_a_page() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let export = m.export.path().to_path_buf();
+    blocking(move || {
+        fs::write(mnt.join("f"), vec![b'a'; 8192]).unwrap();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .open(mnt.join("f"))
+            .unwrap();
+        file.seek(SeekFrom::Start(100)).unwrap();
+        file.write_all(b"BBBB").unwrap();
+    })
+    .await;
+    let got = fs::read(export.join("f")).unwrap();
+    assert_eq!(got.len(), 8192);
+    assert_eq!(&got[100..104], b"BBBB");
+    assert!(got[..100].iter().chain(&got[104..]).all(|b| *b == b'a'));
+    m.finish().await;
+}
+
+/// A write lands in the kernel's cache and returns; it is the flush that learns the server is gone, here through `fsync(2)`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_after_the_server_vanished_fails_at_the_fsync() {
+    let Some(mut m) = Mounted::start(Duration::from_millis(500), Duration::from_secs(60)).await
+    else {
+        return;
+    };
+    let mnt = m.mnt();
+    let file = blocking(move || fs::File::create(mnt.join("f")).unwrap()).await;
+    m.server.take().unwrap().stop().await;
+    blocking(move || {
+        let mut file = file;
+        file.write_all(b"cached").unwrap();
+        let err = file.sync_all().unwrap_err();
+        let code = err.raw_os_error().unwrap();
+        assert!(
+            [libc::ETIMEDOUT, libc::EIO, libc::ENOTCONN].contains(&code),
+            "unexpected errno {code}: {err}"
+        );
+    })
+    .await;
+    m.finish().await;
+}
+
+/// The same failure reaches a program that never syncs: `close(2)` writes the cached data back first and reports the loss as `EIO`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_after_the_server_vanished_fails_at_the_close() {
+    let Some(mut m) = Mounted::start(Duration::from_millis(500), Duration::from_secs(60)).await
+    else {
+        return;
+    };
+    let mnt = m.mnt();
+    let file = blocking(move || fs::File::create(mnt.join("f")).unwrap()).await;
+    m.server.take().unwrap().stop().await;
+    blocking(move || {
+        use std::os::fd::IntoRawFd;
+        let mut file = file;
+        file.write_all(b"cached").unwrap();
+        let fd = file.into_raw_fd();
+        // SAFETY: the descriptor was just taken out of the File and is closed exactly once here.
+        let rc = unsafe { libc::close(fd) };
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            rc, -1,
+            "close succeeded although the data could not be written back"
+        );
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EIO),
+            "close failed with {err}"
+        );
+    })
+    .await;
+    m.finish().await;
+}
+
+/// After the last close of a file written through the mount, the mount shows the server's size and mtime. The kernel does not always push its own mtime at close (a write in the same clock tick as the file's creation leaves the inode clean), so a fresh file written at once is the case that exposes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_written_file_shows_the_servers_attributes_after_its_last_close() {
+    let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(10)).await
+    else {
+        return;
+    };
+    let mnt = m.mnt();
+    let export = m.export.path().to_path_buf();
+    blocking(move || {
+        for i in 0..20 {
+            let name = format!("f{i}");
+            fs::write(mnt.join(&name), b"written at once").unwrap();
+            let started = Instant::now();
+            loop {
+                let seen = fs::metadata(mnt.join(&name)).unwrap();
+                let truth = fs::metadata(export.join(&name)).unwrap();
+                if seen.len() == truth.len()
+                    && seen.modified().unwrap() == truth.modified().unwrap()
+                {
+                    break;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "{name}: mount shows {:?}, export has {:?}",
+                    seen.modified().unwrap(),
+                    truth.modified().unwrap()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    })
+    .await;
+    m.finish().await;
+}
+
+/// Without any event, a file grown on the export is seen through the mount within the attribute TTL plus one access: the refresh notices the size the kernel would otherwise keep, and the file is taken away from the kernel by name. The probe is a `stat`, which refreshes attributes without opening the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_external_size_change_is_seen_within_the_attribute_ttl_without_events() {
+    let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(1)).await
+    else {
+        return;
+    };
+    let mnt = m.mnt();
+    let export = m.export.path().to_path_buf();
+    fs::write(export.join("f"), b"v1").unwrap();
+    let mnt2 = mnt.clone();
+    blocking(move || assert_eq!(fs::read(mnt2.join("f")).unwrap(), b"v1")).await;
+    fs::write(export.join("f"), b"v2 is longer").unwrap();
+    let started = Instant::now();
+    blocking(move || loop {
+        let size = fs::metadata(mnt.join("f")).unwrap().len();
+        if size == 12 {
+            assert_eq!(fs::read(mnt.join("f")).unwrap(), b"v2 is longer");
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "external growth not visible within a 1 s attribute TTL: size {size}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     })
     .await;
     m.finish().await;

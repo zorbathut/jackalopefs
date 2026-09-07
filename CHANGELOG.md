@@ -14,6 +14,15 @@
 - Every `Attr` the server sends carries the node's extended attribute names (or says it did not look), and the client answers a `getxattr` for a name that is not there, and `listxattr`, from that for the attribute TTL without a round trip. A file manager probing every entry for ACLs no longer pays a round trip per probe.
 - `scripts/validate/`: repeatable validation runs against a fresh server and mount: pjdfstest (POSIX conformance, with a checked-in expected-failure baseline per mode), xfstests' fsx and fsstress, fio with verification, plus resilience (server stopped, killed and restarted under load) and coherence (two mounts of one export) checks of our own; a rootless podman image for the root-only parts. `docs/validation.md` explains the runs and the baseline.
 
+### Breaking
+
+- The kernel now caches writes (`FUSE_WRITEBACK_CACHE`). A `write(2)` returns once the page cache has the data; a failure to reach the server surfaces at `fsync(2)` or `close(2)` (as `EIO` at close), and a server that vanishes takes the pages not yet flushed with it, except those the reconnect retry delivers. `O_APPEND` is positioned by the client's kernel, so two clients appending to one file no longer interleave cleanly. The server opens every file for writing as `O_RDWR`, so a file writable but not readable cannot be opened for writing through the mount. A file this client holds open keeps the size and mtime the kernel has for it until it is closed, whatever changes on the server; a file it wrote is looked up afresh after the close, and a file nobody holds open is seen afresh within the attribute TTL plus one access. The mtime of a file written through the mount can be the time the server received the data rather than the time of the `write(2)`.
+
+### Improved
+
+- Writes onto the mount reach the server as requests of up to 1 MiB with many in flight instead of one round trip per `write(2)`, and the kernel's per-write `security.capability` probe is answered from the metadata cache; a copy onto the mount is no longer bound by the round-trip time.
+- A change to a file on the server, or by another client, is seen through the mount by dropping the file from the kernel's cache by name, which is what works when the kernel keeps its own size for files it holds.
+
 ### Fixed
 
 - Opening a large directory in Dolphin, or in the KDE file dialog, took seconds because KIO asks every entry for its POSIX ACLs through two `getxattr` calls that FUSE never caches; those are now answered on the client from the names the listing already carried.

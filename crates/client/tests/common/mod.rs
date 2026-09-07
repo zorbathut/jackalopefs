@@ -35,12 +35,34 @@ impl TestServer {
         TestServer::start_with(export, token, socket, Identity::generate().unwrap()).await
     }
 
+    /// A server that sends no change events, so a test can see what the client's own refreshes find out.
+    pub async fn start_unwatched(export: &Path) -> TestServer {
+        TestServer::start_full(
+            export,
+            None,
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            Identity::generate().unwrap(),
+            false,
+        )
+        .await
+    }
+
     /// Start with a given identity, as a restarted server does when it reloads its persisted certificate.
     pub async fn start_with(
         export: &Path,
         token: Option<String>,
         socket: UdpSocket,
         identity: Identity,
+    ) -> TestServer {
+        TestServer::start_full(export, token, socket, identity, true).await
+    }
+
+    async fn start_full(
+        export: &Path,
+        token: Option<String>,
+        socket: UdpSocket,
+        identity: Identity,
+        watched: bool,
     ) -> TestServer {
         // The server binary zeroes its umask so client modes are honoured; the in-process server needs the same.
         unsafe { libc::umask(0) };
@@ -55,7 +77,11 @@ impl TestServer {
         .unwrap();
         let (events, _) = broadcast::channel(64);
         let changes = Arc::new(ChangeLog::default());
-        let watcher = watch::spawn(export, changes.clone(), events.clone());
+        let watcher = if watched {
+            watch::spawn(export, changes.clone(), events.clone())
+        } else {
+            None
+        };
         let server = Arc::new(Server::new(
             Arc::new(Export::open(export).unwrap()),
             token,

@@ -16,6 +16,7 @@ pub enum HandleKind {
 pub struct HandleRec {
     pub nodeid: u64,
     pub path: Path,
+    /// The flags the server opened with, which is how the file is reopened after a lost session and what says whether this handle writes; the kernel's own flags differ in access mode and append.
     pub flags: i32,
     pub kind: HandleKind,
     /// Set when a reopen after a lost session found a different inode (or nothing) at the path; every later use fails with `ESTALE`.

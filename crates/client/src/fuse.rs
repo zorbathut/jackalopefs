@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Bytes of directory entries fetched from the server per request; the kernel asks for far less at a time, and the rest is served from the handle's buffer.
 const READDIR_FETCH: u32 = 256 * 1024;
 
-/// Concurrent background requests (readahead, writeback of mmap'd pages) the kernel may keep in flight.
+/// Concurrent background requests (readahead and the writeback of cached pages) the kernel may keep in flight; it bounds how many writes a flush has on the wire at once.
 const MAX_BACKGROUND: u16 = 64;
 
 /// State shared between the session thread and the request tasks.
@@ -273,6 +273,16 @@ fn dir_placeholder(ino: u64) -> FileAttr {
         rdev: 0,
         blksize: 4096,
         flags: 0,
+    }
+}
+
+/// The open flags the server gets. With the kernel caching writes, it reads through write handles (to fill the rest of a partially written page) and positions appends itself from its own idea of the size, so the server's descriptor must be readable and must not append on its own: a server-side `O_APPEND` would put every re-flushed page at the end. The price is that a file writable but not readable (mode 0222) cannot be opened for writing through the mount.
+fn flags_for_server(flags: i32) -> i32 {
+    let flags = flags & !libc::O_APPEND;
+    if flags & libc::O_ACCMODE == libc::O_WRONLY {
+        (flags & !libc::O_ACCMODE) | libc::O_RDWR
+    } else {
+        flags
     }
 }
 
@@ -528,7 +538,8 @@ impl Filesystem for Backend {
             | InitFlags::FUSE_PARALLEL_DIROPS
             | InitFlags::FUSE_AUTO_INVAL_DATA
             | InitFlags::FUSE_DO_READDIRPLUS
-            | InitFlags::FUSE_READDIRPLUS_AUTO;
+            | InitFlags::FUSE_READDIRPLUS_AUTO
+            | InitFlags::FUSE_WRITEBACK_CACHE;
         let supported = wanted & config.capabilities();
         let missing = wanted - supported;
         if !missing.is_empty() {
@@ -878,7 +889,7 @@ impl Filesystem for Backend {
 
     fn open(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
         let shared = self.shared.clone();
-        let flags = flags.0;
+        let flags = flags_for_server(flags.0);
         self.spawn(KeyPerf::of("open", req, ino.0), async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
@@ -911,6 +922,7 @@ impl Filesystem for Backend {
             Ok(name) => name,
             Err(e) => return reply.error(e),
         };
+        let flags = flags_for_server(flags);
         self.spawn(KeyPerf::of("create", req, parent.0), async move {
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
@@ -997,7 +1009,7 @@ impl Filesystem for Backend {
         });
     }
 
-    /// Nothing is buffered on the client, so a `close(2)` has nothing to flush; the request still counts, so the op mix shows every close.
+    /// By the time a `close(2)` reaches us the kernel has written back the file's dirty pages and reported their errors to the caller, and this daemon buffers nothing of its own; the request still counts, so the op mix shows every close.
     fn flush(
         &self,
         _req: &Request,
@@ -1030,8 +1042,18 @@ impl Filesystem for Backend {
             ..KeyPerf::of("release", req, ino.0)
         };
         self.spawn(key, async move {
+            let writer = shared
+                .client
+                .handles()
+                .get(fh.0)
+                .is_some_and(|rec| rec.flags & libc::O_ACCMODE != libc::O_RDONLY);
             match shared.client.release(fh.0).await {
                 Ok(()) => {
+                    // The kernel keeps its own size and mtime for a file it wrote, and does not always push the mtime (a write in the same clock tick as the file's last change leaves the inode clean); once the last handle is gone the server's view is the truth, and dropping the file by name makes the next access fetch it. The record goes with it: the next reply is the first for the fresh inode.
+                    if writer && shared.client.handles().any_live_for(ino.0).is_none() {
+                        shared.reported_forget(ino.0);
+                        shared.drop_by_name(ino.0);
+                    }
                     reply.ok();
                     Outcome::default()
                 }
@@ -1459,5 +1481,28 @@ mod tests {
             tagged.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
             vec![5, 10]
         );
+    }
+
+    #[test]
+    fn server_flags_read_through_write_handles_and_never_append() {
+        use libc::{O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
+        assert_eq!(flags_for_server(O_RDONLY), O_RDONLY);
+        assert_eq!(flags_for_server(O_RDWR), O_RDWR);
+        assert_eq!(
+            flags_for_server(O_WRONLY | O_CREAT | O_EXCL | O_TRUNC),
+            O_RDWR | O_CREAT | O_EXCL | O_TRUNC
+        );
+        assert_eq!(flags_for_server(O_RDWR | O_APPEND), O_RDWR);
+        assert_eq!(flags_for_server(O_WRONLY | O_APPEND), O_RDWR);
+        for flags in [O_RDONLY, O_WRONLY, O_RDWR, O_WRONLY | O_APPEND | O_TRUNC] {
+            assert_eq!(
+                flags_for_server(flags) & O_ACCMODE,
+                if flags & O_ACCMODE == O_RDONLY {
+                    O_RDONLY
+                } else {
+                    O_RDWR
+                }
+            );
+        }
     }
 }
