@@ -212,6 +212,19 @@ impl Shared {
             .ok_or(Errno::EIO)
     }
 
+    /// Answer an entry-producing request: register the node and reply with its attributes and generation.
+    fn reply_entry(&self, reply: ReplyEntry, parent: u64, name: Name, attr: &Attr) {
+        match self.register(parent, name, attr) {
+            Ok(generation) => reply.entry_with_ttls(
+                &self.attr_ttl,
+                &self.entry_ttl,
+                &file_attr(attr),
+                generation,
+            ),
+            Err(e) => reply.error(e),
+        }
+    }
+
     /// Serve one page of entries for `fh` starting at `offset`, from the buffer when it continues where the kernel left off and from the server otherwise. A handle without a buffer has been released.
     async fn dir_page(&self, fh: u64, offset: u64) -> Result<Vec<(u64, DirEntry)>, Error> {
         {
@@ -324,15 +337,7 @@ impl Filesystem for Backend {
                 Err(e) => return reply.error(e),
             };
             match shared.client.lookup(path, name.clone()).await {
-                Ok(attr) => match shared.register(parent.0, name, &attr) {
-                    Ok(generation) => reply.entry_with_ttls(
-                        &shared.attr_ttl,
-                        &shared.entry_ttl,
-                        &file_attr(&attr),
-                        generation,
-                    ),
-                    Err(e) => reply.error(e),
-                },
+                Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -438,15 +443,7 @@ impl Filesystem for Backend {
                 .mknod(path, name.clone(), mode, rdev as u64)
                 .await
             {
-                Ok(attr) => match shared.register(parent.0, name, &attr) {
-                    Ok(generation) => reply.entry_with_ttls(
-                        &shared.attr_ttl,
-                        &shared.entry_ttl,
-                        &file_attr(&attr),
-                        generation,
-                    ),
-                    Err(e) => reply.error(e),
-                },
+                Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -472,15 +469,7 @@ impl Filesystem for Backend {
                 Err(e) => return reply.error(e),
             };
             match shared.client.mkdir(path, name.clone(), mode).await {
-                Ok(attr) => match shared.register(parent.0, name, &attr) {
-                    Ok(generation) => reply.entry_with_ttls(
-                        &shared.attr_ttl,
-                        &shared.entry_ttl,
-                        &file_attr(&attr),
-                        generation,
-                    ),
-                    Err(e) => reply.error(e),
-                },
+                Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -548,15 +537,7 @@ impl Filesystem for Backend {
                 Err(e) => return reply.error(e),
             };
             match shared.client.symlink(path, name.clone(), target).await {
-                Ok(attr) => match shared.register(parent.0, name, &attr) {
-                    Ok(generation) => reply.entry_with_ttls(
-                        &shared.attr_ttl,
-                        &shared.entry_ttl,
-                        &file_attr(&attr),
-                        generation,
-                    ),
-                    Err(e) => reply.error(e),
-                },
+                Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
                 Err(e) => reply.error(errno(&e)),
             }
         });
@@ -623,15 +604,7 @@ impl Filesystem for Backend {
                 (Err(e), _) | (_, Err(e)) => return reply.error(e),
             };
             match shared.client.link(path, newpath, newname.clone()).await {
-                Ok(attr) => match shared.register(newparent.0, newname, &attr) {
-                    Ok(generation) => reply.entry_with_ttls(
-                        &shared.attr_ttl,
-                        &shared.entry_ttl,
-                        &file_attr(&attr),
-                        generation,
-                    ),
-                    Err(e) => reply.error(e),
-                },
+                Ok(attr) => shared.reply_entry(reply, newparent.0, newname, &attr),
                 Err(e) => reply.error(errno(&e)),
             }
         });
