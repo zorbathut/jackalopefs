@@ -9,6 +9,7 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
@@ -28,6 +29,45 @@ struct Args {
     /// Require clients to present this token.
     #[arg(long)]
     token: Option<String>,
+    /// Log a per-operation performance summary this often (e.g. `5s`); SIGUSR1 logs one at any time.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    perf_interval: Option<Duration>,
+}
+
+/// The signals the server answers, subscribed before it starts serving so none is missed (and so SIGUSR1, whose default disposition is to terminate, never kills it).
+struct Signals {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    usr1: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn subscribe() -> anyhow::Result<Signals> {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Signals {
+            term: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
+            int: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
+            usr1: signal(SignalKind::user_defined1()).context("listening for SIGUSR1")?,
+        })
+    }
+}
+
+/// Waits for the next signal; a stream that ends (which tokio documents as not happening in practice) waits forever rather than spinning.
+async fn next_signal(signal: &mut tokio::signal::unix::Signal) {
+    if signal.recv().await.is_none() {
+        tracing::warn!("signal stream ended; no longer listening for it");
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Waits for the next report tick, or forever when no interval was asked for.
+async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
+    match interval {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 fn default_state_dir() -> anyhow::Result<PathBuf> {
@@ -61,6 +101,7 @@ fn main() -> anyhow::Result<()> {
 
     let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
     runtime.block_on(async move {
+        let mut signals = Signals::subscribe()?;
         let server_config = tls::server_config(identity, transport_config())?;
         let endpoint = quinn::Endpoint::server(server_config, args.listen)
             .with_context(|| format!("binding {}", args.listen))?;
@@ -83,36 +124,33 @@ fn main() -> anyhow::Result<()> {
 
         let closer = {
             let endpoint = endpoint.clone();
+            let perf = server.perf.clone();
+            // The first tick of an interval is immediate; the first report is due one period from now. A tick delayed by a stalled process is taken late rather than as a burst of near-empty windows.
+            let mut ticks = args.perf_interval.map(|every| {
+                let mut ticks =
+                    tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+                ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ticks
+            });
             tokio::spawn(async move {
-                wait_for_shutdown_signal().await;
+                loop {
+                    tokio::select! {
+                        _ = next_signal(&mut signals.term) => break,
+                        _ = next_signal(&mut signals.int) => break,
+                        _ = next_signal(&mut signals.usr1) => { perf.report(); }
+                        _ = next_tick(&mut ticks) => { perf.report(); }
+                    }
+                }
                 tracing::info!("shutting down");
                 endpoint.close(session::close_code::SHUTDOWN.into(), b"server shutdown");
             })
         };
-        session::serve(endpoint.clone(), server).await;
+        session::serve(endpoint.clone(), server.clone()).await;
         closer.abort();
         endpoint.wait_idle().await;
+        server.perf.report();
         Ok(())
     })
-}
-
-async fn wait_for_shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(term) => term,
-        Err(e) => {
-            tracing::error!("cannot listen for SIGTERM: {e}");
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                tracing::error!("cannot listen for SIGINT: {e}");
-                std::future::pending::<()>().await;
-            }
-            return;
-        }
-    };
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => if let Err(e) = result { tracing::error!("cannot listen for SIGINT: {e}"); std::future::pending::<()>().await },
-        _ = term.recv() => {},
-    }
 }
 
 #[cfg(test)]

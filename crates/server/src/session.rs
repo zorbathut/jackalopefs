@@ -3,6 +3,7 @@
 use crate::export::Export;
 use crate::handles::Handles;
 use crate::ops::{self, Ops};
+use crate::perf::{Outcome, Perf, Phases, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch};
 use crate::SESSION_GRACE;
 use jackalopefs_proto::{
@@ -147,6 +148,8 @@ pub struct Server {
     pub sessions: Arc<Sessions>,
     pub events: broadcast::Sender<Arc<EventBatch>>,
     pub changes: Arc<ChangeLog>,
+    /// Request accounting across every session.
+    pub perf: Arc<Perf>,
     token: Option<String>,
     connection_permits: Arc<Semaphore>,
 }
@@ -164,6 +167,7 @@ impl Server {
             sessions: Arc::new(Sessions::default()),
             events,
             changes,
+            perf: Arc::new(Perf::default()),
             token,
             connection_permits: Arc::new(Semaphore::new(max_connections)),
         }
@@ -263,7 +267,7 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
-                tokio::spawn(handle_request(ops.clone(), send, recv));
+                tokio::spawn(handle_request(ops.clone(), server.perf.clone(), send, recv));
             }
             Err(e) => {
                 tracing::debug!(session = session.id, "connection ended: {e}");
@@ -435,7 +439,26 @@ async fn forward_events(
     }
 }
 
-async fn handle_request(ops: Arc<Ops>, mut send: SendStream, mut recv: RecvStream) {
+/// What a reply carries, or the errno it refuses with.
+fn outcome_of(resp: &Response) -> Outcome {
+    match resp {
+        Response::Err(errno) => Outcome::errno(*errno),
+        Response::Read(data) => Outcome::bytes(data.len()),
+        Response::Written(n) => Outcome::bytes(*n as usize),
+        Response::Readdir(entries) => Outcome::items(entries.len()),
+        Response::ReaddirPlus(entries) => Outcome::items(entries.len()),
+        _ => Outcome::default(),
+    }
+}
+
+async fn handle_request(
+    ops: Arc<Ops>,
+    perf: Arc<Perf>,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) {
+    let accepted = Instant::now();
+    let _inflight = perf.start();
     let req: Request = match timeout(REQUEST_READ_TIMEOUT, read_frame(&mut recv)).await {
         Ok(Ok(req)) => req,
         Ok(Err(e)) if e.is_eof() => {
@@ -464,20 +487,33 @@ async fn handle_request(ops: Arc<Ops>, mut send: SendStream, mut recv: RecvStrea
             return;
         }
     };
+    let mut phases = Phases {
+        read: accepted.elapsed(),
+        ..Phases::default()
+    };
     let op = req.op_name();
-    let started = Instant::now();
-    let resp = match tokio::task::spawn_blocking(move || ops::dispatch(&ops, req)).await {
-        Ok(resp) => resp,
+    let (fh, offset, size) = req.perf_fields();
+    let queued = Instant::now();
+    let resp = match tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let resp = ops::dispatch(&ops, req);
+        (started, Instant::now(), resp)
+    })
+    .await
+    {
+        Ok((started, finished, resp)) => {
+            phases.wait = started - queued;
+            phases.op = finished - started;
+            resp
+        }
         Err(e) => {
             tracing::error!(op, "operation panicked: {e}");
+            phases.wait = queued.elapsed();
             Response::Err(nix::errno::Errno::EIO as i32)
         }
     };
-    tracing::trace!(
-        op,
-        elapsed_us = started.elapsed().as_micros() as u64,
-        "done"
-    );
+    let outcome = outcome_of(&resp);
+    let sending = Instant::now();
     match timeout(REPLY_WRITE_TIMEOUT, write_frame(&mut send, &resp)).await {
         Ok(Ok(())) => {
             if let Err(e) = send.finish() {
@@ -491,6 +527,27 @@ async fn handle_request(ops: Arc<Ops>, mut send: SendStream, mut recv: RecvStrea
                 tracing::debug!(op, "reset after stalled reply: {e}");
             }
         }
+    }
+    phases.send = sending.elapsed();
+    let total = accepted.elapsed();
+    perf.record(op, &outcome, total, phases);
+    if tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE) {
+        tracing::trace!(
+            target: TRACE_TARGET,
+            op,
+            fh,
+            offset,
+            size,
+            bytes = outcome.bytes,
+            items = outcome.items,
+            errno = outcome.errno,
+            read_us = phases.read.as_micros() as u64,
+            wait_us = phases.wait.as_micros() as u64,
+            op_us = phases.op.as_micros() as u64,
+            send_us = phases.send.as_micros() as u64,
+            total_us = total.as_micros() as u64,
+            "request"
+        );
     }
 }
 

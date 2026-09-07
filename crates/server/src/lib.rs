@@ -6,6 +6,7 @@ pub mod dirents;
 pub mod export;
 pub mod handles;
 pub mod ops;
+pub mod perf;
 pub mod session;
 pub mod tls;
 pub mod watch;
