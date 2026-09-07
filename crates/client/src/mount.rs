@@ -72,7 +72,9 @@ impl KernelLimits {
             read_ahead_kb = self.read(&self.bdi, "read_ahead_kb"),
             max_background = self.read(&self.connection, "max_background"),
             congestion_threshold = self.read(&self.connection, "congestion_threshold"),
-            "FUSE limits the kernel granted (from sysfs)"
+            "FUSE limits the kernel granted, from {} and {}",
+            self.bdi.display(),
+            self.connection.display()
         );
     }
 
