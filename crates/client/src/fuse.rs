@@ -29,8 +29,15 @@ pub struct Shared {
     pub client: Arc<Client>,
     pub nodes: Mutex<NodeTable>,
     dirs: Mutex<HashMap<u64, DirBuffer>>,
+    /// What the last attributes said about each inode's extended attribute names, kept for the attribute TTL; answers only the absence of a name and the list itself, never a value. Bounded by the node table: an entry leaves when the kernel forgets the inode.
+    xattrs: Mutex<HashMap<u64, KnownXattrs>>,
     pub entry_ttl: Duration,
     pub attr_ttl: Duration,
+}
+
+struct KnownXattrs {
+    names: Vec<Vec<u8>>,
+    until: Instant,
 }
 
 /// Entries fetched from the server but not yet handed to the kernel, each tagged with the cookie that yields it.
@@ -81,6 +88,7 @@ impl Backend {
             client,
             nodes: Mutex::new(NodeTable::new()),
             dirs: Mutex::new(HashMap::new()),
+            xattrs: Mutex::new(HashMap::new()),
             entry_ttl,
             attr_ttl,
         });
@@ -290,8 +298,58 @@ impl Shared {
             .unwrap_or(ROOT)
     }
 
+    /// Keep what the attributes say about the inode's xattr names for the attribute TTL; attributes that did not look replace whatever was known, since the server may since have declined to say.
+    fn xattr_remember(&self, attr: &Attr) {
+        let mut xattrs = self.xattrs.lock();
+        match &attr.xattr_names {
+            Some(names) => {
+                xattrs.insert(
+                    attr.ino,
+                    KnownXattrs {
+                        names: names.clone(),
+                        until: Instant::now() + self.attr_ttl,
+                    },
+                );
+            }
+            None => {
+                xattrs.remove(&attr.ino);
+            }
+        }
+    }
+
+    pub fn xattr_forget(&self, ino: u64) {
+        self.xattrs.lock().remove(&ino);
+    }
+
+    pub fn xattr_clear(&self) {
+        self.xattrs.lock().clear();
+    }
+
+    /// Whether fresh names say the inode has no attribute called `name`; anything less certain means asking the server.
+    fn xattr_known_absent(&self, ino: u64, name: &[u8]) -> bool {
+        match self.xattrs.lock().get(&ino) {
+            Some(known) => known.until > Instant::now() && !known.names.iter().any(|n| n == name),
+            None => false,
+        }
+    }
+
+    /// The `listxattr` reply (each name followed by a NUL) when the names are known and fresh.
+    fn xattr_known_list(&self, ino: u64) -> Option<Vec<u8>> {
+        match self.xattrs.lock().get(&ino) {
+            Some(known) if known.until > Instant::now() => Some(
+                known
+                    .names
+                    .iter()
+                    .flat_map(|n| n.iter().copied().chain(std::iter::once(0)))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
     /// Register a successful entry reply and return the generation to send.
     fn register(&self, parent: u64, name: Name, attr: &Attr) -> Result<Generation, Errno> {
+        self.xattr_remember(attr);
         self.nodes
             .lock()
             .insert_lookup(parent, name, attr.ino, attr.kind)
@@ -434,7 +492,9 @@ impl Filesystem for Backend {
     }
 
     fn forget(&self, _req: &Request, ino: INodeNo, nlookup: u64) {
-        self.shared.nodes.lock().forget(ino.0, nlookup);
+        if self.shared.nodes.lock().forget(ino.0, nlookup) {
+            self.shared.xattr_forget(ino.0);
+        }
     }
 
     fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
@@ -451,6 +511,7 @@ impl Filesystem for Backend {
             };
             match shared.client.getattr(path, fh).await {
                 Ok(attr) => {
+                    shared.xattr_remember(&attr);
                     reply.attr(&shared.attr_ttl, &file_attr(&attr));
                     Outcome::default()
                 }
@@ -501,6 +562,7 @@ impl Filesystem for Backend {
             };
             match shared.client.setattr(path, fh, set).await {
                 Ok(attr) => {
+                    shared.xattr_remember(&attr);
                     reply.attr(&shared.attr_ttl, &file_attr(&attr));
                     Outcome::default()
                 }
@@ -730,7 +792,8 @@ impl Filesystem for Backend {
                 Err(e) => return fail(reply, e),
             };
             match shared.client.open(ino.0, path, flags).await {
-                Ok((fh, _)) => {
+                Ok((fh, attr)) => {
+                    shared.xattr_remember(&attr);
                     reply.opened(FileHandle(fh), FopenFlags::empty());
                     Outcome::default()
                 }
@@ -1149,7 +1212,9 @@ impl Filesystem for Backend {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
             };
-            match shared.client.setxattr(path, name, value, flags).await {
+            let outcome = shared.client.setxattr(path, name, value, flags).await;
+            shared.xattr_forget(ino.0);
+            match outcome {
                 Ok(()) => {
                     reply.ok();
                     Outcome::default()
@@ -1167,6 +1232,9 @@ impl Filesystem for Backend {
             ..KeyPerf::of("getxattr", req, ino.0)
         };
         self.spawn(key, async move {
+            if shared.xattr_known_absent(ino.0, &name) {
+                return fail(reply, Errno::ENODATA);
+            }
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
@@ -1185,6 +1253,9 @@ impl Filesystem for Backend {
             ..KeyPerf::of("listxattr", req, ino.0)
         };
         self.spawn(key, async move {
+            if let Some(list) = shared.xattr_known_list(ino.0) {
+                return reply_xattr(reply, size, &list);
+            }
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
@@ -1204,7 +1275,9 @@ impl Filesystem for Backend {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
             };
-            match shared.client.removexattr(path, name).await {
+            let outcome = shared.client.removexattr(path, name).await;
+            shared.xattr_forget(ino.0);
+            match outcome {
                 Ok(()) => {
                     reply.ok();
                     Outcome::default()

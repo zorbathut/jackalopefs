@@ -134,21 +134,29 @@ fn notifier_loop(rx: Receiver<Work>, notifier: Notifier, shared: Arc<Shared>) {
     while let Ok(work) = rx.recv() {
         match work {
             Work::Entry(parent, name) => inval_entry(&notifier, parent, &name),
-            Work::Inode(ino) => inval_inode(&notifier, ino),
-            Work::Sweep => sweep(&notifier, &shared),
+            Work::Inode(ino) => {
+                shared.xattr_forget(ino);
+                inval_inode(&notifier, ino)
+            }
+            Work::Sweep => {
+                shared.xattr_clear();
+                sweep(&notifier, &shared)
+            }
         }
     }
 }
 
 fn inval_entry(notifier: &Notifier, parent: u64, name: &Name) {
-    if let Err(e) = notifier.inval_entry(INodeNo(parent), name.as_os_str()) {
-        tracing::debug!(parent, %name, "inval_entry: {e}");
+    match notifier.inval_entry(INodeNo(parent), name.as_os_str()) {
+        Ok(()) => tracing::trace!(parent, %name, "inval_entry"),
+        Err(e) => tracing::debug!(parent, %name, "inval_entry: {e}"),
     }
 }
 
 fn inval_inode(notifier: &Notifier, ino: u64) {
-    if let Err(e) = notifier.inval_inode(INodeNo(ino), 0, 0) {
-        tracing::debug!(ino, "inval_inode: {e}");
+    match notifier.inval_inode(INodeNo(ino), 0, 0) {
+        Ok(()) => tracing::trace!(ino, "inval_inode"),
+        Err(e) => tracing::debug!(ino, "inval_inode: {e}"),
     }
 }
 

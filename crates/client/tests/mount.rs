@@ -435,3 +435,161 @@ async fn perf_tables_see_the_kernel_requests() {
     assert!(snap.fuse["lookup"].n >= 1 && snap.fuse["open"].n >= 1);
     m.finish().await;
 }
+
+fn xattr_get(path: &Path, name: &str) -> Result<Vec<u8>, i32> {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let name = CString::new(name).unwrap();
+    let mut buf = vec![0u8; 256];
+    let got = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if got < 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap());
+    }
+    buf.truncate(got as usize);
+    Ok(buf)
+}
+
+fn xattr_list(path: &Path) -> Vec<u8> {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut buf = vec![0u8; 1024];
+    let got = unsafe {
+        libc::listxattr(
+            path.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+        )
+    };
+    assert!(got >= 0, "{}", std::io::Error::last_os_error());
+    buf.truncate(got as usize);
+    buf
+}
+
+fn xattr_set(path: &Path, name: &str, value: &[u8]) -> Result<(), i32> {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let name = CString::new(name).unwrap();
+    let rc = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+    }
+}
+
+/// The perf tables are the oracle: the `fuse` table counts what the kernel asked, the `call` table what went to the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn absent_xattrs_are_answered_from_the_listing() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(60)).await else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    for i in 0..40 {
+        fs::write(export.join(format!("d/f{i}")), b"").unwrap();
+    }
+    let mnt = m.mnt();
+    let export_dir = export.join("d");
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    let probes = perf.clone();
+    let entries = blocking(move || {
+        // List and stat every entry, as a file manager does; the stats make the kernel use readdirplus for every page.
+        let entries: Vec<PathBuf> = fs::read_dir(mnt.join("d"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        for entry in &entries {
+            fs::metadata(entry).unwrap();
+        }
+        probes.report();
+        for entry in &entries {
+            // The export's own names are the expectation: a host with SELinux or a default ACL gives every file some.
+            let expected = xattr_list(&export_dir.join(entry.file_name().unwrap()));
+            assert_eq!(xattr_list(entry), expected);
+            for acl in ["system.posix_acl_access", "system.posix_acl_default"] {
+                if !expected.split(|b| *b == 0).any(|n| n == acl.as_bytes()) {
+                    assert_eq!(xattr_get(entry, acl), Err(libc::ENODATA));
+                }
+            }
+        }
+        entries
+    })
+    .await;
+    let snap = perf.report();
+    assert!(
+        snap.fuse["getxattr"].n >= 80,
+        "{:?}",
+        snap.fuse.get("getxattr")
+    );
+    assert!(snap.fuse["listxattr"].n >= 40);
+    assert!(
+        !snap.call.contains_key("getxattr"),
+        "{:?}",
+        snap.call.get("getxattr")
+    );
+    assert!(
+        !snap.call.contains_key("listxattr"),
+        "{:?}",
+        snap.call.get("listxattr")
+    );
+
+    // A name set on the export directly reaches the mount through the data event, long before the 60 s TTL, and a present name is fetched, not answered locally.
+    if let Err(errno) = xattr_set(&export.join("d/f0"), "user.k", b"v") {
+        assert_eq!(errno, libc::EOPNOTSUPP, "unexpected errno {errno}");
+        eprintln!("skipping the present-name half: the export filesystem has no user xattrs");
+        m.finish().await;
+        return;
+    }
+    let f0 = entries.iter().find(|p| p.ends_with("f0")).unwrap().clone();
+    let (f0, list) = blocking(move || {
+        let started = Instant::now();
+        loop {
+            let list = xattr_list(&f0);
+            if !list.is_empty() || started.elapsed() > Duration::from_secs(5) {
+                return (f0, list);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    })
+    .await;
+    assert_eq!(list, b"user.k\0", "the event dropped the cached names");
+    perf.report();
+    let f0_again = f0.clone();
+    blocking(move || {
+        // A stat refills the names from a fresh attribute reply; the event only dropped them.
+        fs::metadata(&f0_again).unwrap();
+        assert_eq!(xattr_get(&f0_again, "user.k"), Ok(b"v".to_vec()));
+        assert_eq!(xattr_get(&f0_again, "user.other"), Err(libc::ENODATA));
+    })
+    .await;
+    let snap = perf.report();
+    assert!(
+        snap.call["getxattr"].row.n >= 1,
+        "a present name is fetched"
+    );
+    assert!(
+        snap.fuse["getxattr"].n > snap.call["getxattr"].row.n,
+        "an absent one is not"
+    );
+
+    // Setting a name through the mount makes the next fetch see it, whatever the cache said a moment ago.
+    blocking(move || {
+        assert_eq!(xattr_get(&f0, "user.mine"), Err(libc::ENODATA));
+        xattr_set(&f0, "user.mine", b"m").unwrap();
+        assert_eq!(xattr_get(&f0, "user.mine"), Ok(b"m".to_vec()));
+    })
+    .await;
+    m.finish().await;
+}

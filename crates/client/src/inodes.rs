@@ -106,17 +106,17 @@ impl NodeTable {
         }
     }
 
-    /// The kernel dropped `n` lookups; at zero the node is forgotten.
-    pub fn forget(&mut self, ino: u64, n: u64) {
+    /// The kernel dropped `n` lookups; at zero the node is forgotten, and the caller is told so.
+    pub fn forget(&mut self, ino: u64, n: u64) -> bool {
         if ino == ROOT {
-            return;
+            return false;
         }
         let Some(node) = self.nodes.get_mut(&ino) else {
-            return;
+            return false;
         };
         node.lookup_count = node.lookup_count.saturating_sub(n);
         if node.lookup_count > 0 {
-            return;
+            return false;
         }
         let node = self.nodes.remove(&ino).expect("present");
         for (parent, name) in node.aliases {
@@ -126,6 +126,7 @@ impl NodeTable {
                 }
             }
         }
+        true
     }
 
     /// Path to address `ino` on the wire, through its newest alias; `None` once it has no alias (unlinked, or replaced under every name we knew).
