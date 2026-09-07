@@ -3,6 +3,7 @@
 use crate::client::Client;
 use crate::fuse::{Backend, Shared};
 use crate::invalidate::Invalidator;
+use crate::perf::Perf;
 use anyhow::Context;
 use fuser::{BackgroundSession, MountOption, SessionACL};
 use std::path::Path;
@@ -75,6 +76,10 @@ impl Mount {
             invalidator: Some(invalidator),
             shared,
         })
+    }
+
+    pub fn perf(&self) -> &Arc<Perf> {
+        self.shared.client.perf()
     }
 
     /// Unmount, stop invalidating, and close the connection. Every step is bounded.

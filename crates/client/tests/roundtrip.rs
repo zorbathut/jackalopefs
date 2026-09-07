@@ -850,3 +850,102 @@ async fn client_refuses_a_foreign_revision() {
     );
     client.shutdown().await;
 }
+
+#[tokio::test]
+async fn perf_tables_count_what_was_done() {
+    let export = tempfile::tempdir().unwrap();
+    fs::write(export.path().join("f"), vec![7u8; 4096]).unwrap();
+    for i in 0..10 {
+        fs::write(export.path().join(format!("e{i}")), b"").unwrap();
+    }
+    let server = TestServer::start(export.path(), None).await;
+    let client = server.client().await;
+
+    let attr = client.lookup(Path::root(), name("f")).await.unwrap();
+    let (fh, _) = client
+        .open(attr.ino, path("f"), libc::O_RDONLY)
+        .await
+        .unwrap();
+    for _ in 0..5 {
+        assert_eq!(client.read(fh, 0, 1024).await.unwrap().len(), 1024);
+    }
+    let (dh, _) = client.opendir(1, Path::root()).await.unwrap();
+    let entries = client.readdir(dh, 0, 1 << 20).await.unwrap();
+    assert_eq!(entries.len(), 13, "10 entries, f, and the two dots");
+    assert_eq!(
+        client
+            .lookup(Path::root(), name("nope"))
+            .await
+            .unwrap_err()
+            .errno(),
+        libc::ENOENT
+    );
+
+    let snap = client.perf().report();
+    let read = &snap.call["read"];
+    assert_eq!(
+        (read.row.n, read.row.bytes, read.row.items),
+        (5, 5 * 1024, 0)
+    );
+    assert!(read.row.errnos.is_empty());
+    assert_eq!((read.retried, read.phased), (0, 5));
+    let phased = read.phases.wait + read.phases.open + read.phases.send + read.phases.reply;
+    assert!(
+        phased <= read.row.total,
+        "{phased:?} > {:?}",
+        read.row.total
+    );
+    assert!(read.phases.reply > Duration::ZERO);
+    assert!(read.row.max >= read.row.total / 5);
+    assert_eq!(snap.call["readdir"].row.items, 13);
+    assert_eq!(
+        snap.call["lookup"].row.errnos,
+        std::collections::BTreeMap::from([(libc::ENOENT, 1)])
+    );
+    assert!(snap.fuse.is_empty(), "no kernel was involved");
+    assert!(
+        client.perf().report().call.is_empty(),
+        "a report starts a new window"
+    );
+
+    let served = server.server.perf.report();
+    let read = &served.rows["read"];
+    assert_eq!((read.n, read.bytes), (5, 5 * 1024));
+    let phased = read.phases.read + read.phases.wait + read.phases.op + read.phases.send;
+    assert!(phased <= read.total, "{phased:?} > {:?}", read.total);
+    assert!(read.phases.op > Duration::ZERO);
+    assert_eq!(served.rows["readdir"].items, 13);
+    assert_eq!(
+        served.rows["lookup"].errnos,
+        std::collections::BTreeMap::from([(libc::ENOENT, 1)])
+    );
+    client.shutdown().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn perf_counts_a_timeout_by_its_errno() {
+    let blackhole = Blackhole::start().await;
+    let op_timeout = Duration::from_millis(500);
+    let client = jackalopefs_client::Client::connect(blackhole.config(op_timeout))
+        .await
+        .unwrap();
+    let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+
+    let snap = client.perf().report();
+    let row = &snap.call["getattr"];
+    assert_eq!(row.row.n, 1);
+    assert_eq!(
+        row.row.errnos,
+        std::collections::BTreeMap::from([(libc::ETIMEDOUT, 1)])
+    );
+    assert!(row.row.total >= op_timeout);
+    // The request was sent and never answered, so the deadline was spent waiting for the reply.
+    assert!(
+        row.phases.reply >= op_timeout / 2,
+        "reply phase {:?}",
+        row.phases.reply
+    );
+    client.shutdown().await;
+}

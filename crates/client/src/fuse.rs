@@ -2,6 +2,7 @@
 
 use crate::client::{Client, Error};
 use crate::inodes::{NodeTable, ROOT};
+use crate::perf::{Outcome, REQUEST_ID, TRACE_TARGET};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
     KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
@@ -15,7 +16,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Bytes of directory entries fetched from the server per request; the kernel asks for far less at a time, and the rest is served from the handle's buffer.
 const READDIR_FETCH: u32 = 256 * 1024;
@@ -44,6 +45,31 @@ pub struct Backend {
     runtime: tokio::runtime::Handle,
 }
 
+/// What identifies a kernel request in the trace line.
+struct KeyPerf {
+    op: &'static str,
+    unique: u64,
+    pid: u32,
+    ino: u64,
+    fh: Option<u64>,
+    offset: Option<u64>,
+    size: Option<u64>,
+}
+
+impl KeyPerf {
+    fn of(op: &'static str, req: &Request, ino: u64) -> KeyPerf {
+        KeyPerf {
+            op,
+            unique: req.unique().0,
+            pid: req.pid(),
+            ino,
+            fh: None,
+            offset: None,
+            size: None,
+        }
+    }
+}
+
 impl Backend {
     pub fn new(
         client: Arc<Client>,
@@ -67,9 +93,70 @@ impl Backend {
         )
     }
 
-    fn spawn<F: std::future::Future<Output = ()> + Send + 'static>(&self, f: F) {
-        self.runtime.spawn(f);
+    /// Answer one kernel request from a task, counting it as in flight until it is answered and recording what it took. The task's end is the moment the kernel has its answer: fuser replies with a synchronous `writev` to `/dev/fuse`, and every handler replies last.
+    fn spawn<F: std::future::Future<Output = Outcome> + Send + 'static>(&self, key: KeyPerf, f: F) {
+        let perf = self.shared.client.perf().clone();
+        let started = Instant::now();
+        self.runtime.spawn(async move {
+            let inflight = perf.start();
+            let outcome = REQUEST_ID.scope(key.unique, f).await;
+            let total = started.elapsed();
+            perf.record_fuse(key.op, &outcome, total);
+            if tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE) {
+                tracing::trace!(
+                    target: TRACE_TARGET,
+                    unique = key.unique,
+                    pid = key.pid,
+                    op = key.op,
+                    ino = key.ino,
+                    fh = key.fh,
+                    offset = key.offset,
+                    size = key.size,
+                    bytes = outcome.bytes,
+                    items = outcome.items,
+                    errno = outcome.errno,
+                    total_us = total.as_micros() as u64,
+                    inflight = perf.inflight(),
+                    "fuse"
+                );
+            }
+            drop(inflight);
+        });
     }
+}
+
+/// A reply that can carry an error, so one helper can both send it and report it as the request's outcome.
+trait ReplyError {
+    fn send_error(self, e: Errno);
+}
+
+macro_rules! reply_error {
+    ($($reply:ty),*) => {
+        $(impl ReplyError for $reply {
+            fn send_error(self, e: Errno) {
+                self.error(e)
+            }
+        })*
+    };
+}
+
+reply_error!(
+    ReplyAttr,
+    ReplyCreate,
+    ReplyData,
+    ReplyDirectory,
+    ReplyDirectoryPlus,
+    ReplyEmpty,
+    ReplyEntry,
+    ReplyOpen,
+    ReplyStatfs,
+    ReplyWrite,
+    ReplyXattr
+);
+
+fn fail<R: ReplyError>(reply: R, e: Errno) -> Outcome {
+    reply.send_error(e);
+    Outcome::errno(i32::from(e))
 }
 
 fn errno(e: &Error) -> Errno {
@@ -213,15 +300,18 @@ impl Shared {
     }
 
     /// Answer an entry-producing request: register the node and reply with its attributes and generation.
-    fn reply_entry(&self, reply: ReplyEntry, parent: u64, name: Name, attr: &Attr) {
+    fn reply_entry(&self, reply: ReplyEntry, parent: u64, name: Name, attr: &Attr) -> Outcome {
         match self.register(parent, name, attr) {
-            Ok(generation) => reply.entry_with_ttls(
-                &self.attr_ttl,
-                &self.entry_ttl,
-                &file_attr(attr),
-                generation,
-            ),
-            Err(e) => reply.error(e),
+            Ok(generation) => {
+                reply.entry_with_ttls(
+                    &self.attr_ttl,
+                    &self.entry_ttl,
+                    &file_attr(attr),
+                    generation,
+                );
+                Outcome::default()
+            }
+            Err(e) => fail(reply, e),
         }
     }
 
@@ -325,20 +415,20 @@ impl Filesystem for Backend {
         Ok(())
     }
 
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let shared = self.shared.clone();
         let name = match name_of(name) {
             Ok(name) => name,
             Err(e) => return reply.error(e),
         };
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("lookup", req, parent.0), async move {
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.lookup(path, name.clone()).await {
                 Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
@@ -347,17 +437,24 @@ impl Filesystem for Backend {
         self.shared.nodes.lock().forget(ino.0, nlookup);
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let shared = self.shared.clone();
         let fh = fh.map(|f| f.0);
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh,
+            ..KeyPerf::of("getattr", req, ino.0)
+        };
+        self.spawn(key, async move {
             let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.getattr(path, fh).await {
-                Ok(attr) => reply.attr(&shared.attr_ttl, &file_attr(&attr)),
-                Err(e) => reply.error(errno(&e)),
+                Ok(attr) => {
+                    reply.attr(&shared.attr_ttl, &file_attr(&attr));
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
@@ -365,7 +462,7 @@ impl Filesystem for Backend {
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -392,35 +489,46 @@ impl Filesystem for Backend {
             atime: atime.map(time_or_now),
             mtime: mtime.map(time_or_now),
         };
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh,
+            size,
+            ..KeyPerf::of("setattr", req, ino.0)
+        };
+        self.spawn(key, async move {
             let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.setattr(path, fh, set).await {
-                Ok(attr) => reply.attr(&shared.attr_ttl, &file_attr(&attr)),
-                Err(e) => reply.error(errno(&e)),
+                Ok(attr) => {
+                    reply.attr(&shared.attr_ttl, &file_attr(&attr));
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+    fn readlink(&self, req: &Request, ino: INodeNo, reply: ReplyData) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("readlink", req, ino.0), async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.readlink(path).await {
-                Ok(target) => reply.data(&target),
-                Err(e) => reply.error(errno(&e)),
+                Ok(target) => {
+                    reply.data(&target);
+                    Outcome::bytes(target.len())
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
     fn mknod(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -433,10 +541,10 @@ impl Filesystem for Backend {
             Ok(name) => name,
             Err(e) => return reply.error(e),
         };
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("mknod", req, parent.0), async move {
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared
                 .client
@@ -444,14 +552,14 @@ impl Filesystem for Backend {
                 .await
             {
                 Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -463,63 +571,65 @@ impl Filesystem for Backend {
             Ok(name) => name,
             Err(e) => return reply.error(e),
         };
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("mkdir", req, parent.0), async move {
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.mkdir(path, name.clone(), mode).await {
                 Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let shared = self.shared.clone();
         let name = match name_of(name) {
             Ok(name) => name,
             Err(e) => return reply.error(e),
         };
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("unlink", req, parent.0), async move {
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.unlink(path, name.clone()).await {
                 Ok(()) => {
                     shared.nodes.lock().unlink(parent.0, &name);
-                    reply.ok()
+                    reply.ok();
+                    Outcome::default()
                 }
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let shared = self.shared.clone();
         let name = match name_of(name) {
             Ok(name) => name,
             Err(e) => return reply.error(e),
         };
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("rmdir", req, parent.0), async move {
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.rmdir(path, name.clone()).await {
                 Ok(()) => {
                     shared.nodes.lock().unlink(parent.0, &name);
-                    reply.ok()
+                    reply.ok();
+                    Outcome::default()
                 }
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
     fn symlink(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
         target: &std::path::Path,
@@ -531,21 +641,21 @@ impl Filesystem for Backend {
             Err(e) => return reply.error(e),
         };
         let target = target.as_os_str().as_bytes().to_vec();
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("symlink", req, parent.0), async move {
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.symlink(path, name.clone(), target).await {
                 Ok(attr) => shared.reply_entry(reply, parent.0, name, &attr),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
     fn rename(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -560,10 +670,10 @@ impl Filesystem for Backend {
         };
         let exchange = flags.contains(fuser::RenameFlags::RENAME_EXCHANGE);
         let flags = flags.bits();
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("rename", req, parent.0), async move {
             let (path, newpath) = match (shared.path_of(parent.0), shared.path_of(newparent.0)) {
                 (Ok(a), Ok(b)) => (a, b),
-                (Err(e), _) | (_, Err(e)) => return reply.error(e),
+                (Err(e), _) | (_, Err(e)) => return fail(reply, e),
             };
             match shared
                 .client
@@ -578,16 +688,17 @@ impl Filesystem for Backend {
                         nodes.rename(parent.0, &name, newparent.0, newname);
                     }
                     drop(nodes);
-                    reply.ok()
+                    reply.ok();
+                    Outcome::default()
                 }
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
     fn link(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         newparent: INodeNo,
         newname: &OsStr,
@@ -598,36 +709,39 @@ impl Filesystem for Backend {
             Ok(name) => name,
             Err(e) => return reply.error(e),
         };
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("link", req, ino.0), async move {
             let (path, newpath) = match (shared.path_of(ino.0), shared.path_of(newparent.0)) {
                 (Ok(a), Ok(b)) => (a, b),
-                (Err(e), _) | (_, Err(e)) => return reply.error(e),
+                (Err(e), _) | (_, Err(e)) => return fail(reply, e),
             };
             match shared.client.link(path, newpath, newname.clone()).await {
                 Ok(attr) => shared.reply_entry(reply, newparent.0, newname, &attr),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
         let shared = self.shared.clone();
         let flags = flags.0;
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("open", req, ino.0), async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.open(ino.0, path, flags).await {
-                Ok((fh, _)) => reply.opened(FileHandle(fh), FopenFlags::empty()),
-                Err(e) => reply.error(errno(&e)),
+                Ok((fh, _)) => {
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -640,23 +754,26 @@ impl Filesystem for Backend {
             Ok(name) => name,
             Err(e) => return reply.error(e),
         };
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("create", req, parent.0), async move {
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.create(path, name.clone(), mode, flags).await {
                 Ok((fh, attr)) => match shared.register(parent.0, name, &attr) {
-                    Ok(generation) => reply.created(
-                        &shared.entry_ttl.min(shared.attr_ttl),
-                        &file_attr(&attr),
-                        generation,
-                        FileHandle(fh),
-                        FopenFlags::empty(),
-                    ),
-                    Err(e) => reply.error(e),
+                    Ok(generation) => {
+                        reply.created(
+                            &shared.entry_ttl.min(shared.attr_ttl),
+                            &file_attr(&attr),
+                            generation,
+                            FileHandle(fh),
+                            FopenFlags::empty(),
+                        );
+                        Outcome::default()
+                    }
+                    Err(e) => fail(reply, e),
                 },
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
@@ -664,8 +781,8 @@ impl Filesystem for Backend {
     #[allow(clippy::too_many_arguments)]
     fn read(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -674,10 +791,19 @@ impl Filesystem for Backend {
         reply: ReplyData,
     ) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            offset: Some(offset),
+            size: Some(size as u64),
+            ..KeyPerf::of("read", req, ino.0)
+        };
+        self.spawn(key, async move {
             match shared.client.read(fh.0, offset, size).await {
-                Ok(data) => reply.data(&data),
-                Err(e) => reply.error(errno(&e)),
+                Ok(data) => {
+                    reply.data(&data);
+                    Outcome::bytes(data.len())
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
@@ -685,8 +811,8 @@ impl Filesystem for Backend {
     #[allow(clippy::too_many_arguments)]
     fn write(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -697,15 +823,24 @@ impl Filesystem for Backend {
     ) {
         let shared = self.shared.clone();
         let data = data.to_vec();
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            offset: Some(offset),
+            size: Some(data.len() as u64),
+            ..KeyPerf::of("write", req, ino.0)
+        };
+        self.spawn(key, async move {
             match shared.client.write(fh.0, offset, data).await {
-                Ok(n) => reply.written(n),
-                Err(e) => reply.error(errno(&e)),
+                Ok(n) => {
+                    reply.written(n);
+                    Outcome::bytes(n as usize)
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    /// Nothing is buffered on the client, so a `close(2)` has nothing to flush.
+    /// Nothing is buffered on the client, so a `close(2)` has nothing to flush; the request still counts, so the op mix shows every close.
     fn flush(
         &self,
         _req: &Request,
@@ -714,13 +849,18 @@ impl Filesystem for Backend {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
+        let started = Instant::now();
         reply.ok();
+        self.shared
+            .client
+            .perf()
+            .record_fuse("flush", &Outcome::default(), started.elapsed());
     }
 
     fn release(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
@@ -728,12 +868,19 @@ impl Filesystem for Backend {
         reply: ReplyEmpty,
     ) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            ..KeyPerf::of("release", req, ino.0)
+        };
+        self.spawn(key, async move {
             match shared.client.release(fh.0).await {
-                Ok(()) => reply.ok(),
+                Ok(()) => {
+                    reply.ok();
+                    Outcome::default()
+                }
                 Err(e) => {
                     tracing::debug!(fh = fh.0, "release failed: {e}");
-                    reply.error(errno(&e))
+                    fail(reply, errno(&e))
                 }
             }
         });
@@ -741,52 +888,66 @@ impl Filesystem for Backend {
 
     fn fsync(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            ..KeyPerf::of("fsync", req, ino.0)
+        };
+        self.spawn(key, async move {
             match shared.client.fsync(fh.0, datasync).await {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Ok(()) => {
+                    reply.ok();
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
+    fn opendir(&self, req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("opendir", req, ino.0), async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.opendir(ino.0, path).await {
                 Ok((fh, _)) => {
                     shared.dirs.lock().insert(fh, DirBuffer::default());
-                    reply.opened(FileHandle(fh), FopenFlags::empty())
+                    reply.opened(FileHandle(fh), FopenFlags::empty());
+                    Outcome::default()
                 }
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
     fn readdir(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            offset: Some(offset),
+            ..KeyPerf::of("readdir", req, ino.0)
+        };
+        self.spawn(key, async move {
             let mut entries = match shared.dir_page(fh.0, offset).await {
                 Ok(entries) => entries.into_iter(),
-                Err(e) => return reply.error(errno(&e)),
+                Err(e) => return fail(reply, errno(&e)),
             };
+            let mut added = 0;
             for (cookie, entry) in entries.by_ref() {
                 let entry_ino = match entry.name.as_slice() {
                     b"." => ino.0,
@@ -804,25 +965,33 @@ impl Filesystem for Backend {
                     shared.stash_plain(fh.0, rest);
                     break;
                 }
+                added += 1;
             }
             reply.ok();
+            Outcome::items(added)
         });
     }
 
     fn readdirplus(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            offset: Some(offset),
+            ..KeyPerf::of("readdirplus", req, ino.0)
+        };
+        self.spawn(key, async move {
             let mut entries = match shared.dir_page_plus(fh.0, offset).await {
                 Ok(entries) => entries.into_iter(),
-                Err(e) => return reply.error(errno(&e)),
+                Err(e) => return fail(reply, errno(&e)),
             };
+            let mut added = 0;
             for (cookie, item) in entries.by_ref() {
                 let entry = &item.entry;
                 let name = OsStr::from_bytes(&entry.name);
@@ -875,62 +1044,81 @@ impl Filesystem for Backend {
                     shared.stash_plus(fh.0, rest);
                     break;
                 }
+                added += 1;
             }
             reply.ok();
+            Outcome::items(added)
         });
     }
 
     fn fsyncdir(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            ..KeyPerf::of("fsyncdir", req, ino.0)
+        };
+        self.spawn(key, async move {
             match shared.client.fsync(fh.0, datasync).await {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Ok(()) => {
+                    reply.ok();
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
     fn releasedir(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         _flags: fuser::OpenFlags,
         reply: ReplyEmpty,
     ) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            ..KeyPerf::of("releasedir", req, ino.0)
+        };
+        self.spawn(key, async move {
             shared.dirs.lock().remove(&fh.0);
             match shared.client.releasedir(fh.0).await {
-                Ok(()) => reply.ok(),
+                Ok(()) => {
+                    reply.ok();
+                    Outcome::default()
+                }
                 Err(e) => {
                     tracing::debug!(fh = fh.0, "releasedir failed: {e}");
-                    reply.error(errno(&e))
+                    fail(reply, errno(&e))
                 }
             }
         });
     }
 
-    fn statfs(&self, _req: &Request, ino: INodeNo, reply: ReplyStatfs) {
+    fn statfs(&self, req: &Request, ino: INodeNo, reply: ReplyStatfs) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("statfs", req, ino.0), async move {
             let path = shared
                 .nodes
                 .lock()
                 .path_of(ino.0)
                 .unwrap_or_else(Path::root);
             match shared.client.statfs(path).await {
-                Ok(s) => reply.statfs(
-                    s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, s.frsize,
-                ),
-                Err(e) => reply.error(errno(&e)),
+                Ok(s) => {
+                    reply.statfs(
+                        s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.namelen, s.frsize,
+                    );
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
@@ -938,7 +1126,7 @@ impl Filesystem for Backend {
     #[allow(clippy::too_many_arguments)]
     fn setxattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         name: &OsStr,
         value: &[u8],
@@ -952,86 +1140,109 @@ impl Filesystem for Backend {
         let shared = self.shared.clone();
         let name = name.as_bytes().to_vec();
         let value = value.to_vec();
-        self.spawn(async move {
+        let key = KeyPerf {
+            size: Some(value.len() as u64),
+            ..KeyPerf::of("setxattr", req, ino.0)
+        };
+        self.spawn(key, async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.setxattr(path, name, value, flags).await {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Ok(()) => {
+                    reply.ok();
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+    fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let shared = self.shared.clone();
         let name = name.as_bytes().to_vec();
-        self.spawn(async move {
+        let key = KeyPerf {
+            size: Some(size as u64),
+            ..KeyPerf::of("getxattr", req, ino.0)
+        };
+        self.spawn(key, async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.getxattr(path, name).await {
                 Ok(value) => reply_xattr(reply, size, &value),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+    fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         let shared = self.shared.clone();
-        self.spawn(async move {
+        let key = KeyPerf {
+            size: Some(size as u64),
+            ..KeyPerf::of("listxattr", req, ino.0)
+        };
+        self.spawn(key, async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.listxattr(path).await {
                 Ok(list) => reply_xattr(reply, size, &list),
-                Err(e) => reply.error(errno(&e)),
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         let shared = self.shared.clone();
         let name = name.as_bytes().to_vec();
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("removexattr", req, ino.0), async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.removexattr(path, name).await {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Ok(()) => {
+                    reply.ok();
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 
-    fn access(&self, _req: &Request, ino: INodeNo, mask: fuser::AccessFlags, reply: ReplyEmpty) {
+    fn access(&self, req: &Request, ino: INodeNo, mask: fuser::AccessFlags, reply: ReplyEmpty) {
         let shared = self.shared.clone();
         let mask = mask.bits();
-        self.spawn(async move {
+        self.spawn(KeyPerf::of("access", req, ino.0), async move {
             let path = match shared.path_of(ino.0) {
                 Ok(path) => path,
-                Err(e) => return reply.error(e),
+                Err(e) => return fail(reply, e),
             };
             match shared.client.access(path, mask).await {
-                Ok(()) => reply.ok(),
-                Err(e) => reply.error(errno(&e)),
+                Ok(()) => {
+                    reply.ok();
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
             }
         });
     }
 }
 
 /// The xattr size protocol: a zero `size` asks how big the value is; otherwise the value must fit.
-fn reply_xattr(reply: ReplyXattr, size: u32, value: &[u8]) {
+fn reply_xattr(reply: ReplyXattr, size: u32, value: &[u8]) -> Outcome {
     if size == 0 {
         reply.size(value.len() as u32);
+        Outcome::default()
     } else if value.len() > size as usize {
-        reply.error(Errno::ERANGE);
+        fail(reply, Errno::ERANGE)
     } else {
         reply.data(value);
+        Outcome::bytes(value.len())
     }
 }
 

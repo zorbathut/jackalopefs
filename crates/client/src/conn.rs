@@ -1,6 +1,6 @@
 //! The connection manager: one background task that owns the QUIC connection, reconnects with backoff when it drops, resumes (or reopens) the handle table, and forwards the server's event stream.
 
-use crate::client::{exchange, Error};
+use crate::client::{exchange, Error, Timing};
 use crate::handles::{HandleKind, HandleTable};
 use crate::transport::{client_config, ServerTrust};
 use jackalopefs_proto::{
@@ -433,7 +433,11 @@ async fn reopen_handles(conn: &Connection, handles: &HandleTable, op_timeout: Du
     for (fh, rec) in live {
         let conn = conn.clone();
         reopens.spawn(async move {
-            let outcome = match timeout(op_timeout, exchange(&conn, &rec.reopen_request(fh))).await
+            let outcome = match timeout(
+                op_timeout,
+                exchange(&conn, &rec.reopen_request(fh), &mut Timing::default()),
+            )
+            .await
             {
                 Ok(result) => result.map_err(Error::from),
                 Err(_) => Err(Error::Timeout),
@@ -453,7 +457,12 @@ async fn reopen_handles(conn: &Connection, handles: &HandleTable, op_timeout: Du
                         HandleKind::Dir => jackalopefs_proto::Request::Releasedir { fh },
                     };
                     releases.spawn(async move {
-                        match timeout(op_timeout, exchange(&conn, &release)).await {
+                        match timeout(
+                            op_timeout,
+                            exchange(&conn, &release, &mut Timing::default()),
+                        )
+                        .await
+                        {
                             Ok(Ok(_)) => {}
                             Ok(Err(e)) => {
                                 tracing::debug!(fh, "releasing a stale handle failed: {e:?}")

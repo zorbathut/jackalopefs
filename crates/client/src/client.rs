@@ -2,6 +2,7 @@
 
 use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::{HandleKind, HandleRec, HandleTable};
+use crate::perf::{current_request, AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_proto::{
     read_frame, write_frame, Attr, Auth, DirEntry, DirEntryPlus, ErrorCodec, Event, Name, Path,
@@ -83,12 +84,45 @@ impl Drop for Streams {
     }
 }
 
+/// When each step of an exchange completed; a step that never completed leaves its instant unset.
+#[derive(Default)]
+pub(crate) struct Timing {
+    pub opened: Option<Instant>,
+    pub sent: Option<Instant>,
+    pub replied: Option<Instant>,
+}
+
+impl Timing {
+    /// The phases of one attempt that began at `started`; a phase still in progress is charged up to now, so a timeout shows where it was spent.
+    fn phases(&self, started: Instant) -> Phases {
+        let now = Instant::now();
+        let mut phases = Phases::default();
+        let opened = self.opened.unwrap_or(now);
+        phases.open = opened - started;
+        let Some(opened) = self.opened else {
+            return phases;
+        };
+        let sent = self.sent.unwrap_or(now);
+        phases.send = sent - opened;
+        let Some(sent) = self.sent else {
+            return phases;
+        };
+        phases.reply = self.replied.unwrap_or(now) - sent;
+        phases
+    }
+}
+
 /// One request on one fresh bidi stream.
-pub(crate) async fn exchange(conn: &Connection, req: &Request) -> Result<Response, ErrorExchange> {
+pub(crate) async fn exchange(
+    conn: &Connection,
+    req: &Request,
+    timing: &mut Timing,
+) -> Result<Response, ErrorExchange> {
     let (send, recv) = conn.open_bi().await.map_err(|e| {
         tracing::debug!("cannot open request stream: {e}");
         ErrorExchange::NotSent
     })?;
+    timing.opened = Some(Instant::now());
     let mut streams = Streams {
         send,
         recv,
@@ -98,11 +132,25 @@ pub(crate) async fn exchange(conn: &Connection, req: &Request) -> Result<Respons
         .await
         .map_err(|e| codec_error(e, ErrorExchange::NotSent))?;
     streams.send.finish().map_err(|_| ErrorExchange::Lost)?;
+    timing.sent = Some(Instant::now());
     let resp: Response = read_frame(&mut streams.recv)
         .await
         .map_err(|e| codec_error(e, ErrorExchange::Lost))?;
+    timing.replied = Some(Instant::now());
     streams.done = true;
     Ok(resp)
+}
+
+/// What a call moved, or how it failed.
+fn outcome_of(result: &Result<Response, Error>) -> Outcome {
+    match result {
+        Ok(Response::Read(data)) => Outcome::bytes(data.len()),
+        Ok(Response::Written(n)) => Outcome::bytes(*n as usize),
+        Ok(Response::Readdir(entries)) => Outcome::items(entries.len()),
+        Ok(Response::ReaddirPlus(entries)) => Outcome::items(entries.len()),
+        Ok(_) => Outcome::default(),
+        Err(e) => Outcome::errno(e.errno()),
+    }
 }
 
 fn codec_error(e: ErrorCodec, on_io: ErrorExchange) -> ErrorExchange {
@@ -152,6 +200,7 @@ fn retry_safe(req: &Request, handle: Option<&HandleRec>) -> bool {
 struct Caller {
     state: watch::Receiver<ConnState>,
     handles: Arc<HandleTable>,
+    perf: Arc<Perf>,
     op_timeout: Duration,
 }
 
@@ -179,7 +228,41 @@ impl Caller {
         }
     }
 
+    /// Send one request and account for it: the outcome and phase times go to the table, and one trace line per call to [`TRACE_TARGET`].
     async fn call(&self, req: Request) -> Result<Response, Error> {
+        let started = Instant::now();
+        let mut account = AccountCall::default();
+        let result = self.attempt(&req, &mut account).await;
+        let total = started.elapsed();
+        let outcome = outcome_of(&result);
+        let op = req.op_name();
+        self.perf.record_call(op, &outcome, total, &account);
+        if tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE) {
+            let (fh, offset, size) = req.perf_fields();
+            tracing::trace!(
+                target: TRACE_TARGET,
+                unique = current_request(),
+                op,
+                fh,
+                offset,
+                size,
+                bytes = outcome.bytes,
+                items = outcome.items,
+                errno = outcome.errno,
+                retries = account.retries,
+                wait_us = account.phases.wait.as_micros() as u64,
+                open_us = account.phases.open.as_micros() as u64,
+                send_us = account.phases.send.as_micros() as u64,
+                reply_us = account.phases.reply.as_micros() as u64,
+                total_us = total.as_micros() as u64,
+                "call"
+            );
+        }
+        result
+    }
+
+    /// The exchange and its retries; every attempt's phases are added to `account`.
+    async fn attempt(&self, req: &Request, account: &mut AccountCall) -> Result<Response, Error> {
         let deadline = Instant::now() + self.op_timeout;
         let handle = req.fh().and_then(|fh| self.handles.get(fh));
         let mut min_generation = 0;
@@ -188,15 +271,22 @@ impl Caller {
             if handle.as_ref().is_some_and(|h| h.is_dead()) {
                 return Err(Error::Stale);
             }
-            let attached = self.wait_connected(deadline, min_generation).await?;
-            match timeout_at(deadline, exchange(&attached.conn, &req)).await {
+            let waiting = Instant::now();
+            let attached = self.wait_connected(deadline, min_generation).await;
+            account.phases.wait += waiting.elapsed();
+            let attached = attached?;
+            let mut timing = Timing::default();
+            let attempt = Instant::now();
+            let exchanged = timeout_at(deadline, exchange(&attached.conn, req, &mut timing)).await;
+            account.phases += timing.phases(attempt);
+            match exchanged {
                 Ok(Ok(Response::Err(errno))) => return Err(Error::Remote(errno)),
                 Ok(Ok(resp)) => return Ok(resp),
                 Ok(Err(ErrorExchange::NotSent)) => {
                     min_generation = attached.generation + 1;
                 }
                 Ok(Err(ErrorExchange::Lost)) => {
-                    if lost_once || !retry_safe(&req, handle.as_deref()) {
+                    if lost_once || !retry_safe(req, handle.as_deref()) {
                         return Err(Error::Disconnected);
                     }
                     tracing::debug!(
@@ -209,6 +299,7 @@ impl Caller {
                 Ok(Err(ErrorExchange::Protocol(msg))) => return Err(Error::Protocol(msg)),
                 Err(_) => return Err(Error::Timeout),
             }
+            account.retries += 1;
         }
     }
 
@@ -243,6 +334,7 @@ impl Client {
     /// Connect and complete the hello; fails if the first attempt does, so a bad address, fingerprint or token is reported immediately.
     pub async fn connect(cfg: Config) -> anyhow::Result<Client> {
         let handles = Arc::new(HandleTable::default());
+        let perf = Arc::new(Perf::default());
         let conn = ConnManager::start(
             ConfigConn {
                 server_addrs: cfg.server_addrs,
@@ -259,6 +351,7 @@ impl Client {
             caller: Caller {
                 state: conn.state.clone(),
                 handles,
+                perf,
                 op_timeout: cfg.op_timeout,
             },
             conn,
@@ -267,6 +360,18 @@ impl Client {
 
     pub fn state(&self) -> watch::Receiver<ConnState> {
         self.conn.state.clone()
+    }
+
+    pub fn perf(&self) -> &Arc<Perf> {
+        &self.caller.perf
+    }
+
+    /// The current connection's generation and QUIC statistics, if there is one; the counters are cumulative since that connection was made.
+    pub fn conn_stats(&self) -> Option<(u64, quinn::ConnectionStats)> {
+        match &*self.conn.state.borrow() {
+            ConnState::Connected(attached) => Some((attached.generation, attached.conn.stats())),
+            _ => None,
+        }
     }
 
     pub fn take_events(&mut self) -> Option<mpsc::Receiver<Event>> {

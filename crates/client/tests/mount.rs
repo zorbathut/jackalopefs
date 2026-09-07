@@ -400,3 +400,38 @@ async fn server_vanishing_times_out_and_unmounts_cleanly() {
     assert!(elapsed < Duration::from_secs(3), "blocked for {elapsed:?}");
     m.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn perf_tables_see_the_kernel_requests() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let size = 1 << 20;
+    fs::write(m.export.path().join("f"), vec![1u8; size]).unwrap();
+    let mnt = m.mnt();
+    let data = blocking(move || fs::read(mnt.join("f"))).await.unwrap();
+    assert_eq!(data.len(), size);
+
+    // The release that follows the close is answered a moment after `fs::read` returns.
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
+    })
+    .await;
+    let snap = perf.report();
+    assert!(snap.peak >= 1);
+    // The kernel decides how many reads it issues and how big, so only what they add up to is fixed.
+    let read = &snap.fuse["read"];
+    assert!(read.n >= 1);
+    assert!(read.bytes >= size as u64, "fuse read bytes {}", read.bytes);
+    assert!(read.errnos.is_empty());
+    let call = &snap.call["read"];
+    assert!(call.row.n >= 1 && call.row.n <= read.n);
+    assert!(
+        call.row.bytes >= size as u64,
+        "call read bytes {}",
+        call.row.bytes
+    );
+    assert!(snap.fuse["lookup"].n >= 1 && snap.fuse["open"].n >= 1);
+    m.finish().await;
+}
