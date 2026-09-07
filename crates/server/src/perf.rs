@@ -69,6 +69,8 @@ pub struct Row {
     pub bytes: u64,
     pub items: u64,
     pub total: Duration,
+    /// The fastest request in the window; against `mean` it shows how much of the latency is queueing.
+    pub min: Duration,
     pub max: Duration,
     /// Failures by the errno sent to the client.
     pub errnos: BTreeMap<i32, u64>,
@@ -81,6 +83,11 @@ impl Row {
         self.bytes += outcome.bytes;
         self.items += outcome.items;
         self.total += total;
+        self.min = if self.n == 1 {
+            total
+        } else {
+            self.min.min(total)
+        };
         self.max = self.max.max(total);
         self.phases += phases;
         if outcome.errno != 0 {
@@ -203,8 +210,9 @@ impl Perf {
             }
             tracing::info!(
                 target: TRACE_TARGET,
-                "perf {op}: n={} conc={conc:.2} mean={} max={} bytes={} items={}{}{} read={} wait={} op={} send={}",
+                "perf {op}: n={} conc={conc:.2} min={} mean={} max={} bytes={} items={}{}{} read={} wait={} op={} send={}",
                 row.n,
+                fmt_duration(row.min),
                 fmt_duration(row.mean(row.total)),
                 fmt_duration(row.max),
                 fmt_bytes(row.bytes),
@@ -251,7 +259,7 @@ mod tests {
         let read = &snap.rows["read"];
         assert_eq!((read.n, read.bytes, read.items), (2, 150, 0));
         assert_eq!(read.total, ms(40));
-        assert_eq!(read.max, ms(30));
+        assert_eq!((read.min, read.max), (ms(10), ms(30)));
         assert_eq!(read.mean(read.total), ms(20));
         assert_eq!(read.phases.op, ms(6));
         assert_eq!(read.mean(read.phases.send), ms(4));
