@@ -8,6 +8,7 @@ use jackalopefs_server::export::Export;
 use jackalopefs_server::session::{self, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch, WatcherHandle};
+use jackalopefs_server::Limits;
 use parking_lot::Mutex;
 use quinn::{Connection, Endpoint, EndpointConfig, TokioRuntime};
 use std::net::{SocketAddr, UdpSocket};
@@ -87,7 +88,10 @@ impl TestServer {
             token,
             events.clone(),
             changes,
-            64,
+            Limits {
+                connections: 64,
+                handles_per_session: jackalopefs_server::handles::MAX_HANDLES,
+            },
         ));
         let task = tokio::spawn(session::serve(endpoint.clone(), server.clone()));
         TestServer {

@@ -597,7 +597,7 @@ mod tests {
             dir,
             Ops {
                 export,
-                handles: Arc::new(Handles::default()),
+                handles: Arc::new(Handles::new(crate::handles::MAX_HANDLES)),
                 session_id: 1,
                 changes: Arc::new(ChangeLog::default()),
             },
@@ -1262,5 +1262,25 @@ mod tests {
             Response::Err(Errno::EPERM as i32)
         );
         assert!(!dir.path().join("dev").exists());
+    }
+
+    #[test]
+    fn a_session_past_its_handle_cap_cannot_open() {
+        let (dir, mut ops) = fixture();
+        ops.handles = Arc::new(Handles::new(1));
+        fs::write(dir.path().join("f"), b"").unwrap();
+        let open = |fh| Request::Open {
+            fh,
+            path: path("f"),
+            flags: libc::O_RDONLY,
+        };
+        assert!(matches!(dispatch(&ops, open(1)), Response::Opened { .. }));
+        assert_eq!(dispatch(&ops, open(2)), Response::Err(Errno::EMFILE as i32));
+        assert!(
+            matches!(dispatch(&ops, open(1)), Response::Opened { .. }),
+            "replacing an existing id is still allowed"
+        );
+        assert_eq!(dispatch(&ops, Request::Release { fh: 1 }), Response::Ok);
+        assert!(matches!(dispatch(&ops, open(2)), Response::Opened { .. }));
     }
 }

@@ -32,6 +32,12 @@ const MAX_REQUEST_STREAMS: u32 = 1024;
 /// Simultaneous client connections; beyond this new connections are refused.
 pub const MAX_CONNECTIONS: usize = 64;
 
+/// What one server admits.
+pub struct Limits {
+    pub connections: usize,
+    pub handles_per_session: usize,
+}
+
 /// QUIC transport parameters for the server side of a jackalopefs connection.
 pub fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();

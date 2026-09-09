@@ -19,24 +19,44 @@ pub enum Handle {
     Dir(Arc<Mutex<OwnedFd>>),
 }
 
-/// Open handles one session may hold; a client's own kernel keeps honest clients far below this, so hitting it means a leak or an attack, and the answer is `EMFILE`.
+/// Most open handles one session may hold, however many file descriptors the server has; a client's own kernel keeps honest clients far below this, so hitting it means a leak or an attack, and the answer is `EMFILE`. The cap a server applies is derived from its file descriptor limit at startup ([`per_session`]).
 pub const MAX_HANDLES: usize = 16384;
 
-#[derive(Default)]
+/// File descriptors kept out of the handle caps for the server's own use: the endpoint, epoll, inotify and logs, and up to three transient fds for each of tokio's 512 default blocking threads. A limit too small to spare that many keeps half for the server.
+const RESERVED_FDS: u64 = 2048;
+
+/// Open handles one session may hold under an open-file limit of `limit`: what is left after [`RESERVED_FDS`], shared evenly among every session that can hold handles at once ([`MAX_CONNECTIONS`](crate::MAX_CONNECTIONS) attached plus [`MAX_DETACHED_SESSIONS`](crate::session::MAX_DETACHED_SESSIONS) waiting out their grace), at most [`MAX_HANDLES`]. Zero means the limit leaves no room for client handles at all.
+pub fn per_session(limit: u64) -> usize {
+    let reserved = RESERVED_FDS.min(limit / 2);
+    let sessions = (crate::MAX_CONNECTIONS + crate::session::MAX_DETACHED_SESSIONS) as u64;
+    let share = (limit - reserved) / sessions;
+    usize::try_from(share)
+        .unwrap_or(usize::MAX)
+        .min(MAX_HANDLES)
+}
+
 pub struct Handles {
     map: Mutex<HashMap<u64, Handle>>,
+    max: usize,
 }
 
 impl Handles {
+    pub fn new(max: usize) -> Handles {
+        Handles {
+            map: Mutex::new(HashMap::new()),
+            max,
+        }
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
     /// Register `handle` under `fh`; an existing entry (a retried open whose reply was lost) is replaced and closed.
     pub fn insert(&self, fh: u64, handle: Handle) -> Result<(), Errno> {
         let mut map = self.map.lock();
-        if map.len() >= MAX_HANDLES && !map.contains_key(&fh) {
-            tracing::warn!(
-                fh,
-                limit = MAX_HANDLES,
-                "session holds too many open handles"
-            );
+        if map.len() >= self.max && !map.contains_key(&fh) {
+            tracing::warn!(fh, limit = self.max, "session holds too many open handles");
             return Err(Errno::EMFILE);
         }
         if map.insert(fh, handle).is_some() {
@@ -84,22 +104,40 @@ impl Handles {
 mod tests {
     use super::*;
 
-    /// One file, shared by every handle, so the cap is tested without holding thousands of descriptors.
     #[test]
     fn table_is_capped() {
-        let handles = Handles::default();
+        let handles = Handles::new(2);
         let file = Arc::new(File::open("/dev/null").unwrap());
         let handle = || Handle::File {
             file: file.clone(),
             path: Path::root(),
         };
-        for fh in 1..=MAX_HANDLES as u64 {
-            handles.insert(fh, handle()).unwrap();
-        }
-        assert_eq!(handles.insert(u64::MAX, handle()), Err(Errno::EMFILE));
+        handles.insert(1, handle()).unwrap();
+        handles.insert(2, handle()).unwrap();
+        assert_eq!(handles.insert(3, handle()), Err(Errno::EMFILE));
+        assert_eq!(handles.len(), 2);
         handles.insert(1, handle()).unwrap();
         assert!(handles.remove(2).is_some());
-        handles.insert(u64::MAX, handle()).unwrap();
-        assert_eq!(handles.len(), MAX_HANDLES);
+        handles.insert(3, handle()).unwrap();
+        assert_eq!(handles.len(), 2);
+    }
+
+    #[test]
+    fn per_session_leaves_the_reserve_and_shares_the_rest() {
+        let sessions = (crate::MAX_CONNECTIONS + crate::session::MAX_DETACHED_SESSIONS) as u64;
+        assert_eq!(per_session(0), 0);
+        assert_eq!(
+            per_session(sessions),
+            0,
+            "half of a tiny limit is the reserve"
+        );
+        assert_eq!(per_session(2 * sessions), 1);
+        assert_eq!(per_session(1024), (512 / sessions) as usize);
+        assert_eq!(
+            per_session(524288),
+            ((524288 - RESERVED_FDS) / sessions) as usize
+        );
+        assert!(per_session(524288) < MAX_HANDLES);
+        assert_eq!(per_session(u64::MAX), MAX_HANDLES);
     }
 }

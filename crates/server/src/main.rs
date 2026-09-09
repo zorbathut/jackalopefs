@@ -4,7 +4,7 @@ use jackalopefs_server::export::Export;
 use jackalopefs_server::session::{self, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch};
-use jackalopefs_server::{transport_config, MAX_CONNECTIONS};
+use jackalopefs_server::{handles, transport_config, Limits, MAX_CONNECTIONS};
 use nix::sys::resource::{getrlimit, setrlimit, Resource, RLIM_INFINITY};
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -71,21 +71,26 @@ async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
     }
 }
 
-/// Raise the soft open-file limit to the hard one: every file a client holds open is a descriptor here, and the default soft limit of 1024 is a few hundred open files away from failing every request that opens anything.
-fn raise_open_file_limit() -> anyhow::Result<()> {
+/// Raise the soft open-file limit to the hard one, and return the soft and hard limits in force: every file a client holds open is a descriptor here, and the default soft limit of 1024 is a few hundred open files away from failing every request that opens anything.
+fn raise_open_file_limit() -> anyhow::Result<(u64, u64)> {
     let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).context("reading the open file limit")?;
     if soft >= hard {
         tracing::info!("open file limit {}", limit_text(soft));
-        return Ok(());
+        return Ok((soft, hard));
     }
     match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
-        Ok(()) => tracing::info!("open file limit {} (raised from {soft})", limit_text(hard)),
-        Err(e) => tracing::warn!(
-            "open file limit {soft}; raising it to {} failed: {e}",
-            limit_text(hard)
-        ),
+        Ok(()) => {
+            tracing::info!("open file limit {} (raised from {soft})", limit_text(hard));
+            Ok((hard, hard))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "open file limit {soft}; raising it to {} failed: {e}",
+                limit_text(hard)
+            );
+            Ok((soft, hard))
+        }
     }
-    Ok(())
 }
 
 fn limit_text(limit: u64) -> String {
@@ -117,7 +122,21 @@ fn main() -> anyhow::Result<()> {
     // The client kernel already applied the caller's umask to every mode it sends; applying ours too would mask modes twice.
     nix::sys::stat::umask(nix::sys::stat::Mode::empty());
 
-    raise_open_file_limit()?;
+    let (open_files, hard) = raise_open_file_limit()?;
+    let limits = Limits {
+        connections: MAX_CONNECTIONS,
+        handles_per_session: handles::per_session(open_files),
+    };
+    if limits.handles_per_session == 0 {
+        if open_files < hard {
+            anyhow::bail!("open file limit {open_files} leaves no room for client handles; raise it with ulimit -n, up to the hard limit of {}", limit_text(hard));
+        }
+        anyhow::bail!("open file limit {open_files} leaves no room for client handles; raise the hard limit (LimitNOFILE= under systemd, ulimit -Hn as root)");
+    }
+    tracing::info!(
+        "up to {} open handles per session",
+        limits.handles_per_session
+    );
 
     let state_dir = match args.state_dir {
         Some(dir) => dir,
@@ -142,13 +161,7 @@ fn main() -> anyhow::Result<()> {
         let (events, _) = broadcast::channel::<Arc<EventBatch>>(256);
         let changes = Arc::new(ChangeLog::default());
         let _watcher = watch::spawn(&args.export, changes.clone(), events.clone());
-        let server = Arc::new(Server::new(
-            export,
-            args.token,
-            events,
-            changes,
-            MAX_CONNECTIONS,
-        ));
+        let server = Arc::new(Server::new(export, args.token, events, changes, limits));
 
         let closer = {
             let endpoint = endpoint.clone();

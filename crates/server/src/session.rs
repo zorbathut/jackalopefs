@@ -5,7 +5,7 @@ use crate::handles::Handles;
 use crate::ops::{self, Ops};
 use crate::perf::{Outcome, Perf, Phases, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch};
-use crate::SESSION_GRACE;
+use crate::{Limits, SESSION_GRACE};
 use jackalopefs_perf::{
     line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, SampleLink, TrackerQuic,
 };
@@ -62,20 +62,28 @@ struct Attachment {
     detached_at: Option<Instant>,
 }
 
-#[derive(Default)]
 pub struct Sessions {
     map: Mutex<HashMap<u64, Arc<SessionState>>>,
     next_id: AtomicU64,
+    max_handles: usize,
 }
 
 impl Sessions {
+    pub fn new(max_handles: usize) -> Sessions {
+        Sessions {
+            map: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+            max_handles,
+        }
+    }
+
     /// A brand-new session, attached to the caller. Makes room by dropping the longest-detached session when too many are waiting for a resume that may never come.
     pub fn create(&self) -> (Arc<SessionState>, u64) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let state = Arc::new(SessionState {
             id,
             resume_token: rand::random(),
-            handles: Arc::new(Handles::default()),
+            handles: Arc::new(Handles::new(self.max_handles)),
             attachment: Mutex::new(Attachment {
                 epoch: 1,
                 detached_at: None,
@@ -175,11 +183,11 @@ impl Server {
         token: Option<String>,
         events: broadcast::Sender<Arc<EventBatch>>,
         changes: Arc<ChangeLog>,
-        max_connections: usize,
+        limits: Limits,
     ) -> Server {
         Server {
             export,
-            sessions: Arc::new(Sessions::default()),
+            sessions: Arc::new(Sessions::new(limits.handles_per_session)),
             events,
             changes,
             perf: Arc::new(Perf::default()),
@@ -189,7 +197,7 @@ impl Server {
                 udp: MeterUdp::system(),
             }),
             token,
-            connection_permits: Arc::new(Semaphore::new(max_connections)),
+            connection_permits: Arc::new(Semaphore::new(limits.connections)),
         }
     }
 
@@ -657,7 +665,7 @@ mod tests {
 
     #[test]
     fn sessions_resume_detach_and_reap() {
-        let sessions = Sessions::default();
+        let sessions = Sessions::new(crate::handles::MAX_HANDLES);
         let (state, epoch) = sessions.create();
         assert!(
             sessions.resume(state.id, &[0u8; 16]).is_none(),
@@ -690,7 +698,7 @@ mod tests {
 
     #[test]
     fn detached_sessions_are_capped() {
-        let sessions = Sessions::default();
+        let sessions = Sessions::new(crate::handles::MAX_HANDLES);
         let mut ids = Vec::new();
         for _ in 0..MAX_DETACHED_SESSIONS {
             let (state, epoch) = sessions.create();
