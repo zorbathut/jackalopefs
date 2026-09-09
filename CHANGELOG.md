@@ -24,6 +24,7 @@
 
 - The server raises its open-file soft limit to the hard limit at startup and logs the limit in force.
 - A session's open handles are capped from the server's open-file limit, shared among every session that can hold handles at once (4080 at the common 524288), so the server's own work keeps its descriptors.
+- A request that fails for lack of file descriptors logs the session and its open handles, and the perf report carries the process's descriptor count and each session's open handles.
 - A complete directory listing costs one server round trip: the kernel's empty read past the last entry is answered from the end the fetch reported, and the pages the kernel asks for as plain readdir after its first readdirplus page are served from that first fetch instead of fetching the directory again without attributes.
 - Writes onto the mount reach the server as requests of up to 1 MiB with many in flight instead of one round trip per `write(2)`, and the kernel's per-write `security.capability` probe is answered from the metadata cache; a copy onto the mount is no longer bound by the round-trip time.
 - A change to a file on the server, or by another client, is seen through the mount by dropping the file from the kernel's cache by name, which is what works when the kernel keeps its own size for files it holds.

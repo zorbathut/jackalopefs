@@ -160,6 +160,24 @@ impl Sessions {
     pub fn get(&self, id: u64) -> Option<Arc<SessionState>> {
         self.map.lock().get(&id).cloned()
     }
+
+    /// Every session's id, open handle count and whether it is detached, in id order.
+    pub fn handles_held(&self) -> Vec<(u64, usize, bool)> {
+        let mut held: Vec<(u64, usize, bool)> = self
+            .map
+            .lock()
+            .iter()
+            .map(|(id, s)| {
+                (
+                    *id,
+                    s.handles.len(),
+                    s.attachment.lock().detached_at.is_some(),
+                )
+            })
+            .collect();
+        held.sort_unstable();
+        held
+    }
 }
 
 pub struct Server {
@@ -214,9 +232,28 @@ impl Server {
         }
     }
 
-    /// Log the per-op table for the window since the last report, the host's physical ports and UDP drop counters, and then, per attached session, its connection's QUIC statistics with the window and the verdict against those ports, so a verdict follows the lines it is drawn from. The server is the sending side of every read a client makes, so its window and losses are what bound a download.
+    /// Log the per-op table for the window since the last report, the process's open file descriptors and every session's open handles, the host's physical ports and UDP drop counters, and then, per attached session, its connection's QUIC statistics with the window and the verdict against those ports, so a verdict follows the lines it is drawn from. The server is the sending side of every read a client makes, so its window and losses are what bound a download.
     pub fn report(&self) {
         self.perf.report();
+        // The walk holds a descriptor of its own, which is not counted.
+        match std::fs::read_dir("/proc/self/fd") {
+            Ok(fds) => {
+                let open = fds
+                    .filter_map(|entry| {
+                        entry
+                            .map_err(|e| tracing::warn!("listing /proc/self/fd: {e}"))
+                            .ok()
+                    })
+                    .count()
+                    .saturating_sub(1);
+                tracing::info!(target: TRACE_TARGET, "perf fds open={open}");
+            }
+            Err(e) => tracing::warn!("counting open file descriptors: {e}"),
+        }
+        for (session, open, detached) in self.sessions.handles_held() {
+            let state = if detached { "detached" } else { "attached" };
+            tracing::info!(target: TRACE_TARGET, "perf handles session={session} open={open} state={state}");
+        }
         let (links, udp) = {
             let mut meters = self.meters.lock();
             (meters.link.sample(), meters.udp.sample())

@@ -52,11 +52,10 @@ impl Handles {
         self.max
     }
 
-    /// Register `handle` under `fh`; an existing entry (a retried open whose reply was lost) is replaced and closed.
+    /// Register `handle` under `fh`; an existing entry (a retried open whose reply was lost) is replaced and closed. Past the cap the answer is `EMFILE`, which the dispatcher logs with the rest of the session's state.
     pub fn insert(&self, fh: u64, handle: Handle) -> Result<(), Errno> {
         let mut map = self.map.lock();
         if map.len() >= self.max && !map.contains_key(&fh) {
-            tracing::warn!(fh, limit = self.max, "session holds too many open handles");
             return Err(Errno::EMFILE);
         }
         if map.insert(fh, handle).is_some() {

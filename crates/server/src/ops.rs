@@ -46,10 +46,31 @@ pub struct Ops {
     pub changes: Arc<ChangeLog>,
 }
 
-/// Run one request; every failure becomes an errno for the client.
+/// Run one request; every failure becomes an errno for the client. Running out of file descriptors, whether the session's cap or the process's limit, is logged with what this session holds, since the handles of every session share that limit.
 pub fn dispatch(ops: &Ops, req: Request) -> Response {
+    let op = req.op_name();
     match ops.run(req) {
         Ok(resp) => resp,
+        Err(errno @ (Errno::EMFILE | Errno::ENFILE)) => {
+            let open_handles = ops.handles.len();
+            if open_handles >= ops.handles.max() {
+                tracing::warn!(
+                    op,
+                    session = ops.session_id,
+                    open_handles,
+                    limit = ops.handles.max(),
+                    "session holds too many open handles"
+                );
+            } else {
+                tracing::warn!(
+                    op,
+                    session = ops.session_id,
+                    open_handles,
+                    "out of file descriptors: {errno}"
+                );
+            }
+            Response::Err(errno as i32)
+        }
         Err(errno) => Response::Err(errno as i32),
     }
 }
