@@ -5,6 +5,7 @@ use jackalopefs_server::session::{self, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch};
 use jackalopefs_server::{transport_config, MAX_CONNECTIONS};
+use nix::sys::resource::{getrlimit, setrlimit, Resource, RLIM_INFINITY};
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -70,6 +71,31 @@ async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
     }
 }
 
+/// Raise the soft open-file limit to the hard one: every file a client holds open is a descriptor here, and the default soft limit of 1024 is a few hundred open files away from failing every request that opens anything.
+fn raise_open_file_limit() -> anyhow::Result<()> {
+    let (soft, hard) = getrlimit(Resource::RLIMIT_NOFILE).context("reading the open file limit")?;
+    if soft >= hard {
+        tracing::info!("open file limit {}", limit_text(soft));
+        return Ok(());
+    }
+    match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+        Ok(()) => tracing::info!("open file limit {} (raised from {soft})", limit_text(hard)),
+        Err(e) => tracing::warn!(
+            "open file limit {soft}; raising it to {} failed: {e}",
+            limit_text(hard)
+        ),
+    }
+    Ok(())
+}
+
+fn limit_text(limit: u64) -> String {
+    if limit == RLIM_INFINITY {
+        "unlimited".to_string()
+    } else {
+        limit.to_string()
+    }
+}
+
 fn default_state_dir() -> anyhow::Result<PathBuf> {
     if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
         return Ok(PathBuf::from(dir).join("jackalopefs"));
@@ -90,6 +116,8 @@ fn main() -> anyhow::Result<()> {
 
     // The client kernel already applied the caller's umask to every mode it sends; applying ours too would mask modes twice.
     nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+
+    raise_open_file_limit()?;
 
     let state_dir = match args.state_dir {
         Some(dir) => dir,

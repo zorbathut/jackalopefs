@@ -14,7 +14,7 @@ humantime = { workspace = true }
 jackalopefs-perf = { workspace = true }
 jackalopefs-proto = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["resource"] }
 notify = { workspace = true }
 parking_lot = { workspace = true }
 quinn = { workspace = true }
