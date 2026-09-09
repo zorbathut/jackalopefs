@@ -1263,48 +1263,4 @@ mod tests {
         );
         assert!(!dir.path().join("dev").exists());
     }
-
-    #[test]
-    fn handle_table_is_capped() {
-        let (dir, ops) = fixture();
-        fs::write(dir.path().join("f"), b"").unwrap();
-        for fh in 1..=crate::handles::MAX_HANDLES as u64 {
-            assert!(matches!(
-                dispatch(
-                    &ops,
-                    Request::Open {
-                        fh,
-                        path: path("f"),
-                        flags: libc::O_RDONLY
-                    }
-                ),
-                Response::Opened { .. }
-            ));
-        }
-        assert_eq!(
-            dispatch(
-                &ops,
-                Request::Open {
-                    fh: u64::MAX,
-                    path: path("f"),
-                    flags: libc::O_RDONLY
-                }
-            ),
-            Response::Err(Errno::EMFILE as i32)
-        );
-        assert!(
-            matches!(
-                dispatch(
-                    &ops,
-                    Request::Open {
-                        fh: 1,
-                        path: path("f"),
-                        flags: libc::O_RDONLY
-                    }
-                ),
-                Response::Opened { .. }
-            ),
-            "replacing an existing id is still allowed"
-        );
-    }
 }

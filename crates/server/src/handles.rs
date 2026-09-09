@@ -79,3 +79,27 @@ impl Handles {
         self.len() == 0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One file, shared by every handle, so the cap is tested without holding thousands of descriptors.
+    #[test]
+    fn table_is_capped() {
+        let handles = Handles::default();
+        let file = Arc::new(File::open("/dev/null").unwrap());
+        let handle = || Handle::File {
+            file: file.clone(),
+            path: Path::root(),
+        };
+        for fh in 1..=MAX_HANDLES as u64 {
+            handles.insert(fh, handle()).unwrap();
+        }
+        assert_eq!(handles.insert(u64::MAX, handle()), Err(Errno::EMFILE));
+        handles.insert(1, handle()).unwrap();
+        assert!(handles.remove(2).is_some());
+        handles.insert(u64::MAX, handle()).unwrap();
+        assert_eq!(handles.len(), MAX_HANDLES);
+    }
+}
