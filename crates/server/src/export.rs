@@ -1,6 +1,6 @@
 //! The exported directory and the only way client paths are turned into file descriptors.
 //!
-//! Every resolution goes through `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`, so a symlink, a `..`, or a mount point inside the export can never lead outside it, and no multi-component client path ever reaches any other syscall. The resulting fd pins the inode, so later operations on it are free of lookup races.
+//! Every resolution goes through `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV`, so a symlink, a `..`, or a mount point inside the export can never lead outside it, and no multi-component client path ever reaches any other syscall: the `*at` family and `llistxattr` through `/proc/self/fd/N/name` only ever see a single validated [`Name`] under an fd resolved that way. The resulting fd pins the inode, so later operations on it are free of lookup races.
 
 use anyhow::Context;
 use jackalopefs_proto::{Attr, FileKind, Name, Path, TimeSpec};
@@ -26,7 +26,7 @@ pub struct Export {
 }
 
 impl Export {
-    /// Open `dir` as the export root and verify `openat2` works here (Linux 5.6+, not blocked by seccomp).
+    /// Open `dir` as the export root and verify `openat2` works here (Linux 5.6+, not blocked by seccomp) and that `statx` reports mount roots (Linux 5.8+), which directory listings rely on.
     pub fn open(dir: &std::path::Path) -> anyhow::Result<Export> {
         let root = nix::fcntl::open(
             dir,
@@ -37,6 +37,11 @@ impl Export {
         let root_ino = fstat(&root).context("stat of export root")?.st_ino;
         let export = Export { root, root_ino };
         export.resolve(&Path::root()).map_err(|e| anyhow::anyhow!("openat2 probe failed ({e}); jackalopefs needs Linux 5.6+ and an environment that permits openat2"))?;
+        let st =
+            statx(export.root.as_fd(), c"", libc::AT_EMPTY_PATH).context("statx of export root")?;
+        if st.stx_attributes_mask & libc::STATX_ATTR_MOUNT_ROOT as u64 == 0 {
+            anyhow::bail!("statx does not report mount roots; jackalopefs needs Linux 5.8+");
+        }
         Ok(export)
     }
 
@@ -148,6 +153,35 @@ impl Export {
         self.attr_of(node.as_fd())
     }
 
+    /// The attributes of `dir/name` for a directory listing, `name` being one entry `getdents64` just returned for `dir`: a `statx` on the directory's fd, so describing a page opens nothing. A symlink describes itself. An entry that is the root of a mount is refused with `EXDEV`, as `RESOLVE_NO_XDEV` refuses it in [`Export::attr_in`]. The stat and the xattr name listing resolve `name` separately, so an entry replaced between them is described from both; each sees only this one component under `dir`, so nothing escapes the export.
+    pub fn attr_entry(&self, dir: BorrowedFd<'_>, name: &Name) -> Result<Attr, Errno> {
+        let cname = std::ffi::CString::new(name.as_bytes()).expect("a name has no NUL");
+        let st = statx(dir, &cname, libc::AT_SYMLINK_NOFOLLOW)?;
+        if st.stx_attributes & libc::STATX_ATTR_MOUNT_ROOT as u64 != 0 {
+            return Err(Errno::EXDEV);
+        }
+        let stamp = |t: libc::statx_timestamp| TimeSpec {
+            sec: t.tv_sec,
+            nsec: t.tv_nsec,
+        };
+        Ok(Attr {
+            ino: self.map_ino(st.stx_ino)?,
+            size: st.stx_size,
+            blocks: st.stx_blocks,
+            atime: stamp(st.stx_atime),
+            mtime: stamp(st.stx_mtime),
+            ctime: stamp(st.stx_ctime),
+            kind: kind_from_mode(st.stx_mode as libc::mode_t).ok_or(Errno::EIO)?,
+            perm: st.stx_mode & 0o7777,
+            nlink: st.stx_nlink,
+            uid: st.stx_uid,
+            gid: st.stx_gid,
+            rdev: libc::makedev(st.stx_rdev_major, st.stx_rdev_minor),
+            blksize: st.stx_blksize,
+            xattr_names: xattr_names_at(dir, name),
+        })
+    }
+
     pub fn attr_from_stat(&self, st: &FileStat) -> Result<Attr, Errno> {
         Ok(Attr {
             ino: self.map_ino(st.st_ino)?,
@@ -177,6 +211,30 @@ impl Export {
     }
 }
 
+/// `statx` of `path` under `dir` with the basic stats, the form `fstatat` has no way to ask for the mount-root attribute in.
+fn statx(
+    dir: BorrowedFd<'_>,
+    path: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> Result<libc::statx, Errno> {
+    let mut st = std::mem::MaybeUninit::<libc::statx>::uninit();
+    // SAFETY: the path is NUL-terminated and the buffer is a whole `statx`, which the kernel fills on success.
+    let rc = unsafe {
+        libc::statx(
+            dir.as_raw_fd(),
+            path.as_ptr(),
+            flags | libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_BASIC_STATS,
+            st.as_mut_ptr(),
+        )
+    };
+    if rc < 0 {
+        return Err(Errno::last());
+    }
+    // SAFETY: the kernel filled the buffer.
+    Ok(unsafe { st.assume_init() })
+}
+
 /// Most names a node may carry in an `Attr`; beyond this the client asks. Bounds the readdirplus page and the memory a name list can take.
 const XATTR_NAMES_MAX: usize = 1024;
 
@@ -184,10 +242,28 @@ const XATTR_NAMES_MAX: usize = 1024;
 pub(crate) fn xattr_names(fd: BorrowedFd<'_>) -> Option<Vec<Vec<u8>>> {
     let path = std::ffi::CString::new(proc_path(fd).as_os_str().as_bytes())
         .expect("a /proc/self/fd path has no NUL");
+    xattr_names_by_path(&path, libc::listxattr)
+}
+
+/// The names of the entry `name` of `dir`, through the directory fd's `/proc` path: the magic link is an intermediate component, so it resolves, and the entry is the last one, which `llistxattr` does not follow, so a symlink describes itself.
+pub(crate) fn xattr_names_at(dir: BorrowedFd<'_>, name: &Name) -> Option<Vec<Vec<u8>>> {
+    let path = std::ffi::CString::new(proc_path(dir).join(name.as_os_str()).as_os_str().as_bytes())
+        .expect("a name has no NUL");
+    xattr_names_by_path(&path, libc::llistxattr)
+}
+
+fn xattr_names_by_path(
+    path: &std::ffi::CStr,
+    list: unsafe extern "C" fn(
+        *const libc::c_char,
+        *mut libc::c_char,
+        libc::size_t,
+    ) -> libc::ssize_t,
+) -> Option<Vec<Vec<u8>>> {
     let mut buf = [0u8; XATTR_NAMES_MAX];
     // SAFETY: the path is NUL-terminated and the buffer is valid for its length.
     let got = unsafe {
-        libc::listxattr(
+        list(
             path.as_ptr(),
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len(),
@@ -195,16 +271,17 @@ pub(crate) fn xattr_names(fd: BorrowedFd<'_>) -> Option<Vec<Vec<u8>>> {
     };
     if got < 0 {
         let errno = Errno::last();
+        let path = path.to_string_lossy();
         match errno {
             Errno::ERANGE => tracing::debug!(
-                fd = fd.as_raw_fd(),
+                %path,
                 "more than {XATTR_NAMES_MAX} bytes of xattr names; the client will ask"
             ),
             Errno::EOPNOTSUPP => tracing::debug!(
-                fd = fd.as_raw_fd(),
+                %path,
                 "no xattr support on this node; the client will ask"
             ),
-            _ => tracing::warn!(fd = fd.as_raw_fd(), "listxattr for the attributes: {errno}"),
+            _ => tracing::warn!(%path, "listxattr for the attributes: {errno}"),
         }
         return None;
     }

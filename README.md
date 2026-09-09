@@ -6,7 +6,7 @@ Jackalope FS has been used by exactly one person in exactly one situation. You s
 
 ## That sounds amazing! I am suffering from temporary insanity and don't care about anything else, tell me how to use it.
 
-- Linux 5.6 or later on the server (`openat2`).
+- Linux 5.8 or later on the server (`openat2`, `statx` mount roots).
 - On the client: `/dev/fuse` and `fusermount3` (package `fuse3`). Mounting as a user needs no special configuration; `--allow-other` additionally needs `user_allow_other` in `/etc/fuse.conf`.
 - Rust 1.88 or later and the Cap'n Proto compiler (`capnp` 1.0 or later; package `capnproto` on Arch and Debian) to build.
 

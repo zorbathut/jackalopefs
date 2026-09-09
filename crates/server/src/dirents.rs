@@ -114,7 +114,7 @@ fn entry_failure(name: &[u8], e: Errno) -> Result<(), Errno> {
     }
 }
 
-/// Read entries starting at cookie `offset` until roughly `max_bytes` of them are collected or the directory ends. With `plus`, every entry except `.`/`..` carries its attributes. An entry that vanished or cannot be described is skipped, as is a mount point and an entry whose inode does not map; a resource failure ends the listing with its errno ([`entry_failure`]).
+/// Read entries starting at cookie `offset` until roughly `max_bytes` of them are collected or the directory ends. With `plus`, every entry except `.`/`..` carries its attributes, described from the directory's own fd so a page costs no file descriptors. An entry that vanished or cannot be described is skipped, as is a mount point and an entry whose inode does not map; a resource failure ends the listing with its errno ([`entry_failure`]). An entry's `kind` comes from its attributes when it has them, so the two cannot disagree when the name is replaced mid-listing.
 pub fn read_dir(
     export: &Export,
     dir: BorrowedFd<'_>,
@@ -138,10 +138,28 @@ pub fn read_dir(
         for raw in parse(&buf[..n]) {
             let name = raw.name;
             let is_dot = name == b"." || name == b"..";
-            let stat = || fstatat(dir, name.as_slice(), AtFlags::AT_SYMLINK_NOFOLLOW);
-            let kind = match kind_from_dtype(raw.d_type) {
+            let attr = if plus && !is_dot {
+                let Ok(component) = Name::new(name.as_slice()) else {
+                    tracing::warn!(name = %String::from_utf8_lossy(&name), "skipping entry whose name the protocol cannot carry");
+                    continue;
+                };
+                match export.attr_entry(dir, &component) {
+                    Ok(attr) => Some(attr),
+                    Err(e) => {
+                        entry_failure(&name, e)?;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let kind = match attr
+                .as_ref()
+                .map(|a| a.kind)
+                .or_else(|| kind_from_dtype(raw.d_type))
+            {
                 Some(kind) => kind,
-                None => match stat() {
+                None => match fstatat(dir, name.as_slice(), AtFlags::AT_SYMLINK_NOFOLLOW) {
                     Ok(st) => match kind_from_mode(st.st_mode) {
                         Some(kind) => kind,
                         None => continue,
@@ -166,21 +184,6 @@ pub fn read_dir(
                     Ok(ino) => ino,
                     Err(_) => continue,
                 }
-            };
-            let attr = if plus && !is_dot {
-                let Ok(component) = Name::new(name.as_slice()) else {
-                    tracing::warn!(name = %String::from_utf8_lossy(&name), "skipping entry whose name the protocol cannot carry");
-                    continue;
-                };
-                match export.attr_in(dir, &component) {
-                    Ok(attr) => Some(attr),
-                    Err(e) => {
-                        entry_failure(&name, e)?;
-                        continue;
-                    }
-                }
-            } else {
-                None
             };
             // `max_bytes` is clamped to `MAX_IO`, half of `MAX_FRAME`, so a budget that overshoots by one entry still fits a frame.
             used += jackalopefs_proto::dir_entry_bytes(
@@ -231,6 +234,7 @@ mod tests {
     use nix::fcntl::OFlag;
     use std::collections::BTreeSet;
     use std::fs;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
 
     fn record(ino: u64, off: u64, d_type: u8, name: &[u8]) -> Vec<u8> {
@@ -435,5 +439,144 @@ mod tests {
         let plus = plus.unwrap();
         assert_eq!(names(&plus), vec![b".".to_vec(), b"..".to_vec()]);
         assert!(plus.end);
+    }
+
+    /// The regression test for a server whose descriptors a client's open files have used up: a readdirplus page is described without opening anything, so it still comes back. The check runs in a child process (this same test, re-executed with the marker set), since exhausting the descriptors of the test process would fail every other test running beside it.
+    #[test]
+    fn a_readdirplus_page_needs_no_file_descriptors() {
+        const MARKER: &str = "JACKALOPEFS_TEST_FD_EXHAUSTED_CHILD";
+        if std::env::var_os(MARKER).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "dirents::tests::a_readdirplus_page_needs_no_file_descriptors",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "child run failed:\n{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            fs::write(dir.path().join(format!("file-{i}")), b"").unwrap();
+        }
+        let export = Export::open(dir.path()).unwrap();
+        let fd = export
+            .open_node(
+                &jackalopefs_proto::Path::root(),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+            )
+            .unwrap();
+        let (_, hard) =
+            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE).unwrap();
+        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE, 64, hard)
+            .unwrap();
+        let mut hoard = Vec::new();
+        loop {
+            match fs::File::open("/dev/null") {
+                Ok(f) => hoard.push(f),
+                Err(e) if e.raw_os_error() == Some(libc::EMFILE) => break,
+                Err(e) => panic!("hoarding descriptors: {e}"),
+            }
+        }
+        assert!(
+            fs::File::open("/dev/null").is_err(),
+            "no descriptor is left"
+        );
+        let listing = read_dir_fd(&export, &fd, 0, usize::MAX, true);
+        drop(hoard);
+        let listing = listing.expect("a readdirplus page opens nothing");
+        assert_eq!(names(&listing).len(), 52);
+        let Entries::Plus(entries) = listing.entries else {
+            panic!("a readdirplus page carries attributes");
+        };
+        assert!(entries
+            .iter()
+            .all(|e| e.attr.is_some() || e.entry.is_dot_or_dotdot()));
+    }
+
+    /// A mount point inside the export is left out of a readdirplus page, as the resolver refuses to cross into it.
+    #[test]
+    fn a_mount_point_is_left_out() {
+        if !fs::read_to_string("/proc/self/mounts")
+            .unwrap()
+            .lines()
+            .any(|line| line.split(' ').nth(1) == Some("/proc"))
+        {
+            eprintln!("skipping: /proc is not a mount point here");
+            return;
+        }
+        let export = Export::open(std::path::Path::new("/")).unwrap();
+        let fd = export
+            .open_node(
+                &jackalopefs_proto::Path::root(),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+            )
+            .unwrap();
+        let listed = names(&read_dir_fd(&export, &fd, 0, usize::MAX, true).unwrap());
+        assert!(!listed.contains(&b"proc".to_vec()), "{listed:?}");
+        assert!(listed.contains(&b"etc".to_vec()), "{listed:?}");
+    }
+
+    /// A readdirplus entry is described from the directory's fd alone: a symlink describes itself, and a file's xattr names come along.
+    #[test]
+    fn describes_entries_from_the_directory_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        fs::write(&file, b"x").unwrap();
+        std::os::unix::fs::symlink("file", dir.path().join("link")).unwrap();
+        let target = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        // SAFETY: both strings are NUL-terminated and the value pointer is valid for its length.
+        let set = unsafe {
+            libc::setxattr(
+                target.as_ptr(),
+                c"user.k".as_ptr(),
+                b"v".as_ptr() as *const libc::c_void,
+                1,
+                0,
+            )
+        };
+        let xattrs = set == 0;
+        if !xattrs {
+            eprintln!("skipping the xattr half: filesystem does not support user xattrs");
+        }
+        let export = Export::open(dir.path()).unwrap();
+        let fd = export
+            .open_node(
+                &jackalopefs_proto::Path::root(),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+            )
+            .unwrap();
+        let listing = read_dir_fd(&export, &fd, 0, usize::MAX, true).unwrap();
+        let Entries::Plus(entries) = listing.entries else {
+            panic!("a readdirplus page carries attributes");
+        };
+        let attr = |name: &[u8]| {
+            entries
+                .iter()
+                .find(|e| e.entry.name.as_slice() == name)
+                .unwrap_or_else(|| panic!("{} listed", String::from_utf8_lossy(name)))
+                .attr
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(attr(b"link").kind, FileKind::Symlink);
+        assert_eq!(attr(b"file").kind, FileKind::Regular);
+        assert_eq!(attr(b"file").size, 1);
+        if xattrs {
+            assert_eq!(attr(b"file").xattr_names, Some(vec![b"user.k".to_vec()]));
+            assert_eq!(
+                attr(b"link").xattr_names,
+                Some(vec![]),
+                "the link's own names, not the target's"
+            );
+        }
     }
 }
