@@ -27,6 +27,7 @@
 
 ### Fixed
 
+- A server that ran out of file descriptors (or memory) while listing a directory dropped the entries it could not describe, so a client saw and cached a shorter directory; the listing now fails with the errno, logged once with the entry that failed.
 - KDE's directory chooser (qBittorrent's folder dialog) probes every visible directory on every repaint by listing it until it meets a subdirectory; a files-only directory cost three round trips per probe and now costs two.
 - Opening a large directory in Dolphin, or in the KDE file dialog, took seconds because KIO asks every entry for its POSIX ACLs through two `getxattr` calls that FUSE never caches; those are now answered on the client from the names the listing already carried.
 - The client logged the kernel's cap on readahead (128 KiB on an ordinary mount, against the 1 MiB it asks for) only at `debug`, with a note calling it a tuning fact; it bounds every read the kernel issues and is now logged at `info` with the other FUSE parameters. The warning that the kernel had limited `max_write` could never fire (the limit it checked is fuser's own) and is gone.

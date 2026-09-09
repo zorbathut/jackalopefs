@@ -91,7 +91,30 @@ pub enum Entries {
     Plus(Vec<DirEntryPlus>),
 }
 
-/// Read entries starting at cookie `offset` until roughly `max_bytes` of them are collected or the directory ends. With `plus`, every entry except `.`/`..` carries its attributes; an entry whose stat fails (it is being removed) is skipped.
+/// Log a failure to describe `name`. `Ok` means the listing goes on without the entry: it vanished between `getdents64` and its stat, it is a mount point (not exported), or the server cannot describe it (no search permission on the directory, an I/O error), in which case a lookup of it would fail the same way. `Err` ends the listing: the server ran out of a resource, and a page missing the entries it could not afford would read as a shorter directory.
+fn entry_failure(name: &[u8], e: Errno) -> Result<(), Errno> {
+    let name = String::from_utf8_lossy(name);
+    match e {
+        Errno::ENOENT | Errno::ESTALE => {
+            tracing::debug!(%name, "skipping entry that vanished during readdir: {e}");
+            Ok(())
+        }
+        Errno::EXDEV => {
+            tracing::debug!(%name, "skipping a mount point, which is not exported");
+            Ok(())
+        }
+        Errno::EMFILE | Errno::ENFILE | Errno::ENOMEM => {
+            tracing::warn!(%name, "readdir failed describing entry: {e}");
+            Err(e)
+        }
+        _ => {
+            tracing::warn!(%name, "skipping entry that cannot be described: {e}");
+            Ok(())
+        }
+    }
+}
+
+/// Read entries starting at cookie `offset` until roughly `max_bytes` of them are collected or the directory ends. With `plus`, every entry except `.`/`..` carries its attributes. An entry that vanished or cannot be described is skipped, as is a mount point and an entry whose inode does not map; a resource failure ends the listing with its errno ([`entry_failure`]).
 pub fn read_dir(
     export: &Export,
     dir: BorrowedFd<'_>,
@@ -124,7 +147,7 @@ pub fn read_dir(
                         None => continue,
                     },
                     Err(e) => {
-                        tracing::debug!(name = %String::from_utf8_lossy(&name), "skipping entry with unknown type: {e}");
+                        entry_failure(&name, e)?;
                         continue;
                     }
                 },
@@ -145,21 +168,14 @@ pub fn read_dir(
                 }
             };
             let attr = if plus && !is_dot {
-                let described = Name::new(name.as_slice())
-                    .map_err(|_| Errno::EINVAL)
-                    .and_then(|component| export.attr_in(dir, &component));
-                match described {
+                let Ok(component) = Name::new(name.as_slice()) else {
+                    tracing::warn!(name = %String::from_utf8_lossy(&name), "skipping entry whose name the protocol cannot carry");
+                    continue;
+                };
+                match export.attr_in(dir, &component) {
                     Ok(attr) => Some(attr),
-                    Err(Errno::ENOENT) => {
-                        tracing::debug!(name = %String::from_utf8_lossy(&name), "skipping entry that vanished during readdirplus");
-                        continue;
-                    }
-                    Err(Errno::EXDEV) => {
-                        tracing::debug!(name = %String::from_utf8_lossy(&name), "skipping a mount point, which is not exported");
-                        continue;
-                    }
                     Err(e) => {
-                        tracing::warn!(name = %String::from_utf8_lossy(&name), "skipping entry that cannot be described: {e}");
+                        entry_failure(&name, e)?;
                         continue;
                     }
                 }
@@ -215,6 +231,7 @@ mod tests {
     use nix::fcntl::OFlag;
     use std::collections::BTreeSet;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     fn record(ino: u64, off: u64, d_type: u8, name: &[u8]) -> Vec<u8> {
         let reclen = (HEADER_LEN + name.len() + 1).div_ceil(8) * 8;
@@ -389,5 +406,34 @@ mod tests {
         }
         assert_eq!(paged.len(), 203, "paging yields every entry exactly once");
         assert_eq!(paged.into_iter().collect::<BTreeSet<_>>(), all_names);
+    }
+
+    /// An entry the server has no search permission to stat is left out of a readdirplus page, which a lookup of it would refuse the same way; a plain page, which needs no stat, still names it.
+    #[test]
+    fn an_entry_that_cannot_be_described_is_left_out() {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!("skipping: root bypasses directory permissions");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("file"), b"").unwrap();
+        let export = Export::open(dir.path()).unwrap();
+        let fd = export
+            .open_node(
+                &jackalopefs_proto::Path::from_names(vec![Name::new(b"sub".as_slice()).unwrap()])
+                    .unwrap(),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+            )
+            .unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o644)).unwrap();
+        let plain = read_dir_fd(&export, &fd, 0, usize::MAX, false);
+        let plus = read_dir_fd(&export, &fd, 0, usize::MAX, true);
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(names(&plain.unwrap()).contains(&b"file".to_vec()));
+        let plus = plus.unwrap();
+        assert_eq!(names(&plus), vec![b".".to_vec(), b"..".to_vec()]);
+        assert!(plus.end);
     }
 }
