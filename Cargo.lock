@@ -107,6 +107,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-trait"
+version = "0.1.92"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -416,9 +427,8 @@ dependencies = [
 [[package]]
 name = "fuser"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b82b6597d216503555ead6b358f341ef748869bf5c6fbae6a0cb9dd231baecfd"
 dependencies = [
+ "async-trait",
  "bitflags",
  "libc",
  "log",
@@ -429,7 +439,10 @@ dependencies = [
  "parking_lot",
  "pkg-config",
  "ref-cast",
+ "serde",
  "smallvec",
+ "tempfile",
+ "tokio",
  "zerocopy",
 ]
 

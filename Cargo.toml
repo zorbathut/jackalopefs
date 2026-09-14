@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/proto", "crates/perf", "crates/server", "crates/client"]
+members = ["crates/proto", "crates/perf", "crates/server", "crates/client", "vendor/fuser"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,7 +20,7 @@ bytes = "1"
 capnp = { version = "0.27", features = ["unaligned"] }
 capnpc = "0.27"
 clap = { version = "4", features = ["derive"] }
-fuser = "0.18"
+fuser = { path = "vendor/fuser" }
 humantime = "2"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "dir", "user"] }
