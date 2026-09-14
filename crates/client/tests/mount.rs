@@ -30,6 +30,8 @@ fn fuse_available() -> bool {
 struct Mounted {
     mount: Option<Mount>,
     server: Option<TestServer>,
+    /// Kept alive for a mount whose server never answers.
+    _blackhole: Option<Blackhole>,
     export: tempfile::TempDir,
     mountpoint: tempfile::TempDir,
 }
@@ -49,15 +51,47 @@ impl Mounted {
             return None;
         }
         let export = tempfile::tempdir().unwrap();
-        let mountpoint = tempfile::tempdir().unwrap();
         let server = if watched {
             TestServer::start(export.path(), None).await
         } else {
             TestServer::start_unwatched(export.path()).await
         };
-        let client = jackalopefs_client::Client::connect(server.config(op_timeout))
-            .await
-            .unwrap();
+        let (mount, mountpoint) = Mounted::mount(server.config(op_timeout), ttl).await;
+        Some(Mounted {
+            mount: Some(mount),
+            server: Some(server),
+            _blackhole: None,
+            export,
+            mountpoint,
+        })
+    }
+
+    /// A mount whose server completes the handshake and then never answers a request: a live connection to a server that has stalled.
+    async fn start_stalled() -> Option<Mounted> {
+        if !fuse_available() {
+            return None;
+        }
+        let blackhole = Blackhole::start().await;
+        let (mount, mountpoint) = Mounted::mount(
+            blackhole.config(Duration::from_secs(60)),
+            Duration::from_secs(1),
+        )
+        .await;
+        Some(Mounted {
+            mount: Some(mount),
+            server: None,
+            _blackhole: Some(blackhole),
+            export: tempfile::tempdir().unwrap(),
+            mountpoint,
+        })
+    }
+
+    async fn mount(
+        config: jackalopefs_client::Config,
+        ttl: Duration,
+    ) -> (Mount, tempfile::TempDir) {
+        let mountpoint = tempfile::tempdir().unwrap();
+        let client = jackalopefs_client::Client::connect(config).await.unwrap();
         let mount = Mount::start(
             client,
             mountpoint.path(),
@@ -71,12 +105,7 @@ impl Mounted {
         )
         .await
         .unwrap();
-        Some(Mounted {
-            mount: Some(mount),
-            server: Some(server),
-            export,
-            mountpoint,
-        })
+        (mount, mountpoint)
     }
 
     fn mnt(&self) -> PathBuf {
@@ -1039,4 +1068,39 @@ async fn an_external_size_change_is_seen_within_the_attribute_ttl_without_events
     })
     .await;
     m.finish().await;
+}
+
+/// Aborting the mount's FUSE connection fails every pending request and lets an unmount complete however stuck the server is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abort_fails_pending_requests_and_frees_the_unmount() {
+    let Some(m) = Mounted::start_stalled().await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let mut child = std::process::Command::new("cat")
+        .arg(mnt.join("never"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(child.try_wait().unwrap().is_none(), "cat did not block");
+    m.mount.as_ref().unwrap().aborter().abort();
+    let status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the blocked cat was not released by the abort");
+    assert!(
+        !status.success(),
+        "cat succeeded against a server that never answered"
+    );
+    tokio::time::timeout(Duration::from_secs(3), m.finish())
+        .await
+        .expect("unmount did not complete after the abort");
 }

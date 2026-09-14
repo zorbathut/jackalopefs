@@ -157,13 +157,35 @@ pub struct MountOptions {
     pub default_permissions: bool,
 }
 
-/// A live mount. [`Mount::unmount`] is the orderly way down; dropping one unmounts too, blocking the dropping thread while it does, and is meant for panic paths.
+/// A live mount. [`Mount::unmount`] is the orderly way down; dropping one aborts the FUSE connection and unmounts, blocking the dropping thread while it does, and is meant for panic paths: a process that has already panicked must not then hang on a server that is not answering.
 pub struct Mount {
     session: Option<BackgroundSession>,
     invalidator: Option<Invalidator>,
     shared: Arc<Shared>,
     limits: Option<KernelLimits>,
     meters: Meters,
+}
+
+/// Aborts a mount's FUSE connection through its control file, which the mounting user owns. Taken from the mount beforehand, so it can be used while the mount is being unmounted.
+pub struct Aborter {
+    control: Option<PathBuf>,
+}
+
+impl Aborter {
+    /// Every pending request fails with `ECONNABORTED` and the processes blocked in them are released, writeback included, so an unmount that a stalled server is holding up can complete. Nothing is written back afterwards.
+    pub fn abort(&self) {
+        let Some(path) = &self.control else {
+            tracing::warn!("the mount's control file is unknown; cannot abort its connection, only SIGKILL ends the client now");
+            return;
+        };
+        match std::fs::write(path, b"1") {
+            Ok(()) => tracing::warn!("aborted the FUSE connection; every pending request fails"),
+            Err(e) => tracing::warn!(
+                "cannot abort the FUSE connection: {}: {e}; only SIGKILL ends the client now",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// What a report samples besides the tables: the host's ports, its UDP drop counters, and the connection's window, which belongs to one generation and starts over on a reconnect.
@@ -272,7 +294,16 @@ impl Mount {
         }
     }
 
-    /// Unmount, stop invalidating, and close the connection. Every step is bounded.
+    pub fn aborter(&self) -> Aborter {
+        Aborter {
+            control: self
+                .limits
+                .as_ref()
+                .map(|limits| limits.connection.join("abort")),
+        }
+    }
+
+    /// Unmount, stop invalidating, and close the connection. The unmount writes back what the kernel has cached and waits for every pending request, so against a server that never answers it completes only once [`Aborter::abort`] has failed those requests.
     pub async fn unmount(mut self) -> anyhow::Result<()> {
         let outcome = match self.session.take() {
             Some(session) => {
@@ -305,6 +336,9 @@ impl Mount {
 
 impl Drop for Mount {
     fn drop(&mut self) {
+        if self.session.is_some() {
+            self.aborter().abort();
+        }
         if let Some(session) = self.session.take() {
             if let Err(e) = session.umount_and_join() {
                 tracing::warn!("unmount on drop failed: {e}");

@@ -79,6 +79,14 @@ async fn next_signal(signal: &mut tokio::signal::unix::Signal) {
     }
 }
 
+/// Waits for the next SIGTERM or SIGINT.
+async fn next_stop_signal(signals: &mut Signals) {
+    tokio::select! {
+        _ = next_signal(&mut signals.term) => {}
+        _ = next_signal(&mut signals.int) => {}
+    }
+}
+
 /// Waits for the next report tick, or forever when no interval was asked for.
 async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
     match interval {
@@ -173,8 +181,16 @@ fn main() -> anyhow::Result<()> {
                 _ = next_tick(&mut ticks) => mount.report(),
             }
         }
-        tracing::info!("unmounting");
-        mount.unmount().await
+        tracing::info!("unmounting; a second signal abandons every pending request");
+        let aborter = mount.aborter();
+        let mut unmount = std::pin::pin!(mount.unmount());
+        tokio::select! {
+            outcome = &mut unmount => outcome,
+            _ = next_stop_signal(&mut signals) => {
+                aborter.abort();
+                unmount.await
+            }
+        }
     })
 }
 
