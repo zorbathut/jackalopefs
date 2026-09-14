@@ -7,7 +7,7 @@ use crate::perf::{Outcome, TRACE_TARGET};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
     KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, RequestId,
 };
 use jackalopefs_proto::{
     Attr, DirEntry, DirEntryPlus, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, MAX_IO,
@@ -36,6 +36,8 @@ pub struct Shared {
     reported: Mutex<HashMap<u64, AttrReported>>,
     /// Where to queue such invalidations; set while the invalidator runs.
     invalidations: Mutex<Option<std::sync::mpsc::SyncSender<Work>>>,
+    /// The kernel requests being answered right now, by id, so an interrupt reaches the task answering one. Bounded by what the kernel keeps in flight. A request is registered on the session thread before its task is spawned, and the session has one thread, so the interrupt for a request is always read after the request was registered.
+    inflight: Mutex<HashMap<u64, Arc<RequestKernel>>>,
     pub entry_ttl: Duration,
     pub attr_ttl: Duration,
 }
@@ -110,6 +112,18 @@ impl KeyPerf {
     }
 }
 
+/// Takes a request out of the in-flight table when the task answering it ends, however it ends.
+struct Registered {
+    shared: Arc<Shared>,
+    unique: u64,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        self.shared.inflight.lock().remove(&self.unique);
+    }
+}
+
 impl Backend {
     pub fn new(
         client: Arc<Client>,
@@ -124,6 +138,7 @@ impl Backend {
             xattrs: Mutex::new(HashMap::new()),
             reported: Mutex::new(HashMap::new()),
             invalidations: Mutex::new(None),
+            inflight: Mutex::new(HashMap::new()),
             entry_ttl,
             attr_ttl,
         });
@@ -141,9 +156,18 @@ impl Backend {
         let perf = self.shared.client.perf().clone();
         let started = Instant::now();
         let request = RequestKernel::new(key.unique);
+        let registered = Registered {
+            shared: self.shared.clone(),
+            unique: key.unique,
+        };
+        self.shared
+            .inflight
+            .lock()
+            .insert(key.unique, request.clone());
         self.runtime.spawn(async move {
             let inflight = perf.start();
             let outcome = request.scope(f).await;
+            drop(registered);
             let total = started.elapsed();
             perf.record_fuse(key.op, &outcome, total);
             if tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE) {
@@ -637,6 +661,17 @@ impl Filesystem for Backend {
             "FUSE parameters: asked for {MAX_IO} bytes of write and readahead and {MAX_BACKGROUND} background requests"
         );
         Ok(())
+    }
+
+    /// A process blocked in the request got a signal. The task answering it abandons its call and replies `EINTR`; a request already answered is ignored, as the kernel does.
+    fn interrupt(&self, _req: &Request, unique: RequestId) {
+        match self.shared.inflight.lock().get(&unique.0) {
+            Some(request) => request.interrupt(),
+            None => tracing::trace!(
+                unique = unique.0,
+                "interrupt for a request already answered"
+            ),
+        }
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {

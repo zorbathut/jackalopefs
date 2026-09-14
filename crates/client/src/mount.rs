@@ -215,6 +215,8 @@ impl Mount {
             tokio::runtime::Handle::current(),
         );
         let mut config = fuser::Config::default();
+        // One session thread, fuser's default and what the interrupt table relies on: a request is registered before that thread can read the interrupt for it.
+        config.n_threads = Some(1);
         config.mount_options = vec![
             MountOption::FSName("jackalopefs".into()),
             MountOption::Subtype("jackalopefs".into()),

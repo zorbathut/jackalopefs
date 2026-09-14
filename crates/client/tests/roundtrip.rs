@@ -1,7 +1,9 @@
 mod common;
 
 use common::*;
-use jackalopefs_client::{ConnState, Error, ErrorConnect, ErrorConnectKind, ServerTrust};
+use jackalopefs_client::{
+    ConnState, Error, ErrorConnect, ErrorConnectKind, RequestKernel, ServerTrust,
+};
 use jackalopefs_proto::{
     Auth, Hello, HelloReply, Path, Request, SetAttr, TimeOrNow, TimeSpec, PROTO_REVISION,
 };
@@ -972,6 +974,107 @@ async fn perf_counts_a_timeout_by_its_errno() {
     // The request was sent and never answered, so the deadline was spent waiting for the reply.
     assert!(
         row.phases.reply >= op_timeout / 2,
+        "reply phase {:?}",
+        row.phases.reply
+    );
+    client.shutdown().await;
+}
+
+/// An interrupt from the kernel abandons the call it was made for, cancels it on the wire, and latches: a later call for the same kernel request fails at once.
+#[tokio::test]
+async fn an_interrupt_abandons_a_pending_call() {
+    let blackhole = Blackhole::start().await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(blackhole.config(Duration::from_secs(5)))
+            .await
+            .unwrap(),
+    );
+    let req = RequestKernel::new(7);
+    let (caller, scoped) = (client.clone(), req.clone());
+    let pending = tokio::spawn(async move {
+        scoped
+            .scope(async move { caller.getattr(Some(Path::root()), None).await })
+            .await
+    });
+    wait_for(
+        Duration::from_secs(3),
+        "the getattr to reach the blackhole",
+        || (!blackhole.requests.lock().is_empty()).then_some(()),
+    )
+    .await;
+    let started = Instant::now();
+    req.interrupt();
+    let err = tokio::time::timeout(Duration::from_secs(1), pending)
+        .await
+        .expect("an interrupted call returns at once")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, Error::Interrupted), "{err}");
+    assert_eq!(err.errno(), libc::EINTR);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+    wait_for(
+        Duration::from_secs(3),
+        "the abandoned stream to be stopped",
+        || {
+            blackhole
+                .stops
+                .lock()
+                .contains(&u64::from(jackalopefs_client::conn::close_code::CANCELLED))
+                .then_some(())
+        },
+    )
+    .await;
+
+    let caller = client.clone();
+    let err = req
+        .scope(async move { caller.getattr(Some(Path::root()), None).await })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Interrupted), "{err}");
+    assert_eq!(
+        blackhole.requests.lock().len(),
+        1,
+        "an interrupted request made another call"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn perf_counts_an_interrupt_with_its_phases() {
+    let blackhole = Blackhole::start().await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(blackhole.config(Duration::from_secs(5)))
+            .await
+            .unwrap(),
+    );
+    let req = RequestKernel::new(1);
+    let wait = Duration::from_millis(500);
+    let (caller, scoped) = (client.clone(), req.clone());
+    let pending = tokio::spawn(async move {
+        scoped
+            .scope(async move { caller.getattr(Some(Path::root()), None).await })
+            .await
+    });
+    tokio::time::sleep(wait).await;
+    req.interrupt();
+    let err = pending.await.unwrap().unwrap_err();
+    assert!(matches!(err, Error::Interrupted), "{err}");
+
+    let snap = client.perf().report();
+    let row = &snap.call["getattr"];
+    assert_eq!(row.row.n, 1);
+    assert_eq!(
+        row.row.errnos,
+        std::collections::BTreeMap::from([(libc::EINTR, 1)])
+    );
+    assert!(row.row.total >= wait);
+    // The request was sent and never answered, so the time until the interrupt was spent waiting for the reply.
+    assert!(
+        row.phases.reply >= wait / 2,
         "reply phase {:?}",
         row.phases.reply
     );

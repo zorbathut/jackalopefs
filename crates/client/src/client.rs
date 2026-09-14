@@ -20,6 +20,8 @@ use tokio::time::{timeout_at, Instant};
 pub enum Error {
     #[error("operation timed out")]
     Timeout,
+    #[error("interrupted by a signal")]
+    Interrupted,
     #[error("connection to the server was lost")]
     Disconnected,
     #[error("handle refers to a file that no longer exists at its path")]
@@ -37,6 +39,7 @@ impl Error {
     pub fn errno(&self) -> i32 {
         match self {
             Error::Timeout => libc::ETIMEDOUT,
+            Error::Interrupted => libc::EINTR,
             Error::Disconnected => libc::EIO,
             Error::Stale => libc::ESTALE,
             Error::Remote(e) if *e > 0 && *e < 4096 => *e,
@@ -64,19 +67,35 @@ impl From<ErrorExchange> for Error {
     }
 }
 
-/// The kernel request a call is made for: its id, so a `call` trace line can be joined to the `fuse` line it served. A call made outside one (an orphan handle release, a reopen after a reconnect) has none.
+/// The kernel request a call is made for: its id, so a `call` trace line can be joined to the `fuse` line it served, and the kernel's signal that it wants the request abandoned. A call made outside one (an orphan handle release, a reopen after a reconnect) has none and cannot be interrupted.
 pub struct RequestKernel {
     pub unique: u64,
+    interrupt: watch::Sender<bool>,
 }
 
 impl RequestKernel {
     pub fn new(unique: u64) -> Arc<RequestKernel> {
-        Arc::new(RequestKernel { unique })
+        Arc::new(RequestKernel {
+            unique,
+            interrupt: watch::Sender::new(false),
+        })
     }
 
-    /// Run `f` as the work of this request.
+    /// Run `f` as the work of this request, so every call it makes can be interrupted with it.
     pub async fn scope<F: Future>(self: Arc<Self>, f: F) -> F::Output {
         REQUEST_KERNEL.scope(self, f).await
+    }
+
+    /// The kernel wants the request abandoned. Latches: a call made after this fails at once.
+    pub fn interrupt(&self) {
+        self.interrupt.send_replace(true);
+    }
+
+    async fn interrupted(&self) {
+        let mut seen = self.interrupt.subscribe();
+        seen.wait_for(|interrupted| *interrupted)
+            .await
+            .expect("the sender lives as long as the request");
     }
 }
 
@@ -89,7 +108,22 @@ fn current_request() -> Option<Arc<RequestKernel>> {
     REQUEST_KERNEL.try_with(Arc::clone).ok()
 }
 
-/// Owns a request's streams; dropping it before the reply arrived (a timeout) resets both directions so the server sees a cancellation rather than a clean end of stream.
+/// `f`, abandoned if the kernel interrupts the request it is made for; a request already interrupted is not even started.
+async fn interruptible<T>(
+    req: Option<&RequestKernel>,
+    f: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    match req {
+        Some(req) => tokio::select! {
+            biased;
+            _ = req.interrupted() => Err(Error::Interrupted),
+            out = f => out,
+        },
+        None => f.await,
+    }
+}
+
+/// Owns a request's streams; dropping it before the reply arrived (a timeout, an interrupt) resets both directions so the server sees a cancellation rather than a clean end of stream.
 struct Streams {
     send: SendStream,
     recv: RecvStream,
@@ -287,8 +321,10 @@ impl Caller {
         result
     }
 
-    /// The exchange and its retries; every attempt's phases are added to `account`.
+    /// The exchange and its retries; every attempt's phases are added to `account`. Either wait ends early when the kernel interrupts the request the call is made for.
     async fn attempt(&self, req: &Request, account: &mut AccountCall) -> Result<Response, Error> {
+        let kernel = current_request();
+        let kernel = kernel.as_deref();
         let deadline = Instant::now() + self.op_timeout;
         let handle = req.fh().and_then(|fh| self.handles.get(fh));
         let mut min_generation = 0;
@@ -298,12 +334,18 @@ impl Caller {
                 return Err(Error::Stale);
             }
             let waiting = Instant::now();
-            let attached = self.wait_connected(deadline, min_generation).await;
+            let attached =
+                interruptible(kernel, self.wait_connected(deadline, min_generation)).await;
             account.phases.wait += waiting.elapsed();
             let attached = attached?;
             let mut timing = Timing::default();
             let attempt = Instant::now();
-            let exchanged = timeout_at(deadline, exchange(&attached.conn, req, &mut timing)).await;
+            let exchanged = interruptible(kernel, async {
+                timeout_at(deadline, exchange(&attached.conn, req, &mut timing))
+                    .await
+                    .map_err(|_| Error::Timeout)
+            })
+            .await;
             account.phases += timing.phases(attempt);
             match exchanged {
                 Ok(Ok(Response::Err(errno))) => return Err(Error::Remote(errno)),
@@ -323,13 +365,13 @@ impl Caller {
                     min_generation = attached.generation + 1;
                 }
                 Ok(Err(ErrorExchange::Protocol(msg))) => return Err(Error::Protocol(msg)),
-                Err(_) => return Err(Error::Timeout),
+                Err(e) => return Err(e),
             }
             account.retries += 1;
         }
     }
 
-    /// An open whose reply timed out may have succeeded on the server; tell it to let go of that id, in the background, on its own deadline.
+    /// An open whose reply was not received may have succeeded on the server; tell it to let go of that id, in the background, on its own deadline. Spawned, so it carries no kernel request: the cleanup after an interrupted open must not itself be interrupted.
     fn release_orphan(&self, req: Request) {
         let caller = self.clone();
         tokio::spawn(async move {
@@ -473,7 +515,10 @@ impl Client {
                 self.caller.release_orphan(release_request(kind, fh));
                 Err(unexpected(other))
             }
-            Err(e @ (Error::Timeout | Error::Disconnected | Error::Protocol(_))) => {
+            Err(
+                e
+                @ (Error::Timeout | Error::Interrupted | Error::Disconnected | Error::Protocol(_)),
+            ) => {
                 self.caller.release_orphan(release_request(kind, fh));
                 Err(e)
             }
@@ -757,6 +802,7 @@ mod tests {
     #[test]
     fn errno_mapping_clamps_garbage() {
         assert_eq!(Error::Timeout.errno(), libc::ETIMEDOUT);
+        assert_eq!(Error::Interrupted.errno(), libc::EINTR);
         assert_eq!(Error::Disconnected.errno(), libc::EIO);
         assert_eq!(Error::Stale.errno(), libc::ESTALE);
         assert_eq!(Error::Remote(libc::ENOENT).errno(), libc::ENOENT);

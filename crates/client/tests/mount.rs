@@ -118,11 +118,75 @@ impl Mounted {
             server.stop().await;
         }
     }
+
+    /// The way down for a mount whose server will never answer: fusermount unmounts lazily, so the mount lives while any process is blocked in a request against it (on a desktop, something probes every new mount), and only an abort ends that. A test that panics before this drops the mount instead, which aborts on its own.
+    async fn abort_and_finish(self) {
+        self.mount.as_ref().unwrap().aborter().abort();
+        tokio::time::timeout(Duration::from_secs(3), self.finish())
+            .await
+            .expect("unmount did not complete after the abort");
+    }
 }
 
 /// Filesystem calls against the mount block the calling thread until the FUSE request round-trips; keep them off the runtime workers.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     tokio::task::spawn_blocking(f).await.unwrap()
+}
+
+/// Whether `pid` is blocked inside a FUSE request right now, by the wait channel the kernel reports for it.
+fn blocked_in_fuse(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/wchan"))
+        .is_ok_and(|wchan| wchan.trim() == "request_wait_answer")
+}
+
+/// Read a path from a child process, wait until it is blocked in its request, send it SIGINT, and return how it ended, or `None` if it was still running after `patience`. The child handles the signal and exits 42 only when its read fails with `EINTR`, so the exit code says whether this client answered the interrupt. A handled signal is what a real Ctrl-C to a program with a handler is, and it has no shortcut: the kernel fails a request that is still queued for the daemon by itself when a fatal signal arrives, and that would pass for an interrupt here. The child says when its handler is in place, since a signal before that would just kill it.
+async fn read_and_interrupt(path: PathBuf, patience: Duration) -> Option<std::process::ExitStatus> {
+    let mut child = std::process::Command::new("python3")
+        .arg("-c")
+        .arg("import signal, sys; signal.signal(signal.SIGINT, lambda *_: sys.exit(42)); print('ready', flush=True); open(sys.argv[1], 'rb').read()")
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let ready = blocking(move || {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line).unwrap();
+        line
+    })
+    .await;
+    assert_eq!(ready, "ready\n");
+    let pid = child.id();
+    wait_for(
+        Duration::from_secs(3),
+        "the reader to block in its request",
+        || blocked_in_fuse(pid).then_some(()),
+    )
+    .await;
+    let proc_of =
+        |what: &str| fs::read_to_string(format!("/proc/{pid}/{what}")).unwrap_or_default();
+    eprintln!(
+        "reader {pid} at the signal: wchan {} syscall {}",
+        proc_of("wchan").trim(),
+        proc_of("syscall").trim()
+    );
+    // SAFETY: plain kill(2) on a pid this test owns.
+    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) }, 0);
+    let deadline = Instant::now() + patience;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() > deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    if status.is_none() {
+        child.kill().unwrap();
+    }
+    status
 }
 
 /// A libc directory stream, closed when dropped so a failed assertion cannot leave a handle open on a mount the test still has to unmount.
@@ -1103,4 +1167,53 @@ async fn an_abort_fails_pending_requests_and_frees_the_unmount() {
     tokio::time::timeout(Duration::from_secs(3), m.finish())
         .await
         .expect("unmount did not complete after the abort");
+}
+
+/// Server calls the kernel's interrupt abandoned, summed over every op, so a test need not know which request of the reader was the one that blocked.
+fn interrupted_calls(mount: &Mount) -> u64 {
+    mount
+        .perf()
+        .report()
+        .call
+        .values()
+        .filter_map(|row| row.row.errnos.get(&libc::EINTR))
+        .sum()
+}
+
+/// A process blocked in a call while the server is away can be interrupted: the call fails with `EINTR` and the pending signal ends the process. Twice, because a wrong answer to the first interrupt can make the kernel stop sending them for the life of the mount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_interrupts_a_call_waiting_for_the_server() {
+    let Some(mut m) = Mounted::start(Duration::from_secs(60), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let mnt2 = mnt.clone();
+    blocking(move || fs::write(mnt2.join("f"), b"data").unwrap()).await;
+    m.server.take().unwrap().stop().await;
+    for round in 1..=2 {
+        let status = read_and_interrupt(mnt.join("f"), Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|| panic!("round {round}: the reader was not interrupted"));
+        assert_eq!(status.code(), Some(42), "round {round}: {status}");
+    }
+    assert_eq!(interrupted_calls(m.mount.as_ref().unwrap()), 2);
+    // The server is gone, so anything else that touched the mount meanwhile is still waiting for it.
+    m.abort_and_finish().await;
+}
+
+/// The reported case: the connection is fine and the server simply does not answer. The call has no deadline, and a signal is what ends the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_interrupts_a_call_blocked_on_a_live_connection() {
+    let Some(m) = Mounted::start_stalled().await else {
+        return;
+    };
+    let mnt = m.mnt();
+    for round in 1..=2 {
+        let status = read_and_interrupt(mnt.join("never"), Duration::from_secs(3))
+            .await
+            .unwrap_or_else(|| panic!("round {round}: the reader was not interrupted"));
+        assert_eq!(status.code(), Some(42), "round {round}: {status}");
+    }
+    assert_eq!(interrupted_calls(m.mount.as_ref().unwrap()), 2);
+    m.abort_and_finish().await;
 }
