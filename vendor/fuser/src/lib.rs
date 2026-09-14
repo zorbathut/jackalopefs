@@ -409,6 +409,10 @@ pub trait Filesystem: Send + Sync + 'static {
     /// Called on filesystem exit.
     fn destroy(&mut self) {}
 
+    // jackalopefs: local patch, see vendor/README.md.
+    /// The kernel asks that the request `unique` be abandoned: a process blocked on it got a signal. A filesystem that honours this replies to that request with `EINTR`; one that ignores it lets the request finish. The kernel expects no reply to the interrupt itself.
+    fn interrupt(&self, _req: &Request, _unique: RequestId) {}
+
     /// Look up a directory entry by name and get its attributes.
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         warn!("[Not Implemented] lookup(parent: {parent:#x?}, name {name:?})");

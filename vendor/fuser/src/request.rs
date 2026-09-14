@@ -90,6 +90,8 @@ impl<'a> RequestWithSender<'a> {
                     | ll::Operation::Release(_)
                     | ll::Operation::ReleaseDir(_) => {}
                     ll::Operation::ReadDirPlus(_) => {}
+                    // jackalopefs: local patch, see vendor/README.md. The kernel sends interrupts with a zeroed header, so an owner-only session would refuse them with EACCES, which the kernel ignores, and the interrupted process would hang.
+                    ll::Operation::Interrupt(_) => {}
                     _ => {
                         return Err(Errno::EACCES);
                     }
@@ -114,9 +116,9 @@ impl<'a> RequestWithSender<'a> {
                 return Err(Errno::EIO);
             }
 
-            ll::Operation::Interrupt(_) => {
-                // TODO: handle FUSE_INTERRUPT
-                return Err(Errno::ENOSYS);
+            // jackalopefs: local patch, see vendor/README.md. No reply: the kernel discards any reply to an interrupt except ENOSYS, which disables interrupts for the life of the mount, and EAGAIN, which requeues it.
+            ll::Operation::Interrupt(x) => {
+                filesystem.interrupt(self.request_header(), x.unique());
             }
 
             ll::Operation::Lookup(x) => {

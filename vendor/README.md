@@ -8,4 +8,4 @@ Upstream no longer accepts pull requests, so the changes below live here. Each h
 
 ### Local patches
 
-None yet.
+- **`FUSE_INTERRUPT` is dispatched to `Filesystem::interrupt(&self, req, unique)`** (`src/lib.rs`, `src/request.rs`) instead of being answered with `ENOSYS`. The default implementation does nothing, and nothing is ever sent in reply to the interrupt: the kernel takes an `ENOSYS` reply as "this filesystem never handles interrupts" and stops sending them for the life of the mount, after which not even `SIGKILL` frees a process blocked in a request. That is upstream's behaviour and it must not come back with a rebase. The interrupt is also added to the operations exempt from the session's uid check, because the kernel sends it with a zeroed header.
