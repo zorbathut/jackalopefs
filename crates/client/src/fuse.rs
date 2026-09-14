@@ -1,9 +1,9 @@
 //! The FUSE backend: every kernel request is copied out of the session thread and answered from a tokio task, so the session thread never waits on the network.
 
-use crate::client::{Client, Error};
+use crate::client::{Client, Error, RequestKernel};
 use crate::inodes::{NodeTable, ROOT};
 use crate::invalidate::Work;
-use crate::perf::{Outcome, REQUEST_ID, TRACE_TARGET};
+use crate::perf::{Outcome, TRACE_TARGET};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
     KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
@@ -140,9 +140,10 @@ impl Backend {
     fn spawn<F: std::future::Future<Output = Outcome> + Send + 'static>(&self, key: KeyPerf, f: F) {
         let perf = self.shared.client.perf().clone();
         let started = Instant::now();
+        let request = RequestKernel::new(key.unique);
         self.runtime.spawn(async move {
             let inflight = perf.start();
-            let outcome = REQUEST_ID.scope(key.unique, f).await;
+            let outcome = request.scope(f).await;
             let total = started.elapsed();
             perf.record_fuse(key.op, &outcome, total);
             if tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE) {

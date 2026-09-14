@@ -2,13 +2,14 @@
 
 use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::{HandleKind, HandleTable};
-use crate::perf::{current_request, AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
+use crate::perf::{AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_proto::{
     read_frame, write_frame, Attr, Auth, DirEntry, DirEntryPlus, ErrorCodec, Event, Name, Path,
     Request, Response, SetAttr, Statfs,
 };
 use quinn::{Connection, RecvStream, SendStream};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +62,31 @@ impl From<ErrorExchange> for Error {
             ErrorExchange::Protocol(msg) => Error::Protocol(msg),
         }
     }
+}
+
+/// The kernel request a call is made for: its id, so a `call` trace line can be joined to the `fuse` line it served. A call made outside one (an orphan handle release, a reopen after a reconnect) has none.
+pub struct RequestKernel {
+    pub unique: u64,
+}
+
+impl RequestKernel {
+    pub fn new(unique: u64) -> Arc<RequestKernel> {
+        Arc::new(RequestKernel { unique })
+    }
+
+    /// Run `f` as the work of this request.
+    pub async fn scope<F: Future>(self: Arc<Self>, f: F) -> F::Output {
+        REQUEST_KERNEL.scope(self, f).await
+    }
+}
+
+tokio::task_local! {
+    static REQUEST_KERNEL: Arc<RequestKernel>;
+}
+
+/// The kernel request the current task is answering, if any.
+fn current_request() -> Option<Arc<RequestKernel>> {
+    REQUEST_KERNEL.try_with(Arc::clone).ok()
 }
 
 /// Owns a request's streams; dropping it before the reply arrived (a timeout) resets both directions so the server sees a cancellation rather than a clean end of stream.
@@ -241,7 +267,7 @@ impl Caller {
             let (fh, offset, size) = req.perf_fields();
             tracing::trace!(
                 target: TRACE_TARGET,
-                unique = current_request(),
+                unique = current_request().map(|r| r.unique),
                 op,
                 fh,
                 offset,

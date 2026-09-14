@@ -10,16 +10,6 @@ use std::time::{Duration, Instant};
 /// Target of the per-request trace lines, so `RUST_LOG=jackalopefs_client::perf=trace` enables them alone.
 pub const TRACE_TARGET: &str = "jackalopefs_client::perf";
 
-tokio::task_local! {
-    /// The kernel request id of the task answering it, so a `call` trace line can be joined to the `fuse` line it served; unset in a call made outside one (an orphan handle release).
-    pub static REQUEST_ID: u64;
-}
-
-/// The kernel request the current task is answering, if any.
-pub fn current_request() -> Option<u64> {
-    REQUEST_ID.try_with(|id| *id).ok()
-}
-
 /// What one request produced: payload bytes moved, directory entries returned, and the errno it failed with (0 for success).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {

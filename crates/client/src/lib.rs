@@ -10,7 +10,7 @@ pub mod mount;
 pub mod perf;
 pub mod transport;
 
-pub use client::{Client, Config, Error};
+pub use client::{Client, Config, Error, RequestKernel};
 pub use conn::{ConnState, ErrorConnect, ErrorConnectKind};
 pub use perf::Perf;
 pub use transport::ServerTrust;
