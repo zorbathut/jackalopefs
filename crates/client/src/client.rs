@@ -1,4 +1,4 @@
-//! The typed request API. Every call has a deadline that covers waiting for a connection, opening the stream, and the exchange itself; a call whose reply was lost to a dropped connection is retried once on the next connection only when that is safe.
+//! The typed request API. A request on a live connection is waited for as long as that connection lives, or up to an optional deadline; only the wait for a connection is always bounded. A call whose reply was lost to a dropped connection is retried once on the next connection only when that is safe, and a call made for a kernel request is abandoned when the kernel interrupts that request.
 
 use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::{HandleKind, HandleTable};
@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout, timeout_at, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -106,6 +106,14 @@ tokio::task_local! {
 /// The kernel request the current task is answering, if any.
 fn current_request() -> Option<Arc<RequestKernel>> {
     REQUEST_KERNEL.try_with(Arc::clone).ok()
+}
+
+/// `f` under an optional deadline.
+async fn within<T>(limit: Option<Duration>, f: impl Future<Output = T>) -> Result<T, Error> {
+    match limit {
+        Some(limit) => timeout(limit, f).await.map_err(|_| Error::Timeout),
+        None => Ok(f.await),
+    }
 }
 
 /// `f`, abandoned if the kernel interrupts the request it is made for; a request already interrupted is not even started.
@@ -261,7 +269,10 @@ struct Caller {
     state: watch::Receiver<ConnState>,
     handles: Arc<HandleTable>,
     perf: Arc<Perf>,
-    op_timeout: Duration,
+    /// Longest one exchange on a live connection may take; `None` waits as long as the connection lives.
+    op_timeout: Option<Duration>,
+    /// Longest a call waits for a connection.
+    offline_timeout: Duration,
 }
 
 impl Caller {
@@ -272,6 +283,9 @@ impl Caller {
     ) -> Result<Arc<Attached>, Error> {
         let mut state = self.state.clone();
         loop {
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
             let current = state.borrow_and_update().clone();
             match current {
                 ConnState::Connected(attached) if attached.generation >= min_generation => {
@@ -321,11 +335,11 @@ impl Caller {
         result
     }
 
-    /// The exchange and its retries; every attempt's phases are added to `account`. Either wait ends early when the kernel interrupts the request the call is made for.
+    /// The exchange and its retries; every attempt's phases are added to `account`. The two waits have different clocks. The wait for a connection is bounded by the offline deadline, set once and renewed only for the one resend a lost reply gets, so a server that keeps accepting connections and failing streams cannot hold a call forever. The exchange itself is bounded only by the optional operation deadline: a server slow to answer on a live connection is not an error, and the connection's own idle timeout fails the exchange if the server dies. Either wait ends early when the kernel interrupts the request the call is made for.
     async fn attempt(&self, req: &Request, account: &mut AccountCall) -> Result<Response, Error> {
         let kernel = current_request();
         let kernel = kernel.as_deref();
-        let deadline = Instant::now() + self.op_timeout;
+        let mut offline_deadline = Instant::now() + self.offline_timeout;
         let handle = req.fh().and_then(|fh| self.handles.get(fh));
         let mut min_generation = 0;
         let mut lost_once = false;
@@ -334,17 +348,19 @@ impl Caller {
                 return Err(Error::Stale);
             }
             let waiting = Instant::now();
-            let attached =
-                interruptible(kernel, self.wait_connected(deadline, min_generation)).await;
+            let attached = interruptible(
+                kernel,
+                self.wait_connected(offline_deadline, min_generation),
+            )
+            .await;
             account.phases.wait += waiting.elapsed();
             let attached = attached?;
             let mut timing = Timing::default();
             let attempt = Instant::now();
-            let exchanged = interruptible(kernel, async {
-                timeout_at(deadline, exchange(&attached.conn, req, &mut timing))
-                    .await
-                    .map_err(|_| Error::Timeout)
-            })
+            let exchanged = interruptible(
+                kernel,
+                within(self.op_timeout, exchange(&attached.conn, req, &mut timing)),
+            )
             .await;
             account.phases += timing.phases(attempt);
             match exchanged {
@@ -362,6 +378,7 @@ impl Caller {
                         "reply lost with the connection; retrying once on the next one"
                     );
                     lost_once = true;
+                    offline_deadline = Instant::now() + self.offline_timeout;
                     min_generation = attached.generation + 1;
                 }
                 Ok(Err(ErrorExchange::Protocol(msg))) => return Err(Error::Protocol(msg)),
@@ -371,9 +388,10 @@ impl Caller {
         }
     }
 
-    /// An open whose reply was not received may have succeeded on the server; tell it to let go of that id, in the background, on its own deadline. Spawned, so it carries no kernel request: the cleanup after an interrupted open must not itself be interrupted.
+    /// An open whose reply was not received may have succeeded on the server; tell it to let go of that id, in the background. Spawned, so it carries no kernel request: the cleanup after an interrupted open must not itself be interrupted. Bounded by the offline deadline, so best-effort releases cannot pile up against a server that never answers.
     fn release_orphan(&self, req: Request) {
-        let caller = self.clone();
+        let mut caller = self.clone();
+        caller.op_timeout = self.op_timeout.or(Some(self.offline_timeout));
         tokio::spawn(async move {
             if let Err(e) = caller.call(req).await {
                 tracing::debug!("orphan handle release failed: {e}");
@@ -390,7 +408,10 @@ pub struct Config {
     pub trust: ServerTrust,
     pub auth: Auth,
     pub connect_timeout: Duration,
-    pub op_timeout: Duration,
+    /// Longest to wait for the server's reply once a request is on a live connection; `None` waits as long as the connection lives.
+    pub op_timeout: Option<Duration>,
+    /// Longest a call waits for a connection before failing with `ETIMEDOUT`.
+    pub offline_timeout: Duration,
 }
 
 pub struct Client {
@@ -410,7 +431,7 @@ impl Client {
                 trust: cfg.trust,
                 auth: cfg.auth,
                 connect_timeout: cfg.connect_timeout,
-                op_timeout: cfg.op_timeout,
+                offline_timeout: cfg.offline_timeout,
             },
             handles.clone(),
         )
@@ -421,6 +442,7 @@ impl Client {
                 handles,
                 perf,
                 op_timeout: cfg.op_timeout,
+                offline_timeout: cfg.offline_timeout,
             },
             conn,
         })

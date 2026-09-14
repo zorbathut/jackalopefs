@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# What no external suite tests: a server that stops answering, dies, and comes back, under load through a real mount. Operations must fail with ETIMEDOUT inside the deadline instead of hanging, resume when the server does, survive a server restart with contents and open files intact, and a lazy detach must free the mount at once.
+# What no external suite tests: a server that stops answering, dies, and comes back, under load through a real mount. Operations must fail with ETIMEDOUT once the connection is gone and the offline deadline has passed instead of hanging, resume when the server does, survive a server restart with contents and open files intact, and a lazy detach must free the mount at once. A request on a live connection has no deadline, so the writer's and reader's `timeout 10` is what bounds them while the server is stopped, and its SIGTERM frees a blocked shell only because the client honours FUSE_INTERRUPT: a client without that shows up here as a hung suite.
 set -euo pipefail
-export JFS_OP_TIMEOUT=3s
+export JFS_OFFLINE_TIMEOUT=3s
 source "$(dirname "$0")/lib.sh"
 
 fs_start resilience
@@ -34,7 +34,7 @@ stop_load() {
 }
 sleep 1
 
-# probe_timeout <what> cmd…: must fail with ETIMEDOUT, and within the 3 s deadline plus a margin for the kernel round trip.
+# probe_timeout <what> cmd…: must fail with ETIMEDOUT. The first probe is sent on the still-live connection and fails at its 10 s idle timeout plus the 3 s offline deadline; the later probes find no connection and fail within one or two 3 s offline deadlines, one per request the kernel makes for them. The create must not be the first: it is not safe to resend, so caught by the connection loss it would fail with EIO instead.
 probe_timeout() {
     local what=$1 t0 t1 ms out
     shift
@@ -44,7 +44,7 @@ probe_timeout() {
     ms=$(( (t1 - t0) / 1000000 ))
     log "$what: ${ms} ms, $out"
     case "$out" in *"timed out"*) ;; *) fail "$what did not fail with ETIMEDOUT" ;; esac
-    [ "$ms" -le 6000 ] || fail "$what took ${ms} ms against a 3 s deadline"
+    [ "$ms" -le 20000 ] || fail "$what took ${ms} ms against a 10 s idle timeout and a 3 s offline deadline"
 }
 
 log "server stopped: operations must time out"

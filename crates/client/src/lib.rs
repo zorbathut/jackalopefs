@@ -1,4 +1,4 @@
-//! jackalopefs client: a reconnecting QUIC session to one server, a typed request API with a deadline on every call, and (in [`mount`]) the FUSE backend that presents it as a filesystem.
+//! jackalopefs client: a reconnecting QUIC session to one server, a typed request API whose calls wait for a live connection's reply and fail by a deadline only while there is no connection, and (in [`mount`]) the FUSE backend that presents it as a filesystem.
 
 pub mod client;
 pub mod conn;

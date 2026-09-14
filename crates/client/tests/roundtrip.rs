@@ -327,9 +327,9 @@ async fn rename_link_symlink_xattr_statfs_access() {
 #[tokio::test]
 async fn timeout_against_a_blackhole_resets_and_releases() {
     let blackhole = Blackhole::start().await;
-    let client = jackalopefs_client::Client::connect(blackhole.config(Duration::from_millis(500)))
-        .await
-        .unwrap();
+    let mut cfg = blackhole.config(Duration::from_secs(5));
+    cfg.op_timeout = Some(Duration::from_millis(500));
+    let client = jackalopefs_client::Client::connect(cfg).await.unwrap();
 
     let started = Instant::now();
     let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
@@ -848,7 +848,7 @@ async fn client_refuses_a_foreign_revision() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // A mounted client whose server changes revision underneath it: the reconnect is refused every time, the state stays Connecting, and calls fail by the deadline rather than at once, so a rollback can still recover the mount.
+    // A mounted client whose server changes revision underneath it: the reconnect is refused every time, the state stays Connecting, and calls fail by the offline deadline rather than at once, so a rollback can still recover the mount.
     let hole = Blackhole::start_handshaking(vec![
         Blackhole::ack(),
         HelloReply::RevisionMismatch {
@@ -957,9 +957,9 @@ async fn perf_tables_count_what_was_done() {
 async fn perf_counts_a_timeout_by_its_errno() {
     let blackhole = Blackhole::start().await;
     let op_timeout = Duration::from_millis(500);
-    let client = jackalopefs_client::Client::connect(blackhole.config(op_timeout))
-        .await
-        .unwrap();
+    let mut cfg = blackhole.config(Duration::from_secs(5));
+    cfg.op_timeout = Some(op_timeout);
+    let client = jackalopefs_client::Client::connect(cfg).await.unwrap();
     let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
     assert!(matches!(err, Error::Timeout), "{err}");
 
@@ -976,6 +976,104 @@ async fn perf_counts_a_timeout_by_its_errno() {
         row.phases.reply >= op_timeout / 2,
         "reply phase {:?}",
         row.phases.reply
+    );
+    client.shutdown().await;
+}
+
+/// With no operation deadline, a request on a live connection is simply waited for; the client neither gives up nor cancels it on the wire.
+#[tokio::test]
+async fn a_call_on_a_live_connection_has_no_deadline() {
+    let blackhole = Blackhole::start().await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(blackhole.config(Duration::from_millis(500)))
+            .await
+            .unwrap(),
+    );
+    let caller = client.clone();
+    // Spawned rather than wrapped in a timeout: dropping the call future would itself cancel the stream.
+    let pending = tokio::spawn(async move { caller.getattr(Some(Path::root()), None).await });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !pending.is_finished(),
+        "the call gave up on a live connection"
+    );
+    assert!(
+        blackhole.stops.lock().is_empty(),
+        "the call was cancelled on the wire"
+    );
+    pending.abort();
+    client.shutdown().await;
+}
+
+/// Losing the connection is what fails a pending call: at once when it cannot be resent, and by the offline deadline when the resend finds no connection.
+#[tokio::test]
+async fn a_pending_call_fails_when_its_connection_is_lost() {
+    let blackhole = Blackhole::start().await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(blackhole.config(Duration::from_millis(500)))
+            .await
+            .unwrap(),
+    );
+    let caller = client.clone();
+    let pending = tokio::spawn(async move {
+        caller
+            .mkdir(Path::root(), name("d"), 0o755)
+            .await
+            .unwrap_err()
+    });
+    wait_for(
+        Duration::from_secs(3),
+        "the mkdir to reach the blackhole",
+        || (!blackhole.requests.lock().is_empty()).then_some(()),
+    )
+    .await;
+    let started = Instant::now();
+    blackhole.connections.lock()[0].close(9u32.into(), b"simulated blip");
+    let err = tokio::time::timeout(Duration::from_secs(1), pending)
+        .await
+        .expect("a lost mkdir fails at once")
+        .unwrap();
+    assert!(matches!(err, Error::Disconnected), "{err}");
+    assert_eq!(err.errno(), libc::EIO);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+    client.shutdown().await;
+
+    let hole = Blackhole::start_handshaking(vec![
+        Blackhole::ack(),
+        HelloReply::RevisionMismatch {
+            revision: PROTO_REVISION ^ 1,
+        },
+    ])
+    .await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(hole.config(Duration::from_millis(500)))
+            .await
+            .unwrap(),
+    );
+    let caller = client.clone();
+    let pending =
+        tokio::spawn(async move { caller.getattr(Some(Path::root()), None).await.unwrap_err() });
+    wait_for(
+        Duration::from_secs(3),
+        "the getattr to reach the blackhole",
+        || (!hole.requests.lock().is_empty()).then_some(()),
+    )
+    .await;
+    let started = Instant::now();
+    hole.connections.lock()[0].close(9u32.into(), b"simulated blip");
+    let err = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .expect("a lost getattr fails by the offline deadline")
+        .unwrap();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
+        "{elapsed:?}"
     );
     client.shutdown().await;
 }

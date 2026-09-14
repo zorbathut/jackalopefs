@@ -24,7 +24,7 @@ Client:
 jackalopefs-client server[:port] /mnt/share --fingerprint sha256:… [--token SECRET]
 ```
 
-The server is a host name or an IP address, with or without a port (an IPv6 address with a port in brackets, `[::1]:1933`); the port defaults to 1933. Every address the name resolves to is tried in turn, each within `--connect-timeout`. `--fingerprint` pins the server certificate; `--insecure` skips that check (the connection is still encrypted). Other options: `--op-timeout 30s`, `--connect-timeout 10s`, `--entry-timeout 1s`, `--attr-timeout 1s`, `--allow-other`, `--auto-unmount`, `--default-permissions`. The client runs in the foreground and unmounts on `SIGINT`/`SIGTERM`.
+The server is a host name or an IP address, with or without a port (an IPv6 address with a port in brackets, `[::1]:1933`); the port defaults to 1933. Every address the name resolves to is tried in turn, each within `--connect-timeout`. `--fingerprint` pins the server certificate; `--insecure` skips that check (the connection is still encrypted). Other options: `--offline-timeout 30s`, `--op-timeout` (unset: a request on a live connection waits for its reply as long as the connection lives), `--connect-timeout 10s`, `--entry-timeout 1s`, `--attr-timeout 1s`, `--allow-other`, `--auto-unmount`, `--default-permissions`. The client runs in the foreground and unmounts on `SIGINT`/`SIGTERM`.
 
 `--default-permissions` has the kernel enforce mode bits against the attributes the server reports before it forwards a request. The server only ever checks its own access, so a mount shared through `--allow-other` enforces nothing without it. It costs extra attribute fetches, bounded by `--attr-timeout`, and a `chmod` made on the server side is honoured only after that timeout or the change event. The client warns at startup when `--allow-other` is given without it. It also means the kernel answers `access(2)` itself instead of asking the server, which is what makes a file manager's per-entry permission checks free. The check is against the caller's uid, and uids pass through unchanged, so it is exact when the server runs as the user whose files these are.
 
@@ -68,11 +68,12 @@ Be aware that this was mostly Claude-coded. I've been thinking about this genera
 
 ## When the server goes away
 
-- A filesystem call blocked on the server fails with `ETIMEDOUT` after `--op-timeout`; a call that was in flight when the connection dropped fails with `EIO` unless it is safe to retry, in which case it is retried once on the next connection.
+- A filesystem call on a live connection waits for its reply as long as that connection lives (or up to `--op-timeout`, if set): a server that is slow is not an error. A call that was in flight when the connection dropped fails with `EIO` unless it is safe to retry, in which case it is retried once on the next connection; a call that has no connection waits up to `--offline-timeout` for one and then fails with `ETIMEDOUT`.
+- A process blocked in a call can be interrupted: any signal it receives makes the call fail with `EINTR` and abandons the request on the wire, whether or not the server had applied it (the same as libfuse's `intr` option, so a program with a signal handler blocked in a slow call can see `EINTR` where a local filesystem would not show it).
 - The client reconnects with exponential backoff for as long as it is mounted. If the server kept the session (up to 60 s), open files continue exactly where they were; otherwise each open file is reopened by path and verified to be the same inode, and a handle whose file changed underneath it fails with `ESTALE`.
-- A server and client built from different protocol revisions refuse each other before any authentication, and both log the two revisions (`jackalopefs-client` exits with them when it is the first connection). While mounted, the client keeps retrying so that a server rollback recovers the mount, but calls fail with `ETIMEDOUT` until one side is rebuilt or the mount is given up as below.
-- A write that the kernel had cached when the server went away fails at the next `fsync(2)` or `close(2)` with `EIO` unless it was safe to retry and the reconnect delivered it; a close with much unflushed data waits one operation deadline per batch the kernel tries to flush.
-- To give up on a mount: `fusermount3 -uz /mnt/share` detaches the mount point, and killing `jackalopefs-client` fails every pending and future call with `ENOTCONN` immediately. Nothing needs root and nothing can wedge in uninterruptible sleep beyond the operation deadline, or a few of them for a close with cached data.
+- A server and client built from different protocol revisions refuse each other before any authentication, and both log the two revisions (`jackalopefs-client` exits with them when it is the first connection). While mounted, the client keeps retrying so that a server rollback recovers the mount, but calls fail with `ETIMEDOUT` by the offline deadline until one side is rebuilt or the mount is given up as below.
+- A write that the kernel had cached when the server went away fails at the next `fsync(2)` or `close(2)` with `EIO` unless it was safe to retry and the reconnect delivered it. Against a server that is alive but never answers, cached writes stay pending: the kernel's writeback is not interruptible, so they are pinned until the mount is given up, and a system-wide `sync(2)` (a shutdown, say) blocks on them until then.
+- To give up on a mount: a second `SIGINT` or `SIGTERM` to `jackalopefs-client` while it is unmounting aborts the FUSE connection, which fails every pending request with `ECONNABORTED` (writeback included) and lets the unmount finish; `fusermount3 -uz /mnt/share` detaches the mount point; killing `jackalopefs-client` fails every pending and future call with `ENOTCONN` immediately. Nothing needs root.
 
 ## Semantics
 
@@ -87,7 +88,7 @@ cargo build --release
 cargo test --workspace
 ```
 
-The test suite runs real servers on loopback and, where `/dev/fuse` and `fusermount3` are available, real FUSE mounts; the mount tests skip themselves otherwise.
+The test suite runs real servers on loopback and, where `/dev/fuse` and `fusermount3` are available, real FUSE mounts (the interrupt tests also need `python3`); the mount tests skip themselves otherwise.
 
 `scripts/validate/all.sh` runs the external validation suites (pjdfstest, fsx, fsstress, fio) plus resilience and cache-coherence checks of our own against a fresh server and mount; `docs/validation.md` describes them, their prerequisites, and what the results mean.
 

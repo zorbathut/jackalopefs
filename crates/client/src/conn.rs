@@ -34,7 +34,8 @@ pub struct ConfigConn {
     pub trust: ServerTrust,
     pub auth: Auth,
     pub connect_timeout: Duration,
-    pub op_timeout: Duration,
+    /// Bounds each step of reopening the handles after a new session.
+    pub offline_timeout: Duration,
 }
 
 /// A live, handshaken connection.
@@ -234,7 +235,7 @@ async fn run(
 
         if !resumed {
             tokio::select! {
-                _ = reopen_handles(&conn, &handles, cfg.op_timeout) => {}
+                _ = reopen_handles(&conn, &handles, cfg.offline_timeout) => {}
                 _ = stop.changed() => {
                     conn.close(close_code::UNMOUNT.into(), b"unmount");
                     break;
@@ -422,8 +423,8 @@ async fn connect_once(
     }
 }
 
-/// The server has no memory of our handles: reopen each by path, concurrently, keep only those that still name the same inode, and release the rest so the server doesn't hold what we won't use. Every step has the operation deadline, and the steps run concurrently, so the whole phase is bounded by two of them.
-async fn reopen_handles(conn: &Connection, handles: &HandleTable, op_timeout: Duration) {
+/// The server has no memory of our handles: reopen each by path, concurrently, keep only those that still name the same inode, and release the rest so the server doesn't hold what we won't use. Every step has the offline deadline: reopening is part of getting the connection back, and the connection is not published until it is done, so a reopen without a bound would keep every call on the mount waiting. The steps run concurrently, so the whole phase is bounded by two of them.
+async fn reopen_handles(conn: &Connection, handles: &HandleTable, offline_timeout: Duration) {
     let live = handles.live();
     if live.is_empty() {
         return;
@@ -434,7 +435,7 @@ async fn reopen_handles(conn: &Connection, handles: &HandleTable, op_timeout: Du
         let conn = conn.clone();
         reopens.spawn(async move {
             let outcome = match timeout(
-                op_timeout,
+                offline_timeout,
                 exchange(&conn, &rec.reopen_request(fh), &mut Timing::default()),
             )
             .await
@@ -458,7 +459,7 @@ async fn reopen_handles(conn: &Connection, handles: &HandleTable, op_timeout: Du
                     };
                     releases.spawn(async move {
                         match timeout(
-                            op_timeout,
+                            offline_timeout,
                             exchange(&conn, &release, &mut Timing::default()),
                         )
                         .await

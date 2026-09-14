@@ -37,16 +37,20 @@ struct Mounted {
 }
 
 impl Mounted {
-    async fn start(op_timeout: Duration, ttl: Duration) -> Option<Mounted> {
-        Mounted::start_full(op_timeout, ttl, true).await
+    async fn start(offline_timeout: Duration, ttl: Duration) -> Option<Mounted> {
+        Mounted::start_full(offline_timeout, ttl, true).await
     }
 
     /// A mount whose server sends no change events.
-    async fn start_unwatched(op_timeout: Duration, ttl: Duration) -> Option<Mounted> {
-        Mounted::start_full(op_timeout, ttl, false).await
+    async fn start_unwatched(offline_timeout: Duration, ttl: Duration) -> Option<Mounted> {
+        Mounted::start_full(offline_timeout, ttl, false).await
     }
 
-    async fn start_full(op_timeout: Duration, ttl: Duration, watched: bool) -> Option<Mounted> {
+    async fn start_full(
+        offline_timeout: Duration,
+        ttl: Duration,
+        watched: bool,
+    ) -> Option<Mounted> {
         if !fuse_available() {
             return None;
         }
@@ -56,7 +60,7 @@ impl Mounted {
         } else {
             TestServer::start_unwatched(export.path()).await
         };
-        let (mount, mountpoint) = Mounted::mount(server.config(op_timeout), ttl).await;
+        let (mount, mountpoint) = Mounted::mount(server.config(offline_timeout), ttl).await;
         Some(Mounted {
             mount: Some(mount),
             server: Some(server),
@@ -1134,41 +1138,6 @@ async fn an_external_size_change_is_seen_within_the_attribute_ttl_without_events
     m.finish().await;
 }
 
-/// Aborting the mount's FUSE connection fails every pending request and lets an unmount complete however stuck the server is.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_abort_fails_pending_requests_and_frees_the_unmount() {
-    let Some(m) = Mounted::start_stalled().await else {
-        return;
-    };
-    let mnt = m.mnt();
-    let mut child = std::process::Command::new("cat")
-        .arg(mnt.join("never"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(child.try_wait().unwrap().is_none(), "cat did not block");
-    m.mount.as_ref().unwrap().aborter().abort();
-    let status = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the blocked cat was not released by the abort");
-    assert!(
-        !status.success(),
-        "cat succeeded against a server that never answered"
-    );
-    tokio::time::timeout(Duration::from_secs(3), m.finish())
-        .await
-        .expect("unmount did not complete after the abort");
-}
-
 /// Server calls the kernel's interrupt abandoned, summed over every op, so a test need not know which request of the reader was the one that blocked.
 fn interrupted_calls(mount: &Mount) -> u64 {
     mount
@@ -1216,4 +1185,39 @@ async fn a_signal_interrupts_a_call_blocked_on_a_live_connection() {
     }
     assert_eq!(interrupted_calls(m.mount.as_ref().unwrap()), 2);
     m.abort_and_finish().await;
+}
+
+/// Aborting the mount's FUSE connection fails every pending request and lets an unmount complete however stuck the server is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abort_fails_pending_requests_and_frees_the_unmount() {
+    let Some(m) = Mounted::start_stalled().await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let mut child = std::process::Command::new("cat")
+        .arg(mnt.join("never"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(child.try_wait().unwrap().is_none(), "cat did not block");
+    m.mount.as_ref().unwrap().aborter().abort();
+    let status = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the blocked cat was not released by the abort");
+    assert!(
+        !status.success(),
+        "cat succeeded against a server that never answered"
+    );
+    tokio::time::timeout(Duration::from_secs(3), m.finish())
+        .await
+        .expect("unmount did not complete after the abort");
 }

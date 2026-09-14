@@ -27,9 +27,12 @@ struct Args {
     /// Token the server requires.
     #[arg(long)]
     token: Option<String>,
-    /// Longest a single filesystem operation may take before it fails with ETIMEDOUT.
+    /// Longest to wait for the server's reply once a request is on a live connection, failing with ETIMEDOUT. Unset, a request waits as long as its connection lives; a blocked process can still be interrupted with a signal.
+    #[arg(long, value_parser = humantime::parse_duration)]
+    op_timeout: Option<Duration>,
+    /// Longest a filesystem operation waits for the connection to come back before failing with ETIMEDOUT.
     #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
-    op_timeout: Duration,
+    offline_timeout: Duration,
     /// Longest one connection attempt may take. Each address the server name resolves to gets its own attempt.
     #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]
     connect_timeout: Duration,
@@ -146,6 +149,7 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(Auth::Anonymous),
             connect_timeout: args.connect_timeout,
             op_timeout: args.op_timeout,
+            offline_timeout: args.offline_timeout,
         };
         tracing::info!(
             "protocol revision {:016x}",

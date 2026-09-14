@@ -113,8 +113,13 @@ impl TestServer {
         self.endpoint.wait_idle().await;
     }
 
-    pub fn config(&self, op_timeout: Duration) -> Config {
-        config_for(self.addr, self.fingerprint, Auth::Anonymous, op_timeout)
+    pub fn config(&self, offline_timeout: Duration) -> Config {
+        config_for(
+            self.addr,
+            self.fingerprint,
+            Auth::Anonymous,
+            offline_timeout,
+        )
     }
 
     pub async fn client(&self) -> Client {
@@ -124,11 +129,12 @@ impl TestServer {
     }
 }
 
+/// A client with the production default of no deadline on a request in flight; tests that need one set `op_timeout` themselves.
 pub fn config_for(
     addr: SocketAddr,
     fingerprint: [u8; 32],
     auth: Auth,
-    op_timeout: Duration,
+    offline_timeout: Duration,
 ) -> Config {
     Config {
         server_addrs: vec![addr],
@@ -136,7 +142,8 @@ pub fn config_for(
         trust: ServerTrust::Fingerprint(fingerprint),
         auth,
         connect_timeout: Duration::from_secs(5),
-        op_timeout,
+        op_timeout: None,
+        offline_timeout,
     }
 }
 
@@ -248,8 +255,13 @@ impl Blackhole {
         }
     }
 
-    pub fn config(&self, op_timeout: Duration) -> Config {
-        config_for(self.addr, self.fingerprint, Auth::Anonymous, op_timeout)
+    pub fn config(&self, offline_timeout: Duration) -> Config {
+        config_for(
+            self.addr,
+            self.fingerprint,
+            Auth::Anonymous,
+            offline_timeout,
+        )
     }
 }
 
