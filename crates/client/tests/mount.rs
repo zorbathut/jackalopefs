@@ -988,6 +988,60 @@ async fn writes_are_merged_by_the_kernel_before_they_reach_the_server() {
     m.finish().await;
 }
 
+/// The kernel copies through the mount by itself when the daemon refuses, and the result looks the same, so the request count is what shows the server did the work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn copy_file_range_moves_no_data_through_the_mount() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let export = m.export.path().to_path_buf();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    let size = 8 << 20;
+    let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    fs::write(export.join("src"), &data).unwrap();
+    perf.report();
+    blocking(move || {
+        use std::os::fd::AsRawFd;
+        let src = fs::File::open(mnt.join("src")).unwrap();
+        let dst = fs::File::create(mnt.join("dst")).unwrap();
+        let mut left = size;
+        while left > 0 {
+            let copied = unsafe {
+                libc::copy_file_range(
+                    src.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    dst.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    left,
+                    0,
+                )
+            };
+            assert!(
+                copied > 0,
+                "copy_file_range: {copied}, {}",
+                std::io::Error::last_os_error()
+            );
+            left -= copied as usize;
+        }
+    })
+    .await;
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
+    })
+    .await;
+    let snap = perf.report();
+    let copy = snap.fuse.get("copy_file_range").expect(
+        "no copy_file_range reached the daemon: the kernel copied through the mount itself",
+    );
+    assert_eq!(copy.bytes, size as u64);
+    assert!(copy.errnos.is_empty(), "{:?}", copy.errnos);
+    let moved: u64 = snap.call.values().map(|call| call.row.bytes).sum();
+    assert_eq!(moved, 0, "server calls moved payload to copy {size} bytes");
+    assert_eq!(fs::read(export.join("dst")).unwrap(), data);
+    m.finish().await;
+}
+
 /// With the kernel positioning appends and the server's descriptor not appending on its own, re-flushed pages land where they belong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appends_through_the_mount_land_once_and_in_order() {

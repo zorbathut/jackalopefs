@@ -31,6 +31,7 @@
 #
 # Senders guarantee (a receiver answers a violation with an ordinary error):
 # - a write payload is at most 1048576 bytes (EINVAL beyond that) and a read asks for at most that many (a larger request is clamped)
+# - a copyFileRange may be answered with fewer bytes than len, as copy_file_range(2) may: copied says how many, and the sender asks again for the rest
 # - getattr and setattr carry a path, a handle, or both, never neither
 # - fh values are chosen by the client and never reused within a client's lifetime
 # - err is a Linux errno; flags, mode and mask are Linux values; nextOffset is a getdents64 cookie
@@ -184,6 +185,7 @@ struct Request {
     listxattr :group { path @65 :Path; }
     removexattr :group { path @66 :Path; name @67 :Data; }
     access :group { path @68 :Path; mask @69 :Int32; }
+    copyFileRange :group { fhIn @70 :UInt64; offsetIn @71 :UInt64; fhOut @72 :UInt64; offsetOut @73 :UInt64; len @74 :UInt64; }
   }
 }
 
@@ -205,6 +207,7 @@ struct Response {
     readdirPlus :group { entries @9 :List(DirEntryPlus); end @13 :Bool; }
     statfs @10 :Statfs;
     xattr @11 :Data;
+    copied @14 :UInt32;
   }
 }
 

@@ -164,6 +164,14 @@ pub enum Request {
         path: Path,
         mask: i32,
     },
+    /// `copy_file_range(2)` between two of the session's open files, done by the server. It may copy less than `len`.
+    CopyFileRange {
+        fh_in: u64,
+        offset_in: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+    },
 }
 
 impl Request {
@@ -180,6 +188,7 @@ impl Request {
             | Request::Opendir { fh, .. }
             | Request::Readdir { fh, .. }
             | Request::Releasedir { fh } => [Some(*fh), None],
+            Request::CopyFileRange { fh_in, fh_out, .. } => [Some(*fh_in), Some(*fh_out)],
             Request::Lookup { .. }
             | Request::Readlink { .. }
             | Request::Mknod { .. }
@@ -198,7 +207,7 @@ impl Request {
         }
     }
 
-    /// The handle, offset and size (or byte count) this request names, for logs.
+    /// The handle, offset and size (or byte count) this request names, for logs; a copy is described by its destination.
     pub fn perf_fields(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         match self {
             Request::Read { fh, offset, size } => (Some(*fh), Some(*offset), Some(*size as u64)),
@@ -211,6 +220,12 @@ impl Request {
                 max_bytes,
                 ..
             } => (Some(*fh), Some(*offset), Some(*max_bytes as u64)),
+            Request::CopyFileRange {
+                fh_out,
+                offset_out,
+                len,
+                ..
+            } => (Some(*fh_out), Some(*offset_out), Some(*len)),
             other => (other.fhs()[0], None, None),
         }
     }
@@ -245,6 +260,7 @@ impl Request {
             Request::Listxattr { .. } => "listxattr",
             Request::Removexattr { .. } => "removexattr",
             Request::Access { .. } => "access",
+            Request::CopyFileRange { .. } => "copy_file_range",
         }
     }
 }
@@ -266,6 +282,8 @@ pub enum Response {
     },
     Read(Vec<u8>),
     Written(u32),
+    /// copy_file_range: how many bytes the server copied
+    Copied(u32),
     /// `end`: no entry follows the last one, so the client may answer a read at its `next_offset` itself; meaningless with no entries.
     Readdir {
         entries: Vec<DirEntry>,
@@ -313,5 +331,13 @@ mod tests {
         };
         assert_eq!(getattr.fhs(), [None, None]);
         assert_eq!(Request::Statfs { path: Path::root() }.fhs(), [None, None]);
+        let copy = Request::CopyFileRange {
+            fh_in: 4,
+            offset_in: 0,
+            fh_out: 5,
+            offset_out: 0,
+            len: 1,
+        };
+        assert_eq!(copy.fhs(), [Some(4), Some(5)]);
     }
 }

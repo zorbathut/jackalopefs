@@ -6,7 +6,7 @@ source "$(dirname "$0")/lib.sh"
 FSX=$TOOLS/xfstests/ltp/fsx
 need_tool "$FSX"
 ops=${FSX_OPS:-20000}
-# The client implements nothing in the fallocate family, nor clone, dedupe or exchange; disabling them explicitly keeps a run deterministic instead of relying on the probe's errno. copy_file_range stays on because the kernel falls back to a read/write copy for FUSE.
+# The client implements nothing in the fallocate family, nor clone, dedupe or exchange; disabling them explicitly keeps a run deterministic instead of relying on the probe's errno. copy_file_range stays on: the server does it.
 disable=(-F -H -z -Y -C -I -J -B -0)
 
 fs_start fsx

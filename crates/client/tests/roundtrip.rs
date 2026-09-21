@@ -129,6 +129,56 @@ async fn file_lifecycle() {
 }
 
 #[tokio::test]
+async fn copy_file_range_is_done_by_the_server() {
+    let export = tempfile::tempdir().unwrap();
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    fs::write(export.path().join("src"), &data).unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = server.client().await;
+
+    let src_ino = client.lookup(Path::root(), name("src")).await.unwrap().ino;
+    let (src, _) = client
+        .open(src_ino, path("src"), libc::O_RDONLY)
+        .await
+        .unwrap();
+    let (dst, _) = client
+        .create(Path::root(), name("dst"), 0o100644, libc::O_WRONLY)
+        .await
+        .unwrap();
+    let mut done = 0u64;
+    while done < data.len() as u64 {
+        let copied = client
+            .copy_file_range(src, done, dst, done, u64::MAX)
+            .await
+            .unwrap();
+        assert!(copied > 0, "no progress at {done}");
+        done += copied as u64;
+    }
+    assert_eq!(
+        client
+            .copy_file_range(src, done, dst, done, 1)
+            .await
+            .unwrap(),
+        0,
+        "nothing is left at the end of the source"
+    );
+    assert_eq!(fs::read(export.path().join("dst")).unwrap(), data);
+    assert_eq!(
+        client
+            .copy_file_range(dst, 0, src, 0, 1)
+            .await
+            .unwrap_err()
+            .errno(),
+        libc::EBADF,
+        "a write-only handle cannot be the source"
+    );
+    client.release(src).await.unwrap();
+    client.release(dst).await.unwrap();
+    client.shutdown().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn unlink_while_open_and_stale_open() {
     let export = tempfile::tempdir().unwrap();
     let server = TestServer::start(export.path(), None).await;
@@ -589,6 +639,16 @@ async fn handles_are_reopened_and_verified_after_a_server_restart() {
         "handle to a replaced inode must not silently read the new file: {err}"
     );
     assert_eq!(err.errno(), libc::ESTALE);
+    for (fh_in, fh_out) in [(swap_fh, keep_fh), (keep_fh, swap_fh)] {
+        let err = client
+            .copy_file_range(fh_in, 0, fh_out, 0, 1)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Stale),
+            "a copy naming a dead handle on either side is stale: {err}"
+        );
+    }
     assert!(client.readdir(dir_fh, 0, 1 << 20).await.unwrap().0.len() >= 4);
     assert_eq!(
         second.server.sessions.get(1).unwrap().handles.len(),

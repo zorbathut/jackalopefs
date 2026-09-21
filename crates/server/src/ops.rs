@@ -39,6 +39,10 @@ const OPEN_FLAGS_ALLOWED: i32 = libc::O_ACCMODE
     | libc::O_LARGEFILE
     | libc::O_NOCTTY;
 
+/// Most bytes one `CopyFileRange` copies; the client asks again for the rest. Nothing notices a request its client abandoned, so this bounds how long a copy holds a blocking thread and how long it goes on writing to a file whose caller has moved on. A power of two, so a reflink stays block-aligned.
+const MAX_COPY: u64 = 64 << 20;
+const _: () = assert!(MAX_COPY <= u32::MAX as u64, "the copied reply is a u32");
+
 pub struct Ops {
     pub export: Arc<Export>,
     pub handles: Arc<Handles>,
@@ -328,6 +332,42 @@ impl Ops {
                 self.changes.record(&path, self.session_id);
                 file.write_all_at(&data, offset).map_err(io_errno)?;
                 Ok(Response::Written(data.len() as u32))
+            }
+            Request::CopyFileRange {
+                fh_in,
+                offset_in,
+                fh_out,
+                offset_out,
+                len,
+            } => {
+                let src = self.handles.file(fh_in)?;
+                let (dst, path) = self.handles.file_and_path(fh_out)?;
+                let mut offset_in = i64::try_from(offset_in).map_err(|_| Errno::EINVAL)?;
+                let mut offset_out = i64::try_from(offset_out).map_err(|_| Errno::EINVAL)?;
+                self.changes.record(&path, self.session_id);
+                let copied = loop {
+                    // SAFETY: the `Arc`s keep both fds open across the call, whatever is released meanwhile, and both offsets point at live locals. Explicit offsets keep the call positional: a null one would move the file position that every request on the handle shares.
+                    let copied = unsafe {
+                        libc::copy_file_range(
+                            src.as_raw_fd(),
+                            &mut offset_in,
+                            dst.as_raw_fd(),
+                            &mut offset_out,
+                            len.min(MAX_COPY) as usize,
+                            0,
+                        )
+                    };
+                    if copied >= 0 {
+                        break copied;
+                    }
+                    match Errno::last() {
+                        Errno::EINTR => continue,
+                        errno => return Err(errno),
+                    }
+                };
+                Ok(Response::Copied(
+                    u32::try_from(copied).expect("a copy is clamped to MAX_COPY"),
+                ))
             }
             Request::Release { fh } | Request::Releasedir { fh } => {
                 if self.handles.remove(fh).is_none() {
@@ -702,6 +742,141 @@ mod tests {
             Response::Ok,
             "releasing an unknown handle is harmless"
         );
+    }
+
+    fn open(ops: &Ops, fh: u64, file: &str, flags: i32) {
+        expect_attr(dispatch(
+            ops,
+            Request::Open {
+                fh,
+                path: path(file),
+                flags,
+            },
+        ));
+    }
+
+    fn copy(
+        ops: &Ops,
+        fh_in: u64,
+        offset_in: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+    ) -> Response {
+        dispatch(
+            ops,
+            Request::CopyFileRange {
+                fh_in,
+                offset_in,
+                fh_out,
+                offset_out,
+                len,
+            },
+        )
+    }
+
+    #[test]
+    fn copy_file_range_copies_between_handles() {
+        let (dir, ops) = fixture();
+        fs::write(dir.path().join("src"), b"0123456789").unwrap();
+        fs::write(dir.path().join("dst"), b"abcdefghijklmnop").unwrap();
+        open(&ops, 1, "src", libc::O_RDONLY);
+        open(&ops, 2, "dst", libc::O_RDWR);
+        assert_eq!(copy(&ops, 1, 2, 2, 4, 5), Response::Copied(5));
+        assert_eq!(
+            fs::read(dir.path().join("dst")).unwrap(),
+            b"abcd23456jklmnop"
+        );
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Read {
+                    fh: 2,
+                    offset: 4,
+                    size: 5
+                }
+            ),
+            Response::Read(b"23456".to_vec())
+        );
+        // The handles are shared and every access positional, so a copy must leave their file positions alone.
+        let src = ops.handles.file(1).unwrap();
+        assert_eq!(
+            nix::unistd::lseek(&*src, 0, nix::unistd::Whence::SeekCur),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn copy_file_range_is_short_at_the_end_of_the_source() {
+        let (dir, ops) = fixture();
+        fs::write(dir.path().join("src"), b"0123456789").unwrap();
+        fs::write(dir.path().join("dst"), b"").unwrap();
+        open(&ops, 1, "src", libc::O_RDONLY);
+        open(&ops, 2, "dst", libc::O_RDWR);
+        assert_eq!(copy(&ops, 1, 6, 2, 0, 100), Response::Copied(4));
+        assert_eq!(copy(&ops, 1, 10, 2, 4, 100), Response::Copied(0));
+        assert_eq!(
+            copy(&ops, 1, 0, 2, 0, u64::MAX),
+            Response::Copied(10),
+            "a length no file has is clamped, not refused"
+        );
+        assert_eq!(fs::read(dir.path().join("dst")).unwrap(), b"0123456789");
+    }
+
+    #[test]
+    fn copy_file_range_refusals() {
+        let (dir, ops) = fixture();
+        fs::write(dir.path().join("src"), b"0123456789").unwrap();
+        fs::write(dir.path().join("dst"), b"").unwrap();
+        open(&ops, 1, "src", libc::O_RDONLY);
+        open(&ops, 2, "dst", libc::O_RDWR);
+        open(&ops, 3, "dst", libc::O_RDONLY);
+        dispatch(
+            &ops,
+            Request::Opendir {
+                fh: 4,
+                path: Path::root(),
+            },
+        );
+        let refused = |errno: Errno| Response::Err(errno as i32);
+        assert_eq!(
+            copy(&ops, 1, 0, 3, 0, 5),
+            refused(Errno::EBADF),
+            "read-only destination"
+        );
+        assert_eq!(
+            copy(&ops, 9, 0, 2, 0, 5),
+            refused(Errno::EBADF),
+            "unknown source"
+        );
+        assert_eq!(
+            copy(&ops, 1, 0, 9, 0, 5),
+            refused(Errno::EBADF),
+            "unknown destination"
+        );
+        assert_eq!(
+            copy(&ops, 4, 0, 2, 0, 5),
+            refused(Errno::EBADF),
+            "directory source"
+        );
+        assert_eq!(
+            copy(&ops, 1, u64::MAX, 2, 0, 5),
+            refused(Errno::EINVAL),
+            "source offset past off_t"
+        );
+        assert_eq!(
+            copy(&ops, 1, 0, 2, u64::MAX, 5),
+            refused(Errno::EINVAL),
+            "destination offset past off_t"
+        );
+        fs::write(dir.path().join("same"), b"0123456789").unwrap();
+        open(&ops, 5, "same", libc::O_RDWR);
+        assert_eq!(
+            copy(&ops, 5, 0, 5, 2, 5),
+            refused(Errno::EINVAL),
+            "overlapping ranges of one file"
+        );
+        assert_eq!(fs::read(dir.path().join("dst")).unwrap(), b"");
     }
 
     #[test]

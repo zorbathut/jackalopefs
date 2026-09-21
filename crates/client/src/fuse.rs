@@ -1128,6 +1128,46 @@ impl Filesystem for Backend {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn copy_file_range(
+        &self,
+        req: &Request,
+        _ino_in: INodeNo,
+        fh_in: FileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FileHandle,
+        offset_out: u64,
+        len: u64,
+        flags: fuser::CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        let shared = self.shared.clone();
+        let key = KeyPerf {
+            fh: Some(fh_out.0),
+            offset: Some(offset_out),
+            size: Some(len),
+            ..KeyPerf::of("copy_file_range", req, ino_out.0)
+        };
+        self.spawn(key, async move {
+            // `copy_file_range(2)` defines no flags; one a later kernel adds must be refused, not ignored.
+            if !flags.is_empty() {
+                return fail(reply, Errno::EINVAL);
+            }
+            let copied = shared
+                .client
+                .copy_file_range(fh_in.0, offset_in, fh_out.0, offset_out, len)
+                .await;
+            match copied {
+                Ok(n) => {
+                    reply.written(n);
+                    Outcome::bytes(n as usize)
+                }
+                Err(e) => fail(reply, errno(&e)),
+            }
+        });
+    }
+
     /// By the time a `close(2)` reaches us the kernel has written back the file's dirty pages and reported their errors to the caller, and this daemon buffers nothing of its own; the request still counts, so the op mix shows every close.
     fn flush(
         &self,

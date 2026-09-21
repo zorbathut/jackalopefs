@@ -214,6 +214,8 @@ fn outcome_of(result: &Result<Response, Error>) -> Outcome {
     match result {
         Ok(Response::Read(data)) => Outcome::bytes(data.len()),
         Ok(Response::Written(n)) => Outcome::bytes(*n as usize),
+        // A copy moves no payload; what the server copied is counted by the kernel-level row.
+        Ok(Response::Copied(_)) => Outcome::default(),
         Ok(Response::Readdir { entries, .. }) => Outcome::items(entries.len()),
         Ok(Response::ReaddirPlus { entries, .. }) => Outcome::items(entries.len()),
         Ok(_) => Outcome::default(),
@@ -248,7 +250,8 @@ fn retry_safe(req: &Request) -> bool {
         | Request::Statfs { .. }
         | Request::Getxattr { .. }
         | Request::Listxattr { .. }
-        | Request::Access { .. } => true,
+        | Request::Access { .. }
+        | Request::CopyFileRange { .. } => true,
         Request::Open { flags, .. } => flags & libc::O_TRUNC == 0,
         Request::Create { flags, .. } => flags & (libc::O_EXCL | libc::O_TRUNC) == 0,
         Request::Setxattr { flags, .. } => *flags == 0,
@@ -679,6 +682,28 @@ impl Client {
         }
     }
 
+    /// How many bytes the server copied, which may be fewer than `len`.
+    pub async fn copy_file_range(
+        &self,
+        fh_in: u64,
+        offset_in: u64,
+        fh_out: u64,
+        offset_out: u64,
+        len: u64,
+    ) -> Result<u32, Error> {
+        let req = Request::CopyFileRange {
+            fh_in,
+            offset_in,
+            fh_out,
+            offset_out,
+            len,
+        };
+        match self.call(req).await? {
+            Response::Copied(n) if u64::from(n) <= len => Ok(n),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Forget the handle locally first so a reconnect never reopens it, then tell the server.
     pub async fn release(&self, fh: u64) -> Result<(), Error> {
         self.caller.handles.remove(fh);
@@ -813,6 +838,7 @@ fn response_name(resp: &Response) -> &'static str {
         Response::ReaddirPlus { .. } => "ReaddirPlus",
         Response::Statfs(_) => "Statfs",
         Response::Xattr(_) => "Xattr",
+        Response::Copied(_) => "Copied",
     }
 }
 
@@ -845,6 +871,13 @@ mod tests {
             fh: 1,
             offset: 0,
             data: Vec::new()
+        }));
+        assert!(retry_safe(&Request::CopyFileRange {
+            fh_in: 1,
+            offset_in: 0,
+            fh_out: 2,
+            offset_out: 0,
+            len: 1
         }));
         assert!(retry_safe(&Request::Open {
             fh: 4,

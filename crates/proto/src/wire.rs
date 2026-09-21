@@ -669,6 +669,20 @@ impl Message for Request {
                 build_path(g.reborrow().init_path(path.names().len() as u32), path);
                 g.set_mask(*mask);
             }
+            Request::CopyFileRange {
+                fh_in,
+                offset_in,
+                fh_out,
+                offset_out,
+                len,
+            } => {
+                let mut g = b.init_copy_file_range();
+                g.set_fh_in(*fh_in);
+                g.set_offset_in(*offset_in);
+                g.set_fh_out(*fh_out);
+                g.set_offset_out(*offset_out);
+                g.set_len(*len);
+            }
         }
     }
 
@@ -802,6 +816,13 @@ impl Message for Request {
                 path: parse_path(g.get_path()?)?,
                 mask: g.get_mask(),
             },
+            rq::Which::CopyFileRange(g) => Request::CopyFileRange {
+                fh_in: g.get_fh_in(),
+                offset_in: g.get_offset_in(),
+                fh_out: g.get_fh_out(),
+                offset_out: g.get_offset_out(),
+                len: g.get_len(),
+            },
         })
     }
 
@@ -863,7 +884,8 @@ impl Message for Request {
             | Request::Release { .. }
             | Request::Fsync { .. }
             | Request::Readdir { .. }
-            | Request::Releasedir { .. } => 0,
+            | Request::Releasedir { .. }
+            | Request::CopyFileRange { .. } => 0,
         };
         BASE_WORDS + payload
     }
@@ -893,6 +915,7 @@ impl Message for Response {
             Response::Opened { attr } => build_attr(b.init_opened().init_attr(), attr),
             Response::Read(data) => b.init_read().set_data(data),
             Response::Written(n) => b.set_written(*n),
+            Response::Copied(n) => b.set_copied(*n),
             Response::Readdir { entries, end } => {
                 let mut g = b.init_readdir();
                 g.set_end(*end);
@@ -933,6 +956,7 @@ impl Message for Response {
             },
             rs::Which::Read(g) => Response::Read(g.get_data()?.to_vec()),
             rs::Which::Written(n) => Response::Written(n),
+            rs::Which::Copied(n) => Response::Copied(n),
             rs::Which::Readdir(g) => {
                 let list = g.get_entries()?;
                 let mut entries =
@@ -971,7 +995,7 @@ impl Message for Response {
 
     fn size_hint(&self) -> u32 {
         let payload = match self {
-            Response::Err(_) | Response::Ok | Response::Written(_) => 0,
+            Response::Err(_) | Response::Ok | Response::Written(_) | Response::Copied(_) => 0,
             Response::Entry(attr) | Response::Attr(attr) | Response::Opened { attr } => {
                 ATTR_WORDS + words_for_xattr_names(attr.xattr_names.as_deref())
             }

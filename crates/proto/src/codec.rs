@@ -314,10 +314,17 @@ mod tests {
                 path: path("f"),
                 mask: 4,
             },
+            Request::CopyFileRange {
+                fh_in: 1,
+                offset_in: 4096,
+                fh_out: 2,
+                offset_out: 8192,
+                len: u64::MAX,
+            },
         ]
     }
 
-    const REQUEST_VARIANTS: usize = 26;
+    const REQUEST_VARIANTS: usize = 27;
 
     fn variant_index(req: &Request) -> usize {
         match req {
@@ -347,10 +354,11 @@ mod tests {
             Request::Listxattr { .. } => 23,
             Request::Removexattr { .. } => 24,
             Request::Access { .. } => 25,
+            Request::CopyFileRange { .. } => 26,
         }
     }
 
-    const RESPONSE_VARIANTS: usize = 12;
+    const RESPONSE_VARIANTS: usize = 13;
 
     fn response_index(resp: &Response) -> usize {
         match resp {
@@ -366,6 +374,7 @@ mod tests {
             Response::ReaddirPlus { .. } => 9,
             Response::Statfs(_) => 10,
             Response::Xattr(_) => 11,
+            Response::Copied(_) => 12,
         }
     }
 
@@ -421,6 +430,7 @@ mod tests {
                 frsize: 4096,
             }),
             Response::Xattr(b"a\0b\0".to_vec()),
+            Response::Copied(1 << 26),
         ]
     }
 
@@ -725,10 +735,11 @@ mod tests {
             &15u16.to_le_bytes(),
             "layout assumption"
         );
-        body[ROOT_DATA..ROOT_DATA + 2].copy_from_slice(&26u16.to_le_bytes());
+        let unknown = REQUEST_VARIANTS as u16;
+        body[ROOT_DATA..ROOT_DATA + 2].copy_from_slice(&unknown.to_le_bytes());
         assert!(matches!(
             decode::<Request>(&body),
-            Err(ErrorCodec::Decode(ErrorDecode::NotInSchema(26)))
+            Err(ErrorCodec::Decode(ErrorDecode::NotInSchema(n))) if n == unknown
         ));
 
         // Response's union tag is at bits 32..48; `ok` is member 4.
@@ -738,10 +749,11 @@ mod tests {
             &4u16.to_le_bytes(),
             "layout assumption"
         );
-        body[ROOT_DATA + 4..ROOT_DATA + 6].copy_from_slice(&12u16.to_le_bytes());
+        let unknown = RESPONSE_VARIANTS as u16;
+        body[ROOT_DATA + 4..ROOT_DATA + 6].copy_from_slice(&unknown.to_le_bytes());
         assert!(matches!(
             decode::<Response>(&body),
-            Err(ErrorCodec::Decode(ErrorDecode::NotInSchema(12)))
+            Err(ErrorCodec::Decode(ErrorDecode::NotInSchema(n))) if n == unknown
         ));
 
         // A readdir reply: root struct (8 data + 8 pointer), list tag word (8), then the first DirEntry whose kind is at bits 128..144.
@@ -1009,7 +1021,7 @@ mod tests {
             ("readdir", frame_body(&readdir), "00000000090000000000000001000100010000000800000001000000270000000400000003000100030000000000000004000000000000000100000000000000010000000a0000006e00000000000000"),
             ("hello", frame_body(&hellos[1]), "000000000a0000000000000002000200080706050403020101000100000000000500000032000000040000000100010073656372657400000300000000000000010000008200000007070707070707070707070707070707"),
             ("reply", frame_body(&replies[0]), "0000000006000000000000000200010001000000000000000100000000000000010000008200000001010101010101010101010101010101"),
-            ("request", frame_body(&Request::Rename { parent: path("a"), name: name("b"), newparent: path("c"), newname: name("d"), flags: 1 }), "000000000e00000000000000030004000900000000000000010000000000000000000000000000000d0000000e000000110000000a000000110000000e000000150000000a000000010000000a00000061000000000000006200000000000000010000000a00000063000000000000006400000000000000"),
+            ("request", frame_body(&Request::Rename { parent: path("a"), name: name("b"), newparent: path("c"), newname: name("d"), flags: 1 }), "000000001100000000000000060004000900000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000d0000000e000000110000000a000000110000000e000000150000000a000000010000000a00000061000000000000006200000000000000010000000a00000063000000000000006400000000000000"),
             ("response", frame_body(&Response::Entry(sample_attr(9))), "000000001500000000000000010001000000000001000000000000000c00010009000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e80300000010000000000000000000000100000000000000010000001600000005000000320000000500000082000000757365722e6b000073656375726974792e73656c696e7578"),
             ("event", frame_body(&event), "00000000110000000000000000000100010000004f0000000c0000000100020000000000000000001d00000006000000190000000a0000000100000000000000150000001600000000000000000000000200000000000000000000000000000000000000000000006600000000000000050000000a000000050000000a00000061000000000000006600000000000000"),
         ];
