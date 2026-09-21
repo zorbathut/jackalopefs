@@ -512,32 +512,28 @@ impl Client {
         }
     }
 
-    /// Open (or opendir) under a fresh handle id; the reply's inode must be the one the caller meant, or the handle is released and `ESTALE` returned. Whenever the outcome leaves any doubt about whether the server opened something, the id is released in the background; only a definite refusal from the server needs no cleanup.
+    /// Open (or opendir, or create) under a fresh handle id. `node` says which node the reply's attributes belong to, or refuses them (an open whose path led to a file other than the one meant; a created file that cannot be registered), in which case the handle is released. Whenever the outcome leaves any doubt about whether the server opened something, the id is released in the background; only a definite refusal from the server needs no cleanup.
     async fn open_handle(
         &self,
-        nodeid: Option<u64>,
         path: Path,
         flags: i32,
         kind: HandleKind,
         build: impl FnOnce(u64) -> Request,
+        node: impl FnOnce(&Attr) -> Result<u64, Error>,
     ) -> Result<(u64, Attr), Error> {
         let fh = self.caller.handles.alloc();
         let req = build(fh);
         match self.call(req).await {
-            Ok(Response::Opened { attr }) => {
-                if nodeid.is_some_and(|n| n != attr.ino) {
-                    tracing::warn!(
-                        ?path,
-                        expected = nodeid,
-                        actual = attr.ino,
-                        "path led to a different inode than the one being opened"
-                    );
-                    self.caller.release_orphan(release_request(kind, fh));
-                    return Err(Error::Stale);
+            Ok(Response::Opened { attr }) => match node(&attr) {
+                Ok(nodeid) => {
+                    self.caller.handles.insert(fh, nodeid, path, flags, kind);
+                    Ok((fh, attr))
                 }
-                self.caller.handles.insert(fh, attr.ino, path, flags, kind);
-                Ok((fh, attr))
-            }
+                Err(e) => {
+                    self.caller.release_orphan(release_request(kind, fh));
+                    Err(e)
+                }
+            },
             Ok(other) => {
                 self.caller.release_orphan(release_request(kind, fh));
                 Err(unexpected(other))
@@ -640,19 +636,25 @@ impl Client {
     }
 
     pub async fn open(&self, nodeid: u64, path: Path, flags: i32) -> Result<(u64, Attr), Error> {
-        let p = path.clone();
-        self.open_handle(Some(nodeid), path, flags, HandleKind::File, move |fh| {
-            Request::Open { fh, path: p, flags }
-        })
+        let (p, meant) = (path.clone(), path.clone());
+        self.open_handle(
+            path,
+            flags,
+            HandleKind::File,
+            move |fh| Request::Open { fh, path: p, flags },
+            move |attr| same_inode(&meant, nodeid, attr),
+        )
         .await
     }
 
+    /// `node` registers the new file and says which node it is; the handle is recorded under that node, so it cannot exist before the node does.
     pub async fn create(
         &self,
         parent: Path,
         name: Name,
         mode: u32,
         flags: i32,
+        node: impl FnOnce(&Attr) -> Result<u64, Error>,
     ) -> Result<(u64, Attr), Error> {
         let path = match parent.join(name.clone()) {
             Ok(path) => path,
@@ -661,15 +663,19 @@ impl Client {
                 return Err(Error::Remote(libc::ENAMETOOLONG));
             }
         };
-        self.open_handle(None, path, flags, HandleKind::File, move |fh| {
-            Request::Create {
+        self.open_handle(
+            path,
+            flags,
+            HandleKind::File,
+            move |fh| Request::Create {
                 fh,
                 parent,
                 name,
                 mode,
                 flags,
-            }
-        })
+            },
+            node,
+        )
         .await
     }
 
@@ -744,13 +750,13 @@ impl Client {
     }
 
     pub async fn opendir(&self, nodeid: u64, path: Path) -> Result<(u64, Attr), Error> {
-        let p = path.clone();
+        let (p, meant) = (path.clone(), path.clone());
         self.open_handle(
-            Some(nodeid),
             path,
             libc::O_RDONLY | libc::O_DIRECTORY,
             HandleKind::Dir,
             move |fh| Request::Opendir { fh, path: p },
+            move |attr| same_inode(&meant, nodeid, attr),
         )
         .await
     }
@@ -840,6 +846,20 @@ impl Client {
     pub async fn access(&self, path: Path, mask: i32) -> Result<(), Error> {
         self.call_ok(Request::Access { path, mask }).await
     }
+}
+
+/// The node an open meant, if the path still led to it.
+fn same_inode(path: &Path, nodeid: u64, attr: &Attr) -> Result<u64, Error> {
+    if attr.ino == nodeid {
+        return Ok(nodeid);
+    }
+    tracing::warn!(
+        ?path,
+        expected = nodeid,
+        actual = attr.ino,
+        "path led to a different inode than the one being opened"
+    );
+    Err(Error::Stale)
 }
 
 fn release_request(kind: HandleKind, fh: u64) -> Request {

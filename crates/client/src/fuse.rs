@@ -1082,24 +1082,37 @@ impl Filesystem for Backend {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
             };
-            match shared.client.create(path, name.clone(), mode, flags).await {
-                Ok((fh, attr)) => {
-                    shared.dir_grew(parent.0);
-                    match shared.register(parent.0, name, &attr) {
-                        Ok(generation) => {
-                            reply.created(
-                                &shared.entry_ttl.min(shared.attr_ttl),
-                                &file_attr(&attr),
-                                generation,
-                                FileHandle(fh),
-                                FopenFlags::empty(),
-                            );
-                            Outcome::default()
-                        }
-                        Err(e) => fail(reply, e),
-                    }
+            let mut generation = None;
+            let registering = shared.clone();
+            let created = shared
+                .client
+                .create(path, name.clone(), mode, flags, |attr| {
+                    registering.dir_grew(parent.0);
+                    let registered = registering
+                        .register(parent.0, name, attr)
+                        .map_err(|e| Error::Remote(i32::from(e)))?;
+                    generation = Some(registered);
+                    Ok(attr.ino)
+                })
+                .await;
+            match (created, generation) {
+                (Ok((fh, attr)), Some(generation)) => {
+                    reply.created(
+                        &shared.entry_ttl.min(shared.attr_ttl),
+                        &file_attr(&attr),
+                        generation,
+                        FileHandle(fh),
+                        FopenFlags::empty(),
+                    );
+                    Outcome::default()
                 }
-                Err(e) => fail(reply, errno(&e)),
+                (Ok(_), None) => {
+                    tracing::error!(
+                        "a create succeeded without registering its node; this is a bug"
+                    );
+                    fail(reply, Errno::EIO)
+                }
+                (Err(e), _) => fail(reply, errno(&e)),
             }
         });
     }

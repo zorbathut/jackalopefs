@@ -75,7 +75,9 @@ async fn server_side_changes_reach_the_client_but_own_changes_do_not() {
 
     // The client's own create + write must not come back to it, but the other client must hear about both.
     let (fh, _) = client
-        .create(path("sub"), name("mine"), 0o100644, libc::O_RDWR)
+        .create(path("sub"), name("mine"), 0o100644, libc::O_RDWR, |attr| {
+            Ok(attr.ino)
+        })
         .await
         .unwrap();
     client.write(fh, 0, b"payload".to_vec()).await.unwrap();

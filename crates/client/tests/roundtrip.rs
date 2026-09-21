@@ -60,7 +60,9 @@ async fn file_lifecycle() {
     let client = server.client().await;
 
     let (fh, attr) = client
-        .create(Path::root(), name("f"), 0o100640, libc::O_RDWR)
+        .create(Path::root(), name("f"), 0o100640, libc::O_RDWR, |attr| {
+            Ok(attr.ino)
+        })
         .await
         .unwrap();
     assert_eq!(attr.perm, 0o640);
@@ -142,7 +144,13 @@ async fn copy_file_range_is_done_by_the_server() {
         .await
         .unwrap();
     let (dst, _) = client
-        .create(Path::root(), name("dst"), 0o100644, libc::O_WRONLY)
+        .create(
+            Path::root(),
+            name("dst"),
+            0o100644,
+            libc::O_WRONLY,
+            |attr| Ok(attr.ino),
+        )
         .await
         .unwrap();
     let mut done = 0u64;
@@ -287,7 +295,9 @@ async fn unlink_while_open_and_stale_open() {
     let client = server.client().await;
 
     let (fh, attr) = client
-        .create(Path::root(), name("gone"), 0o100644, libc::O_RDWR)
+        .create(Path::root(), name("gone"), 0o100644, libc::O_RDWR, |attr| {
+            Ok(attr.ino)
+        })
         .await
         .unwrap();
     client.write(fh, 0, b"still here".to_vec()).await.unwrap();
@@ -647,6 +657,7 @@ async fn session_resumes_after_a_connection_drop() {
             name("open-then-unlinked"),
             0o100644,
             libc::O_RDWR,
+            |attr| Ok(attr.ino),
         )
         .await
         .unwrap();
