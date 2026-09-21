@@ -1042,6 +1042,68 @@ async fn copy_file_range_moves_no_data_through_the_mount() {
     m.finish().await;
 }
 
+/// Refused, `posix_fallocate` succeeds all the same, by writing into every block, so the request count is what shows the server did the work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fallocate_reaches_the_server_and_moves_no_data() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let export = m.export.path().to_path_buf();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    let size = 8 << 20;
+    perf.report();
+    blocking(move || {
+        use std::os::fd::AsRawFd;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(mnt.join("f"))
+            .unwrap();
+        file.write_all(b"head").unwrap();
+        let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, size) };
+        assert_eq!(
+            rc,
+            0,
+            "posix_fallocate: {}",
+            std::io::Error::from_raw_os_error(rc)
+        );
+        assert_eq!(file.metadata().unwrap().len(), size as u64);
+        let punch = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        let rc = unsafe { libc::fallocate(file.as_raw_fd(), punch, 0, 2) };
+        assert_eq!(rc, 0, "punch: {}", std::io::Error::last_os_error());
+        let mut head = [0u8; 4];
+        std::os::unix::fs::FileExt::read_exact_at(&file, &mut head, 0).unwrap();
+        assert_eq!(
+            &head, b"\0\0ad",
+            "the punched bytes read as zeros through the cache"
+        );
+    })
+    .await;
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
+    })
+    .await;
+    let snap = perf.report();
+    let fallocate = snap
+        .fuse
+        .get("fallocate")
+        .expect("no fallocate reached the daemon: glibc wrote the file out instead");
+    assert_eq!(fallocate.n, 2);
+    assert!(fallocate.errnos.is_empty(), "{:?}", fallocate.errnos);
+    let moved: u64 = snap.call.values().map(|call| call.row.bytes).sum();
+    // The kernel writes the dirty first page back before it asks for the punch; nothing else carries data.
+    assert!(
+        moved <= 64 << 10,
+        "server calls moved {moved} bytes of payload to allocate {size}"
+    );
+    let on_export = fs::read(export.join("f")).unwrap();
+    assert_eq!(on_export.len(), size as usize);
+    assert_eq!(&on_export[..4], b"\0\0ad");
+    m.finish().await;
+}
+
 /// With the kernel positioning appends and the server's descriptor not appending on its own, re-flushed pages land where they belong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appends_through_the_mount_land_once_and_in_order() {

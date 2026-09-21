@@ -5,10 +5,11 @@ use crate::export::{kind_from_mode, proc_path, Export};
 use crate::handles::{Handle, Handles};
 use crate::watch::ChangeLog;
 use jackalopefs_proto::{
-    Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, MAX_IO, NAME_MAX,
+    Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, MAX_FALLOCATE, MAX_IO,
+    NAME_MAX,
 };
 use nix::errno::Errno;
-use nix::fcntl::{renameat2, AtFlags, OFlag, RenameFlags, AT_FDCWD};
+use nix::fcntl::{fallocate, renameat2, AtFlags, FallocateFlags, OFlag, RenameFlags, AT_FDCWD};
 use nix::sys::stat::{
     fchmod, fstatat, futimens, mkdirat, mknodat, utimensat, Mode, SFlag, UtimensatFlags,
 };
@@ -38,6 +39,11 @@ const OPEN_FLAGS_ALLOWED: i32 = libc::O_ACCMODE
     | libc::O_DIRECTORY
     | libc::O_LARGEFILE
     | libc::O_NOCTTY;
+
+/// The `fallocate` modes the protocol carries: the ones the FUSE kernel forwards.
+const FALLOCATE_MODES_ALLOWED: FallocateFlags = FallocateFlags::FALLOC_FL_KEEP_SIZE
+    .union(FallocateFlags::FALLOC_FL_PUNCH_HOLE)
+    .union(FallocateFlags::FALLOC_FL_ZERO_RANGE);
 
 /// Most bytes one `CopyFileRange` copies; the client asks again for the rest. Nothing notices a request its client abandoned, so this bounds how long a copy holds a blocking thread and how long it goes on writing to a file whose caller has moved on. A power of two, so a reflink stays block-aligned.
 const MAX_COPY: u64 = 64 << 20;
@@ -368,6 +374,31 @@ impl Ops {
                 Ok(Response::Copied(
                     u32::try_from(copied).expect("a copy is clamped to MAX_COPY"),
                 ))
+            }
+            Request::Fallocate {
+                fh,
+                offset,
+                len,
+                mode,
+            } => {
+                if len > MAX_FALLOCATE {
+                    return Err(Errno::EINVAL);
+                }
+                // A mode outside the protocol's is refused, never trimmed: a punch without its punch bit is an allocation.
+                let mode = FallocateFlags::from_bits(mode)
+                    .filter(|mode| FALLOCATE_MODES_ALLOWED.contains(*mode))
+                    .ok_or(Errno::EOPNOTSUPP)?;
+                let (file, path) = self.handles.file_and_path(fh)?;
+                let offset = i64::try_from(offset).map_err(|_| Errno::EINVAL)?;
+                let len = i64::try_from(len).map_err(|_| Errno::EINVAL)?;
+                self.changes.record(&path, self.session_id);
+                loop {
+                    match fallocate(&*file, mode, offset, len) {
+                        Err(Errno::EINTR) => continue,
+                        done => break done?,
+                    }
+                }
+                Ok(Response::Ok)
             }
             Request::Release { fh } | Request::Releasedir { fh } => {
                 if self.handles.remove(fh).is_none() {
@@ -877,6 +908,130 @@ mod tests {
             "overlapping ranges of one file"
         );
         assert_eq!(fs::read(dir.path().join("dst")).unwrap(), b"");
+    }
+
+    fn fallocate(ops: &Ops, fh: u64, offset: u64, len: u64, mode: i32) -> Response {
+        dispatch(
+            ops,
+            Request::Fallocate {
+                fh,
+                offset,
+                len,
+                mode,
+            },
+        )
+    }
+
+    /// What a filesystem does with each mode is its own business (tmpfs has no zero-range, and they all count blocks differently), so the server's answer is held against the same call made directly on a twin file beside it.
+    #[test]
+    fn fallocate_does_what_the_syscall_does() {
+        use nix::fcntl::FallocateFlags;
+        let (dir, ops) = fixture();
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8 + 1).collect();
+        let modes = [
+            (FallocateFlags::empty(), 100_000, 400_000),
+            (FallocateFlags::FALLOC_FL_KEEP_SIZE, 100_000, 400_000),
+            (
+                FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+                65_536,
+                65_536,
+            ),
+            (FallocateFlags::FALLOC_FL_ZERO_RANGE, 65_536, 300_000),
+            (
+                FallocateFlags::FALLOC_FL_ZERO_RANGE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+                65_536,
+                300_000,
+            ),
+        ];
+        for (i, (mode, offset, len)) in modes.into_iter().enumerate() {
+            let (served, control) = (format!("served{i}"), format!("control{i}"));
+            fs::write(dir.path().join(&served), &content).unwrap();
+            fs::write(dir.path().join(&control), &content).unwrap();
+            let fh = 10 + i as u64;
+            open(&ops, fh, &served, libc::O_RDWR);
+            let twin = fs::OpenOptions::new()
+                .write(true)
+                .open(dir.path().join(&control))
+                .unwrap();
+            let expected = match nix::fcntl::fallocate(&twin, mode, offset, len) {
+                Ok(()) => Response::Ok,
+                // Zero-range is the one a filesystem tests run on may lack (tmpfs does); without the others this test would compare refusals.
+                Err(errno) => {
+                    assert!(
+                        mode.contains(FallocateFlags::FALLOC_FL_ZERO_RANGE),
+                        "{mode:?} is {errno} here"
+                    );
+                    Response::Err(errno as i32)
+                }
+            };
+            assert_eq!(
+                fallocate(&ops, fh, offset as u64, len as u64, mode.bits()),
+                expected,
+                "{mode:?}"
+            );
+            assert_eq!(
+                fs::read(dir.path().join(&served)).unwrap(),
+                fs::read(dir.path().join(&control)).unwrap(),
+                "{mode:?}"
+            );
+            assert_eq!(
+                fs::metadata(dir.path().join(&served)).unwrap().blocks(),
+                fs::metadata(dir.path().join(&control)).unwrap().blocks(),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fallocate_refusals() {
+        let (dir, ops) = fixture();
+        fs::write(dir.path().join("f"), b"0123456789").unwrap();
+        open(&ops, 1, "f", libc::O_RDWR);
+        open(&ops, 2, "f", libc::O_RDONLY);
+        dispatch(
+            &ops,
+            Request::Opendir {
+                fh: 3,
+                path: Path::root(),
+            },
+        );
+        let refused = |errno: Errno| Response::Err(errno as i32);
+        assert_eq!(
+            fallocate(&ops, 1, 0, 5, libc::FALLOC_FL_COLLAPSE_RANGE),
+            refused(Errno::EOPNOTSUPP),
+            "a mode the protocol does not carry"
+        );
+        assert_eq!(
+            fallocate(&ops, 1, 0, 5, 1 << 20),
+            refused(Errno::EOPNOTSUPP),
+            "a mode nobody knows"
+        );
+        assert_eq!(
+            fallocate(&ops, 1, 0, MAX_FALLOCATE + 1, 0),
+            refused(Errno::EINVAL),
+            "longer than one request may be"
+        );
+        assert_eq!(
+            fallocate(&ops, 1, u64::MAX, 5, 0),
+            refused(Errno::EINVAL),
+            "offset past off_t"
+        );
+        assert_eq!(
+            fallocate(&ops, 2, 0, 5, 0),
+            refused(Errno::EBADF),
+            "read-only handle"
+        );
+        assert_eq!(
+            fallocate(&ops, 3, 0, 5, 0),
+            refused(Errno::EBADF),
+            "directory handle"
+        );
+        assert_eq!(
+            fallocate(&ops, 9, 0, 5, 0),
+            refused(Errno::EBADF),
+            "unknown handle"
+        );
+        assert_eq!(fs::read(dir.path().join("f")).unwrap(), b"0123456789");
     }
 
     #[test]

@@ -2,6 +2,9 @@
 
 use crate::types::*;
 
+/// Longest range one `fallocate` request may cover: a receiver refuses a longer one with `EINVAL`, and a sender splits it into consecutive requests, which every mode the protocol carries allows. It bounds what a request its client abandoned goes on doing, as the server's own limit on a copy does: an allocation is work per extent or per page, and a punch or zero destroys data. Changing it is a protocol change: the schema states it.
+pub const MAX_FALLOCATE: u64 = 64 << 20;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Auth {
     Anonymous,
@@ -172,6 +175,13 @@ pub enum Request {
         offset_out: u64,
         len: u64,
     },
+    /// `fallocate(2)` on an open file; `len` is at most [`crate::MAX_FALLOCATE`].
+    Fallocate {
+        fh: u64,
+        offset: u64,
+        len: u64,
+        mode: i32,
+    },
 }
 
 impl Request {
@@ -185,6 +195,7 @@ impl Request {
             | Request::Write { fh, .. }
             | Request::Release { fh }
             | Request::Fsync { fh, .. }
+            | Request::Fallocate { fh, .. }
             | Request::Opendir { fh, .. }
             | Request::Readdir { fh, .. }
             | Request::Releasedir { fh } => [Some(*fh), None],
@@ -220,6 +231,9 @@ impl Request {
                 max_bytes,
                 ..
             } => (Some(*fh), Some(*offset), Some(*max_bytes as u64)),
+            Request::Fallocate {
+                fh, offset, len, ..
+            } => (Some(*fh), Some(*offset), Some(*len)),
             Request::CopyFileRange {
                 fh_out,
                 offset_out,
@@ -261,6 +275,7 @@ impl Request {
             Request::Removexattr { .. } => "removexattr",
             Request::Access { .. } => "access",
             Request::CopyFileRange { .. } => "copy_file_range",
+            Request::Fallocate { .. } => "fallocate",
         }
     }
 }
@@ -274,7 +289,7 @@ pub enum Response {
     /// getattr, setattr
     Attr(Attr),
     Readlink(Vec<u8>),
-    /// unlink, rmdir, rename, release, fsync, releasedir, setxattr, removexattr, access
+    /// unlink, rmdir, rename, release, fsync, releasedir, setxattr, removexattr, access, fallocate
     Ok,
     /// open, create, opendir; the attr lets a reconnecting client verify it reopened the same inode
     Opened {

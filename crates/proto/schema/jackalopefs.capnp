@@ -31,6 +31,7 @@
 #
 # Senders guarantee (a receiver answers a violation with an ordinary error):
 # - a write payload is at most 1048576 bytes (EINVAL beyond that) and a read asks for at most that many (a larger request is clamped)
+# - a fallocate covers at most 67108864 bytes (EINVAL beyond that; a sender splits a longer range into consecutive requests), and its mode is a combination of FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE and FALLOC_FL_ZERO_RANGE (EOPNOTSUPP for any other bit)
 # - a copyFileRange may be answered with fewer bytes than len, as copy_file_range(2) may: copied says how many, and the sender asks again for the rest
 # - getattr and setattr carry a path, a handle, or both, never neither
 # - fh values are chosen by the client and never reused within a client's lifetime
@@ -186,6 +187,7 @@ struct Request {
     removexattr :group { path @66 :Path; name @67 :Data; }
     access :group { path @68 :Path; mask @69 :Int32; }
     copyFileRange :group { fhIn @70 :UInt64; offsetIn @71 :UInt64; fhOut @72 :UInt64; offsetOut @73 :UInt64; len @74 :UInt64; }
+    fallocate :group { fh @75 :UInt64; offset @76 :UInt64; len @77 :UInt64; mode @78 :Int32; }
   }
 }
 

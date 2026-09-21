@@ -683,6 +683,18 @@ impl Message for Request {
                 g.set_offset_out(*offset_out);
                 g.set_len(*len);
             }
+            Request::Fallocate {
+                fh,
+                offset,
+                len,
+                mode,
+            } => {
+                let mut g = b.init_fallocate();
+                g.set_fh(*fh);
+                g.set_offset(*offset);
+                g.set_len(*len);
+                g.set_mode(*mode);
+            }
         }
     }
 
@@ -823,6 +835,12 @@ impl Message for Request {
                 offset_out: g.get_offset_out(),
                 len: g.get_len(),
             },
+            rq::Which::Fallocate(g) => Request::Fallocate {
+                fh: g.get_fh(),
+                offset: g.get_offset(),
+                len: g.get_len(),
+                mode: g.get_mode(),
+            },
         })
     }
 
@@ -885,7 +903,8 @@ impl Message for Request {
             | Request::Fsync { .. }
             | Request::Readdir { .. }
             | Request::Releasedir { .. }
-            | Request::CopyFileRange { .. } => 0,
+            | Request::CopyFileRange { .. }
+            | Request::Fallocate { .. } => 0,
         };
         BASE_WORDS + payload
     }

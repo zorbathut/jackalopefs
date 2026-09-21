@@ -4,6 +4,7 @@
 
 ### Added
 
+- `fallocate(2)` through the mount is done by the server: allocation (with or without `FALLOC_FL_KEEP_SIZE`), `FALLOC_FL_PUNCH_HOLE` and `FALLOC_FL_ZERO_RANGE`, 64 MiB per request. Preallocating a file (`posix_fallocate`, which torrent clients call for every download) no longer writes the whole file over the network, which is what glibc did when the mount refused; punching and zeroing used to fail with `EOPNOTSUPP`. `docs/sparse-files.md` describes it.
 - `copy_file_range(2)` between two files on the mount is done by the server, between its own descriptors, 64 MiB per request: a copy or a cross-subvolume `mv` with coreutils 9 or later moves no file data over the network, and on bcachefs (or any filesystem that can reflink) it is a reflink. Until now the kernel copied through the mount itself, every byte crossing the network twice. A copy the caller abandons still finishes its current request on the server. `docs/copy-file-range.md` describes it.
 - `jackalopefs-client` honours `FUSE_INTERRUPT`: a signal to a process blocked in a filesystem call fails the call with `EINTR` at once and abandons the request on the wire (whether the server had applied it is unknown, as for any lost reply). Until now even `SIGKILL` waited for the server's reply. fuser is vendored under `vendor/fuser` with the local patch that makes this possible; `vendor/README.md` describes it.
 - `jackalopefs-client --offline-timeout <dur>` (default `30s`): how long a filesystem call waits for the connection to come back before failing with `ETIMEDOUT`.
@@ -20,6 +21,7 @@
 
 ### Breaking
 
+- Protocol revision: a `fallocate` request. Client and server must be rebuilt together.
 - Protocol revision: a `copyFileRange` request and a `copied` reply. Every request is 24 bytes larger on the wire (the golden request bytes in `crates/proto/src/codec.rs` were regenerated for that). Client and server must be rebuilt together.
 - `jackalopefs-client --op-timeout` has no default: a request on a live connection waits for its reply as long as the connection lives, so a server whose disk stalls no longer produces `ETIMEDOUT`. Only the wait for a connection is bounded (`--offline-timeout`). The kernel's writeback requests cannot be interrupted, so against a server that is alive but never answers, cached writes stay pinned and an unmount blocks until a second signal aborts the mount.
 - Any signal delivered to a process blocked in a filesystem call now interrupts the call with `EINTR`, not only a fatal one, as with libfuse's `intr` option; a program with a signal handler blocked in a slow call can see `EINTR` where before it saw nothing.

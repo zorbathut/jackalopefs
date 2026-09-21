@@ -6,7 +6,7 @@ use crate::perf::{AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_proto::{
     read_frame, write_frame, Attr, Auth, DirEntry, DirEntryPlus, ErrorCodec, Event, Name, Path,
-    Request, Response, SetAttr, Statfs,
+    Request, Response, SetAttr, Statfs, MAX_FALLOCATE,
 };
 use quinn::{Connection, RecvStream, SendStream};
 use std::future::Future;
@@ -251,7 +251,8 @@ fn retry_safe(req: &Request) -> bool {
         | Request::Getxattr { .. }
         | Request::Listxattr { .. }
         | Request::Access { .. }
-        | Request::CopyFileRange { .. } => true,
+        | Request::CopyFileRange { .. }
+        | Request::Fallocate { .. } => true,
         Request::Open { flags, .. } => flags & libc::O_TRUNC == 0,
         Request::Create { flags, .. } => flags & (libc::O_EXCL | libc::O_TRUNC) == 0,
         Request::Setxattr { flags, .. } => *flags == 0,
@@ -704,6 +705,25 @@ impl Client {
         }
     }
 
+    /// One request for every [`MAX_FALLOCATE`] of the range, in order, stopping at the first failure; what came before it stays done, as after a `fallocate(2)` that ran out of space.
+    pub async fn fallocate(&self, fh: u64, offset: u64, len: u64, mode: i32) -> Result<(), Error> {
+        let mut done = 0;
+        loop {
+            let chunk = (len - done).min(MAX_FALLOCATE);
+            self.call_ok(Request::Fallocate {
+                fh,
+                offset: offset + done,
+                len: chunk,
+                mode,
+            })
+            .await?;
+            done += chunk;
+            if done == len {
+                return Ok(());
+            }
+        }
+    }
+
     /// Forget the handle locally first so a reconnect never reopens it, then tell the server.
     pub async fn release(&self, fh: u64) -> Result<(), Error> {
         self.caller.handles.remove(fh);
@@ -878,6 +898,12 @@ mod tests {
             fh_out: 2,
             offset_out: 0,
             len: 1
+        }));
+        assert!(retry_safe(&Request::Fallocate {
+            fh: 1,
+            offset: 0,
+            len: 1,
+            mode: libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE
         }));
         assert!(retry_safe(&Request::Open {
             fh: 4,

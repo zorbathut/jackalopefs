@@ -1168,6 +1168,35 @@ impl Filesystem for Backend {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn fallocate(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        let shared = self.shared.clone();
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            offset: Some(offset),
+            size: Some(length),
+            ..KeyPerf::of("fallocate", req, ino.0)
+        };
+        self.spawn(key, async move {
+            match shared.client.fallocate(fh.0, offset, length, mode).await {
+                Ok(()) => {
+                    reply.ok();
+                    Outcome::default()
+                }
+                Err(e) => fail(reply, errno(&e)),
+            }
+        });
+    }
+
     /// By the time a `close(2)` reaches us the kernel has written back the file's dirty pages and reported their errors to the caller, and this daemon buffers nothing of its own; the request still counts, so the op mix shows every close.
     fn flush(
         &self,

@@ -179,6 +179,46 @@ async fn copy_file_range_is_done_by_the_server() {
 }
 
 #[tokio::test]
+async fn fallocate_is_split_into_requests_the_server_accepts() {
+    let export = tempfile::tempdir().unwrap();
+    fs::write(export.path().join("f"), vec![7u8; 100_000]).unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = server.client().await;
+    let ino = client.lookup(Path::root(), name("f")).await.unwrap().ino;
+    let (fh, _) = client.open(ino, path("f"), libc::O_RDWR).await.unwrap();
+
+    client.fallocate(fh, 0, 300_000, 0).await.unwrap();
+    assert_eq!(
+        fs::metadata(export.path().join("f")).unwrap().len(),
+        300_000
+    );
+
+    // Punching far past the end costs a filesystem nothing, so this range can be longer than one request may cover.
+    // A report starts a new window, so the count below is this call's alone.
+    client.perf().report();
+    let punch = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+    let len = 2 * jackalopefs_proto::MAX_FALLOCATE + 1;
+    client.fallocate(fh, 4096, len, punch).await.unwrap();
+    assert_eq!(client.perf().report().call["fallocate"].row.n, 3);
+    let after = fs::read(export.path().join("f")).unwrap();
+    assert_eq!(after.len(), 300_000);
+    assert!(after[..4096].iter().all(|&b| b == 7));
+    assert!(after[4096..].iter().all(|&b| b == 0));
+
+    assert_eq!(
+        client
+            .fallocate(fh, 0, 1, libc::FALLOC_FL_COLLAPSE_RANGE)
+            .await
+            .unwrap_err()
+            .errno(),
+        libc::EOPNOTSUPP
+    );
+    client.release(fh).await.unwrap();
+    client.shutdown().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn unlink_while_open_and_stale_open() {
     let export = tempfile::tempdir().unwrap();
     let server = TestServer::start(export.path(), None).await;

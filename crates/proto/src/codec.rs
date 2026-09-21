@@ -321,10 +321,16 @@ mod tests {
                 offset_out: 8192,
                 len: u64::MAX,
             },
+            Request::Fallocate {
+                fh: 1,
+                offset: 4096,
+                len: MAX_FALLOCATE,
+                mode: 3,
+            },
         ]
     }
 
-    const REQUEST_VARIANTS: usize = 27;
+    const REQUEST_VARIANTS: usize = 28;
 
     fn variant_index(req: &Request) -> usize {
         match req {
@@ -355,6 +361,7 @@ mod tests {
             Request::Removexattr { .. } => 24,
             Request::Access { .. } => 25,
             Request::CopyFileRange { .. } => 26,
+            Request::Fallocate { .. } => 27,
         }
     }
 
@@ -951,6 +958,7 @@ mod tests {
         let schema = include_str!("../schema/jackalopefs.capnp");
         assert!(schema.contains(&format!("frame body longer than {MAX_FRAME} bytes")));
         assert!(schema.contains(&format!("write payload is at most {MAX_IO} bytes")));
+        assert!(schema.contains(&format!("fallocate covers at most {MAX_FALLOCATE} bytes")));
     }
 
     /// `dir_entry_bytes` is what the server budgets a page with, so it must be the true marginal cost of an entry.

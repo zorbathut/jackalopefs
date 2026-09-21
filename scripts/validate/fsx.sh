@@ -6,8 +6,8 @@ source "$(dirname "$0")/lib.sh"
 FSX=$TOOLS/xfstests/ltp/fsx
 need_tool "$FSX"
 ops=${FSX_OPS:-20000}
-# The client implements nothing in the fallocate family, nor clone, dedupe or exchange; disabling them explicitly keeps a run deterministic instead of relying on the probe's errno. copy_file_range stays on: the server does it.
-disable=(-F -H -z -Y -C -I -J -B -0)
+# The protocol carries fallocate's allocate, keep-size, punch-hole and zero-range and nothing else of that family, nor clone, dedupe or exchange; disabling the rest explicitly keeps a run deterministic instead of relying on the probe's errno. copy_file_range stays on: the server does it.
+disable=(-Y -C -I -J -B -0)
 
 fs_start fsx
 mkdir "$MNT/fsx"
