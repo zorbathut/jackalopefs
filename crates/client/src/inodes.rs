@@ -129,21 +129,30 @@ impl NodeTable {
         true
     }
 
-    /// Path to address `ino` on the wire, through its newest alias; `None` once it has no alias (unlinked, or replaced under every name we knew).
+    /// Path to address `ino` on the wire: through its newest alias whose directory can itself be addressed. The kernel forgets a directory nothing holds, and a file with a name in it may still be held through a name elsewhere. `None` once no alias leads to the root (unlinked, or replaced under every name we knew).
     pub fn path_of(&self, ino: u64) -> Option<Path> {
-        let mut names = Vec::new();
-        let mut current = ino;
-        while current != ROOT {
-            let (parent, name) = self.nodes.get(&current)?.aliases.last()?;
-            names.push(name.clone());
-            current = *parent;
-            if names.len() > MAX_DEPTH {
-                tracing::error!(ino, "alias chain does not reach the root");
-                return None;
-            }
+        Path::from_names(self.names_to(ino, 0)?).ok()
+    }
+
+    /// The names leading from the root to `ino`, newest aliases first at every step.
+    fn names_to(&self, ino: u64, depth: usize) -> Option<Vec<Name>> {
+        if ino == ROOT {
+            return Some(Vec::new());
         }
-        names.reverse();
-        Path::from_names(names).ok()
+        if depth > MAX_DEPTH {
+            tracing::error!(ino, "alias chain does not reach the root");
+            return None;
+        }
+        self.nodes
+            .get(&ino)?
+            .aliases
+            .iter()
+            .rev()
+            .find_map(|(parent, name)| {
+                let mut names = self.names_to(*parent, depth + 1)?;
+                names.push(name.clone());
+                Some(names)
+            })
     }
 
     pub fn child(&self, parent: u64, name: &Name) -> Option<u64> {
@@ -309,6 +318,21 @@ mod tests {
         t.unlink(ROOT, &n("x"));
         assert_eq!(t.path_of(10), None);
         assert!(t.get(10).unwrap().unlinked);
+    }
+
+    /// The kernel forgets a directory nothing holds; a file held through a name elsewhere is still to be found by that name.
+    #[test]
+    fn a_name_in_a_forgotten_directory_is_passed_over() {
+        let mut t = NodeTable::new();
+        t.insert_lookup(ROOT, n("d"), 5, FileKind::Directory);
+        t.insert_lookup(ROOT, n("e"), 6, FileKind::Directory);
+        t.insert_lookup(5, n("a"), 10, FileKind::Regular);
+        t.insert_lookup(6, n("b"), 10, FileKind::Regular);
+        assert_eq!(t.path_of(10), Some(p("e/b")));
+        assert!(t.forget(6, 1));
+        assert_eq!(t.path_of(10), Some(p("d/a")));
+        assert!(t.forget(5, 1));
+        assert_eq!(t.path_of(10), None);
     }
 
     #[test]

@@ -44,6 +44,7 @@
 
 ### Fixed
 
+- A node reached through several names (a hardlinked file) stays addressable when the directory of the name used last has been forgotten by the kernel; it used to fail with `ESTALE` although another name was good.
 - `syncfs(2)` on the mount no longer fails with `ESTALE` after a written file was deleted or replaced by a rename. With the kernel caching writes it flushes a file's times from inside the `unlink`, the client could address the file by neither name nor handle and answered `ESTALE`, and the kernel reports such an error against the whole mount at the next `syncfs`. The client now answers that flush itself. One visible consequence: setting only the modification time of such a file through an `O_PATH` descriptor, which used to fail with `ESTALE`, is reported as done and not applied.
 - `jackalopefs-client` answers every `ioctl` with `ENOTTY` itself instead of logging a `[Not Implemented] ioctl` warning each time; a program polling the mount for its filesystem label (qBittorrent does, through Qt, every 30 s) no longer fills the log. What the program sees is unchanged: the kernel already turned the old `ENOSYS` into `ENOTTY`. The perf report counts them as `ioctl`, and the per-request trace carries the command, flags and sizes.
 - A server that ran out of file descriptors (or memory) while listing a directory dropped the entries it could not describe, so a client saw and cached a shorter directory; the listing now fails with the errno, logged once with the entry that failed.
