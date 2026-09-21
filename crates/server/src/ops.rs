@@ -45,7 +45,7 @@ const FALLOCATE_MODES_ALLOWED: FallocateFlags = FallocateFlags::FALLOC_FL_KEEP_S
     .union(FallocateFlags::FALLOC_FL_PUNCH_HOLE)
     .union(FallocateFlags::FALLOC_FL_ZERO_RANGE);
 
-/// Most bytes one `CopyFileRange` copies; the client asks again for the rest. Nothing notices a request its client abandoned, so this bounds how long a copy holds a blocking thread and how long it goes on writing to a file whose caller has moved on. A power of two, so a reflink stays block-aligned.
+/// Most bytes one `CopyFileRange` copies; the client asks again for the rest. Nothing notices a request its client abandoned, so this bounds how long a copy holds a blocking thread and how long it goes on writing to a file whose caller has moved on. A power of two, so a copy that starts block-aligned stays so, as a reflink needs.
 const MAX_COPY: u64 = 64 << 20;
 const _: () = assert!(MAX_COPY <= u32::MAX as u64, "the copied reply is a u32");
 
