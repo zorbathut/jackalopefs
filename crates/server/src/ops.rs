@@ -1473,7 +1473,8 @@ mod tests {
                 path: Path::root(),
             },
         ));
-        assert_eq!(attr.ino, crate::export::ROOT_NODEID);
+        let root_ino = fs::metadata(dir.path()).unwrap().ino();
+        assert_eq!(attr.ino, root_ino);
         match dispatch(
             &ops,
             Request::Readdir {
@@ -1497,7 +1498,7 @@ mod tests {
                         .find(|e| e.name.as_slice() == b".")
                         .unwrap()
                         .ino,
-                    crate::export::ROOT_NODEID
+                    root_ino
                 );
             }
             other => panic!("{other:?}"),

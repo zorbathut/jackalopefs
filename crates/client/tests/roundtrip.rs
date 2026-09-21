@@ -87,7 +87,10 @@ async fn file_lifecycle() {
     assert!(client.handles().is_empty());
 
     let (fh, _) = client
-        .open(attr.ino, path("f"), libc::O_WRONLY | libc::O_APPEND)
+        .open(path("f"), libc::O_WRONLY | libc::O_APPEND, {
+            let meant = attr.ino;
+            move |attr| expect_ino(attr, meant)
+        })
         .await
         .unwrap();
     client.write(fh, 0, b"!".to_vec()).await.unwrap();
@@ -140,7 +143,9 @@ async fn copy_file_range_is_done_by_the_server() {
 
     let src_ino = client.lookup(Path::root(), name("src")).await.unwrap().ino;
     let (src, _) = client
-        .open(src_ino, path("src"), libc::O_RDONLY)
+        .open(path("src"), libc::O_RDONLY, move |attr| {
+            expect_ino(attr, src_ino)
+        })
         .await
         .unwrap();
     let (dst, _) = client
@@ -193,7 +198,10 @@ async fn fallocate_is_split_into_requests_the_server_accepts() {
     let server = TestServer::start(export.path(), None).await;
     let client = server.client().await;
     let ino = client.lookup(Path::root(), name("f")).await.unwrap().ino;
-    let (fh, _) = client.open(ino, path("f"), libc::O_RDWR).await.unwrap();
+    let (fh, _) = client
+        .open(path("f"), libc::O_RDWR, move |attr| expect_ino(attr, ino))
+        .await
+        .unwrap();
 
     client.fallocate(fh, 0, 300_000, 0).await.unwrap();
     assert_eq!(
@@ -242,7 +250,9 @@ async fn lseek_finds_data_and_holes_on_the_server() {
         .unwrap()
         .ino;
     let (fh, _) = client
-        .open(ino, path("sparse"), libc::O_RDONLY)
+        .open(path("sparse"), libc::O_RDONLY, move |attr| {
+            expect_ino(attr, ino)
+        })
         .await
         .unwrap();
     let local = |offset: i64, whence| lseek_local(&file, offset, whence);
@@ -317,7 +327,9 @@ async fn unlink_while_open_and_stale_open() {
     fs::write(export.path().join("other"), b"").unwrap();
     let other_ino = fs::metadata(export.path().join("other")).unwrap().ino();
     let err = client
-        .open(other_ino + 1_000_000, path("other"), libc::O_RDONLY)
+        .open(path("other"), libc::O_RDONLY, move |attr| {
+            expect_ino(attr, other_ino + 1_000_000)
+        })
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Stale), "{err}");
@@ -338,7 +350,10 @@ async fn directory_listing_in_pages_and_concurrently() {
     let server = TestServer::start(export.path(), None).await;
     let client = server.client().await;
 
-    let (fh, attr) = client.opendir(1, Path::root()).await.unwrap();
+    let (fh, attr) = client
+        .opendir(Path::root(), move |attr| expect_ino(attr, 1))
+        .await
+        .unwrap();
     assert_eq!(attr.ino, 1);
     let mut seen = Vec::new();
     let mut offset = 0;
@@ -516,7 +531,9 @@ async fn timeout_against_a_blackhole_resets_and_releases() {
     .await;
 
     let err = client
-        .open(1, Path::root(), libc::O_RDONLY)
+        .open(Path::root(), libc::O_RDONLY, move |attr| {
+            expect_ino(attr, 1)
+        })
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Timeout), "{err}");
@@ -546,7 +563,9 @@ async fn a_nonsense_reply_to_an_open_releases_the_handle() {
         .await
         .unwrap();
     let err = client
-        .open(1, Path::root(), libc::O_RDONLY)
+        .open(Path::root(), libc::O_RDONLY, move |attr| {
+            expect_ino(attr, 1)
+        })
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Protocol(_)), "{err}");
@@ -620,7 +639,9 @@ async fn truncated_request_is_ignored_by_the_server() {
     .unwrap();
     send.finish().unwrap();
     let resp: jackalopefs_proto::Response = jackalopefs_proto::read_frame(&mut recv).await.unwrap();
-    assert!(matches!(resp, jackalopefs_proto::Response::Attr(a) if a.ino == 1));
+    // On the wire the root goes by its own inode number; it is the client that knows it as node 1.
+    let root_ino = std::os::unix::fs::MetadataExt::ino(&fs::metadata(export.path()).unwrap());
+    assert!(matches!(resp, jackalopefs_proto::Response::Attr(a) if a.ino == root_ino));
     conn.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
     server.stop().await;
@@ -715,14 +736,21 @@ async fn handles_are_reopened_and_verified_after_a_server_restart() {
     let keep_ino = fs::metadata(export.path().join("keep")).unwrap().ino();
     let swap_ino = fs::metadata(export.path().join("swap")).unwrap().ino();
     let (keep_fh, _) = client
-        .open(keep_ino, path("keep"), libc::O_RDONLY)
+        .open(path("keep"), libc::O_RDONLY, move |attr| {
+            expect_ino(attr, keep_ino)
+        })
         .await
         .unwrap();
     let (swap_fh, _) = client
-        .open(swap_ino, path("swap"), libc::O_RDONLY)
+        .open(path("swap"), libc::O_RDONLY, move |attr| {
+            expect_ino(attr, swap_ino)
+        })
         .await
         .unwrap();
-    let (dir_fh, _) = client.opendir(1, Path::root()).await.unwrap();
+    let (dir_fh, _) = client
+        .opendir(Path::root(), move |attr| expect_ino(attr, 1))
+        .await
+        .unwrap();
 
     first.stop().await;
     let restart = async {
@@ -1060,13 +1088,19 @@ async fn perf_tables_count_what_was_done() {
 
     let attr = client.lookup(Path::root(), name("f")).await.unwrap();
     let (fh, _) = client
-        .open(attr.ino, path("f"), libc::O_RDONLY)
+        .open(path("f"), libc::O_RDONLY, {
+            let meant = attr.ino;
+            move |attr| expect_ino(attr, meant)
+        })
         .await
         .unwrap();
     for _ in 0..5 {
         assert_eq!(client.read(fh, 0, 1024).await.unwrap().len(), 1024);
     }
-    let (dh, _) = client.opendir(1, Path::root()).await.unwrap();
+    let (dh, _) = client
+        .opendir(Path::root(), move |attr| expect_ino(attr, 1))
+        .await
+        .unwrap();
     let (entries, _) = client.readdir(dh, 0, 1 << 20).await.unwrap();
     assert_eq!(entries.len(), 13, "10 entries, f, and the two dots");
     assert_eq!(

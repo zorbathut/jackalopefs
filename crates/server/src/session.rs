@@ -505,6 +505,8 @@ async fn handshake(
                     session_id: state.id,
                     resume_token: state.resume_token,
                     resumed,
+                    root_ino: server.export.root_key().0,
+                    root_identity: server.export.root_key().1.clone(),
                 },
             )
             .await?;

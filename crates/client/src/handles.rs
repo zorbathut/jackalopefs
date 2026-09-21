@@ -1,5 +1,6 @@
 //! Client-side table of open handles. The client chooses handle ids and never reuses one, so when an open's outcome is unknown (timeout, lost connection) the client can simply ask the server to release that id: releasing an id the server never opened is harmless, and releasing one it did closes the fd the client would otherwise never learn about.
 
+use crate::inodes::KeyNode;
 use jackalopefs_proto::{Path, Request, Response};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -15,6 +16,8 @@ pub enum HandleKind {
 #[derive(Debug)]
 pub struct HandleRec {
     pub nodeid: u64,
+    /// The file the handle was opened on, which a reopen must find at the path again.
+    pub key: KeyNode,
     pub path: Path,
     /// The flags the server opened with, which is how the file is reopened after a lost session and what says whether this handle writes; the kernel's own flags differ in access mode and append.
     pub flags: i32,
@@ -64,12 +67,14 @@ impl HandleTable {
         &self,
         fh: u64,
         nodeid: u64,
+        key: KeyNode,
         path: Path,
         flags: i32,
         kind: HandleKind,
     ) -> Arc<HandleRec> {
         let rec = Arc::new(HandleRec {
             nodeid,
+            key,
             path,
             flags,
             kind,
@@ -141,7 +146,7 @@ impl HandleTable {
             .collect()
     }
 
-    /// Judge a reopen reply: the same inode keeps the handle alive, anything else kills it.
+    /// Judge a reopen reply: the same file keeps the handle alive, anything else kills it. The same inode number is not the same file: numbers are recycled, and a server restart is ample time.
     pub fn apply_reopen(
         &self,
         fh: u64,
@@ -149,9 +154,9 @@ impl HandleTable {
         outcome: Result<Response, crate::client::Error>,
     ) {
         match outcome {
-            Ok(Response::Opened { attr }) if attr.ino == rec.nodeid => {}
+            Ok(Response::Opened { attr }) if rec.key.describes(&attr) => {}
             Ok(Response::Opened { attr }) => {
-                tracing::warn!(fh, path = ?rec.path, "path now names a different inode ({} was {}); handle is stale", attr.ino, rec.nodeid);
+                tracing::warn!(fh, path = ?rec.path, was = ?rec.key, now = ?KeyNode::of(&attr), "path now names a different file; handle is stale");
                 rec.mark_dead();
             }
             Ok(other) => {
@@ -188,6 +193,11 @@ mod tests {
             rdev: 0,
             blksize: 4096,
             xattr_names: None,
+            identity: jackalopefs_proto::Identity {
+                handle_type: 1,
+                handle: ino.to_le_bytes().to_vec(),
+            },
+            foreign: false,
         }
     }
 
@@ -198,6 +208,7 @@ mod tests {
         let rec = table.insert(
             fh,
             42,
+            KeyNode::of(&attr(42)),
             Path::root(),
             libc::O_RDWR | libc::O_TRUNC | libc::O_CREAT,
             HandleKind::File,
@@ -209,6 +220,19 @@ mod tests {
         assert!(!rec.is_dead());
         table.apply_reopen(fh, &rec, Ok(Response::Opened { attr: attr(43) }));
         assert!(rec.is_dead());
+        let recycled = table.alloc();
+        let rec = table.insert(
+            recycled,
+            42,
+            KeyNode::of(&attr(42)),
+            Path::root(),
+            libc::O_RDONLY,
+            HandleKind::File,
+        );
+        let mut same_number = attr(42);
+        same_number.identity.handle.push(1);
+        table.apply_reopen(recycled, &rec, Ok(Response::Opened { attr: same_number }));
+        assert!(rec.is_dead(), "the same inode number is not the same file");
         assert!(table.open_nodeids().is_empty());
         assert!(table.live().is_empty());
         assert!(table.alloc() > fh);
@@ -218,9 +242,23 @@ mod tests {
     fn any_live_handle_for_a_node() {
         let table = HandleTable::default();
         let a = table.alloc();
-        let rec_a = table.insert(a, 42, Path::root(), libc::O_RDONLY, HandleKind::File);
+        let rec_a = table.insert(
+            a,
+            42,
+            KeyNode::of(&attr(42)),
+            Path::root(),
+            libc::O_RDONLY,
+            HandleKind::File,
+        );
         let b = table.alloc();
-        table.insert(b, 43, Path::root(), libc::O_RDONLY, HandleKind::File);
+        table.insert(
+            b,
+            43,
+            KeyNode::of(&attr(43)),
+            Path::root(),
+            libc::O_RDONLY,
+            HandleKind::File,
+        );
         assert_eq!(table.any_live_for(42), Some(a));
         assert_eq!(table.any_live_for(43), Some(b));
         assert_eq!(table.any_live_for(44), None);
@@ -233,11 +271,19 @@ mod tests {
     fn a_writer_is_a_live_file_handle_that_can_write() {
         let table = HandleTable::default();
         let r = table.alloc();
-        table.insert(r, 42, Path::root(), libc::O_RDONLY, HandleKind::File);
+        table.insert(
+            r,
+            42,
+            KeyNode::of(&attr(42)),
+            Path::root(),
+            libc::O_RDONLY,
+            HandleKind::File,
+        );
         let d = table.alloc();
         table.insert(
             d,
             42,
+            KeyNode::of(&attr(42)),
             Path::root(),
             libc::O_RDONLY | libc::O_DIRECTORY,
             HandleKind::Dir,
@@ -245,7 +291,14 @@ mod tests {
         assert!(!table.has_writer(42));
         assert!(!table.may_be_dirty(42));
         let w = table.alloc();
-        let rec_w = table.insert(w, 42, Path::root(), libc::O_RDWR, HandleKind::File);
+        let rec_w = table.insert(
+            w,
+            42,
+            KeyNode::of(&attr(42)),
+            Path::root(),
+            libc::O_RDWR,
+            HandleKind::File,
+        );
         assert!(table.has_writer(42));
         assert!(!table.has_writer(43));
         assert!(table.may_be_dirty(42));
@@ -263,6 +316,7 @@ mod tests {
         table.insert(
             w2,
             42,
+            KeyNode::of(&attr(42)),
             Path::root(),
             libc::O_WRONLY | libc::O_CREAT,
             HandleKind::File,

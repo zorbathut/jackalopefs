@@ -22,6 +22,8 @@
 
 ### Breaking
 
+- Protocol revision: every `Attr` carries the file's identity (its `name_to_handle_at` handle) and whether it lies outside the export root's subvolume, the hello's `Ack` carries the root's, and the server no longer rewrites the root's inode number to 1. A directory entry with attributes is 32 bytes larger with ext4's handles. Client and server must be rebuilt together.
+- `jackalopefs-server` refuses to export a directory on a filesystem that gives no file handles, which with Linux 6.5 or later is none, and before that one that cannot be exported over NFS either (overlayfs without `nfs_export`). Files outside the export root's subvolume change their `st_ino`.
 - Protocol revision: an `lseek` request and a `seeked` reply. Every reply is 8 bytes larger on the wire (the golden reply bytes in `crates/proto/src/codec.rs` were regenerated for that). Client and server must be rebuilt together.
 - Protocol revision: a `fallocate` request. Client and server must be rebuilt together.
 - Protocol revision: a `copyFileRange` request and a `copied` reply. Every request is 24 bytes larger on the wire (the golden request bytes in `crates/proto/src/codec.rs` were regenerated for that). Client and server must be rebuilt together.
@@ -44,6 +46,10 @@
 
 ### Fixed
 
+- A descriptor no longer fails with `EIO` after the name it was opened by is removed through the mount and another hardlink of the same file is looked up. The client used to tell a recycled inode number from a live file by guessing (it had lost every name it knew for the node), and guessed wrong.
+- A file deleted and replaced behind the client's back, by another client or on the server, is a new file even when the filesystem gives it the old inode number, as ext4 does at once: the name leads to the new file and a descriptor on the old one keeps the old one. Before, the two shared a node and its cache, and a handle reopened after a reconnect was accepted on its inode number alone.
+- A snapshot or subvolume inside an export (btrfs, bcachefs) no longer collides with the rest of it. A snapshot shares every inode number with its origin, and the two were one file to the client: one node, one page cache, one `(st_dev, st_ino)`. They are now told apart, and the files outside the export root's subvolume go by substitute inode numbers that are the same on every mount.
+- A file whose inode number on the server is 1 was missing from every directory listing and could not be looked up.
 - A node reached through several names (a hardlinked file) stays addressable when the directory of the name used last has been forgotten by the kernel; it used to fail with `ESTALE` although another name was good.
 - `syncfs(2)` on the mount no longer fails with `ESTALE` after a written file was deleted or replaced by a rename. With the kernel caching writes it flushes a file's times from inside the `unlink`, the client could address the file by neither name nor handle and answered `ESTALE`, and the kernel reports such an error against the whole mount at the next `syncfs`. The client now answers that flush itself. One visible consequence: setting only the modification time of such a file through an `O_PATH` descriptor, which used to fail with `ESTALE`, is reported as done and not applied.
 - `jackalopefs-client` answers every `ioctl` with `ENOTTY` itself instead of logging a `[Not Implemented] ioctl` warning each time; a program polling the mount for its filesystem label (qBittorrent does, through Qt, every 30 s) no longer fills the log. What the program sees is unchanged: the kernel already turned the old `ENOSYS` into `ENOTTY`. The perf report counts them as `ioctl`, and the per-request trace carries the command, flags and sizes.

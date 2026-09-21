@@ -145,6 +145,11 @@ fn main() -> anyhow::Result<()> {
     let identity = Identity::load_or_generate(&state_dir)?;
     tracing::info!("certificate fingerprint: {}", identity.fingerprint());
     let export = Arc::new(Export::open(&args.export)?);
+    match export.handles_are_stable() {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!("{} is on FUSE or overlayfs, whose file handles do not last as long as its files (a remount, a copy-up): clients will take such a file for a new one", args.export.display()),
+        Err(e) => tracing::warn!("cannot tell what filesystem {} is on: {e}", args.export.display()),
+    }
 
     let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
     runtime.block_on(async move {

@@ -1,7 +1,7 @@
 //! The FUSE backend: every kernel request is copied out of the session thread and answered from a tokio task, so the session thread never waits on the network.
 
 use crate::client::{Client, Error, RequestKernel};
-use crate::inodes::{NodeTable, ROOT};
+use crate::inodes::{KeyNode, NodeTable, ROOT};
 use crate::invalidate::Work;
 use crate::perf::{Outcome, TRACE_TARGET};
 use fuser::{
@@ -286,9 +286,13 @@ fn file_type(kind: FileKind) -> FileType {
     }
 }
 
-fn file_attr(attr: &Attr) -> FileAttr {
+/// Every node keeps this generation for ever: a node's number is never given to another file while the kernel remembers it, which is all a generation is for.
+const GENERATION: Generation = Generation(0);
+
+/// The kernel's attributes for the node `id`, which is also the `st_ino` userspace sees (fuser has one field for both).
+fn file_attr(id: u64, attr: &Attr) -> FileAttr {
     FileAttr {
-        ino: INodeNo(attr.ino),
+        ino: INodeNo(id),
         size: attr.size,
         blocks: attr.blocks,
         atime: system_time(attr.atime),
@@ -384,12 +388,23 @@ impl Shared {
         }
     }
 
-    /// Whether `ino` is a regular file this client can no longer address by any name it knew: its last known name was unlinked or renamed over through this client, or found to belong to another inode. With no handle open either, the kernel's flush of the file's times (see [`setattr_flushes_times`]) has nowhere to go, since the name may by now be another file's, and is answered without the server: the kernel ignores that reply, while an error would be recorded against the whole mount and fail its next `syncfs`. `docs/design.md`, "Node table", has what that gives up.
+    /// Whether `ino` is a regular file this client can no longer address by any name it knew. With no handle open either, the kernel's flush of the file's times (see [`setattr_flushes_times`]) has nowhere to go and is answered without the server: the kernel ignores that reply, while an error would be recorded against the whole mount and fail its next `syncfs`. `docs/design.md`, "Node table", has what that gives up.
     fn unlinked_file(&self, ino: u64) -> bool {
         self.nodes
             .lock()
             .get(ino)
             .is_some_and(|node| node.unlinked && node.kind == FileKind::Regular)
+    }
+
+    /// The node `id` if `attr`, the reply to an open of it by path, describes the file the node is; a path that led to another file is refused. The root is whatever the server says it is.
+    fn same_file(&self, id: u64, attr: &Attr) -> Result<u64, Error> {
+        let nodes = self.nodes.lock();
+        let known = nodes.get(id).and_then(|node| node.key.as_ref());
+        if id == ROOT || known.is_some_and(|key| key.describes(attr)) {
+            return Ok(id);
+        }
+        tracing::warn!(node = id, was = ?known, now = ?KeyNode::of(attr), "path led to a different file than the one being opened");
+        Err(Error::Stale)
     }
 
     fn parent_of(&self, ino: u64) -> u64 {
@@ -401,12 +416,12 @@ impl Shared {
     }
 
     /// Keep what the attributes say about the inode's xattr names for the attribute TTL; attributes that did not look replace whatever was known, since the server may since have declined to say.
-    fn xattr_remember(&self, attr: &Attr) {
+    fn xattr_remember(&self, id: u64, attr: &Attr) {
         let mut xattrs = self.xattrs.lock();
         match &attr.xattr_names {
             Some(names) => {
                 xattrs.insert(
-                    attr.ino,
+                    id,
                     KnownXattrs {
                         names: names.clone(),
                         until: Instant::now() + self.attr_ttl,
@@ -414,7 +429,7 @@ impl Shared {
                 );
             }
             None => {
-                xattrs.remove(&attr.ino);
+                xattrs.remove(&id);
             }
         }
     }
@@ -432,7 +447,7 @@ impl Shared {
     }
 
     /// Record what the server reports about a regular file's size and mtime; when that differs from last time and this client is not writing the file, someone else changed it, and the kernel, which keeps its own view of a file it holds, is made to drop the file by name so an unopened one is looked up afresh.
-    fn attr_reported(&self, attr: &Attr) {
+    fn attr_reported(&self, id: u64, attr: &Attr) {
         if attr.kind != FileKind::Regular {
             return;
         }
@@ -442,21 +457,21 @@ impl Shared {
         };
         let changed = {
             let mut reported = self.reported.lock();
-            match reported.get(&attr.ino) {
+            match reported.get(&id) {
                 Some(before) => *before != now,
                 None => {
-                    reported.insert(attr.ino, now);
+                    reported.insert(id, now);
                     false
                 }
             }
         };
         // A file held open cannot be evicted, and while we write it the server's view is noise; the record stays behind so the first reply after the last close detects the change and drops the file then.
-        if !changed || self.client.handles().any_live_for(attr.ino).is_some() {
+        if !changed || self.client.handles().any_live_for(id).is_some() {
             return;
         }
         // The record moves only once the invalidation is queued; until then it stays behind so the next reply detects the same change again.
-        if self.drop_by_name(attr.ino) {
-            self.reported.lock().insert(attr.ino, now);
+        if self.drop_by_name(id) {
+            self.reported.lock().insert(id, now);
         }
     }
 
@@ -512,15 +527,16 @@ impl Shared {
         }
     }
 
-    /// Register a successful entry reply and return the generation to send.
-    fn register(&self, parent: u64, name: Name, attr: &Attr) -> Result<Generation, Errno> {
-        self.xattr_remember(attr);
-        self.attr_reported(attr);
-        self.nodes
+    /// Register a successful entry reply and return the node it describes.
+    fn register(&self, parent: u64, name: Name, attr: &Attr) -> Result<u64, Errno> {
+        let id = self
+            .nodes
             .lock()
-            .insert_lookup(parent, name, attr.ino, attr.kind)
-            .map(Generation)
-            .ok_or(Errno::EIO)
+            .insert_lookup(parent, name, attr.into())
+            .ok_or(Errno::EIO)?;
+        self.xattr_remember(id, attr);
+        self.attr_reported(id, attr);
+        Ok(id)
     }
 
     /// Answer a request that created `name` under `parent`: the directory grew, then as `reply_entry`.
@@ -532,12 +548,12 @@ impl Shared {
     /// Answer an entry-producing request: register the node and reply with its attributes and generation.
     fn reply_entry(&self, reply: ReplyEntry, parent: u64, name: Name, attr: &Attr) -> Outcome {
         match self.register(parent, name, attr) {
-            Ok(generation) => {
+            Ok(id) => {
                 reply.entry_with_ttls(
                     &self.attr_ttl,
                     &self.entry_ttl,
-                    &file_attr(attr),
-                    generation,
+                    &file_attr(id, attr),
+                    GENERATION,
                 );
                 Outcome::default()
             }
@@ -619,12 +635,18 @@ impl Shared {
     ) -> (usize, VecDeque<(u64, T)>) {
         let mut entries = entries.into_iter();
         let mut added = 0;
+        let parent = self.parent_of(ino);
+        let nodes = self.nodes.lock();
         while let Some((cookie, item)) = entries.next() {
             let entry = entry_of(&item);
             let entry_ino = match entry.name.as_slice() {
                 b"." => ino,
-                b".." => self.parent_of(ino),
-                _ => entry.ino,
+                b".." => parent,
+                // A name the table knows goes by its node's number, which is what `stat` will say; one it does not know yet goes by the file's own inode number, which is what its node will have unless it turns out to need a substitute.
+                name => Name::new(name)
+                    .ok()
+                    .and_then(|name| nodes.child(ino, &name))
+                    .unwrap_or(entry.ino),
             };
             if reply.add(
                 INodeNo(entry_ino),
@@ -745,9 +767,12 @@ impl Filesystem for Backend {
             };
             match shared.client.getattr(path, fh).await {
                 Ok(attr) => {
-                    shared.xattr_remember(&attr);
-                    shared.attr_reported(&attr);
-                    reply.attr(&shared.attr_ttl, &file_attr(&attr));
+                    if ino.0 == ROOT {
+                        shared.nodes.lock().root_seen(&attr.identity);
+                    }
+                    shared.xattr_remember(ino.0, &attr);
+                    shared.attr_reported(ino.0, &attr);
+                    reply.attr(&shared.attr_ttl, &file_attr(ino.0, &attr));
                     Outcome::default()
                 }
                 Err(e) => fail(reply, errno(&e)),
@@ -807,20 +832,20 @@ impl Filesystem for Backend {
             };
             match shared.client.setattr(path, fh, set).await {
                 Ok(attr) => {
-                    shared.xattr_remember(&attr);
+                    shared.xattr_remember(ino.0, &attr);
                     if observes_only {
-                        shared.attr_reported(&attr);
+                        shared.attr_reported(ino.0, &attr);
                     } else {
                         // Our own change: the kernel already knows the new size and time, so only the record moves.
                         shared.reported.lock().insert(
-                            attr.ino,
+                            ino.0,
                             AttrReported {
                                 size: attr.size,
                                 mtime: attr.mtime,
                             },
                         );
                     }
-                    reply.attr(&shared.attr_ttl, &file_attr(&attr));
+                    reply.attr(&shared.attr_ttl, &file_attr(ino.0, &attr));
                     Outcome::default()
                 }
                 Err(e) => fail(reply, errno(&e)),
@@ -1049,10 +1074,15 @@ impl Filesystem for Backend {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
             };
-            match shared.client.open(ino.0, path, flags).await {
+            let meant = shared.clone();
+            let opened = shared
+                .client
+                .open(path, flags, move |attr| meant.same_file(ino.0, attr))
+                .await;
+            match opened {
                 Ok((fh, attr)) => {
-                    shared.xattr_remember(&attr);
-                    shared.attr_reported(&attr);
+                    shared.xattr_remember(ino.0, &attr);
+                    shared.attr_reported(ino.0, &attr);
                     reply.opened(FileHandle(fh), FopenFlags::empty());
                     Outcome::default()
                 }
@@ -1082,7 +1112,7 @@ impl Filesystem for Backend {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
             };
-            let mut generation = None;
+            let mut node = None;
             let registering = shared.clone();
             let created = shared
                 .client
@@ -1091,16 +1121,16 @@ impl Filesystem for Backend {
                     let registered = registering
                         .register(parent.0, name, attr)
                         .map_err(|e| Error::Remote(i32::from(e)))?;
-                    generation = Some(registered);
-                    Ok(attr.ino)
+                    node = Some(registered);
+                    Ok(registered)
                 })
                 .await;
-            match (created, generation) {
-                (Ok((fh, attr)), Some(generation)) => {
+            match (created, node) {
+                (Ok((fh, attr)), Some(id)) => {
                     reply.created(
                         &shared.entry_ttl.min(shared.attr_ttl),
-                        &file_attr(&attr),
-                        generation,
+                        &file_attr(id, &attr),
+                        GENERATION,
                         FileHandle(fh),
                         FopenFlags::empty(),
                     );
@@ -1380,7 +1410,12 @@ impl Filesystem for Backend {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
             };
-            match shared.client.opendir(ino.0, path).await {
+            let meant = shared.clone();
+            let opened = shared
+                .client
+                .opendir(path, move |attr| meant.same_file(ino.0, attr))
+                .await;
+            match opened {
                 Ok((fh, _)) => {
                     shared.dirs.lock().insert(
                         fh,
@@ -1463,7 +1498,7 @@ impl Filesystem for Backend {
                         name,
                         &shared.entry_ttl,
                         &dir_placeholder(ino.0),
-                        Generation(0),
+                        GENERATION,
                     ),
                     (b"..", _) => {
                         let parent = shared.parent_of(ino.0);
@@ -1473,7 +1508,7 @@ impl Filesystem for Backend {
                             name,
                             &shared.entry_ttl,
                             &dir_placeholder(parent),
-                            Generation(0),
+                            GENERATION,
                         )
                     }
                     (_, Some(attr)) => {
@@ -1481,20 +1516,26 @@ impl Filesystem for Backend {
                             tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.name), "readdirplus entry with an invalid name; skipped");
                             continue;
                         };
-                        let generation = shared.nodes.lock().generation_for_lookup(attr.ino);
-                        let full = reply.add(
-                            INodeNo(attr.ino),
-                            entry.next_offset,
-                            name,
-                            &shared.entry_ttl,
-                            &file_attr(attr),
-                            Generation(generation),
-                        );
-                        if !full && shared.register(ino.0, entry_name, attr).is_err() {
-                            tracing::warn!(
-                                ino = attr.ino,
-                                "readdirplus entry could not be registered"
+                        // The kernel may refuse the entry for want of room, and one it refused must leave no node behind, so the node is asked for first and registered once the entry is in; the table stays locked between the two, or another request could be given the number meanwhile.
+                        let (id, full) = {
+                            let mut nodes = shared.nodes.lock();
+                            let id = nodes.id_for(attr.into());
+                            let full = reply.add(
+                                INodeNo(id),
+                                entry.next_offset,
+                                name,
+                                &shared.entry_ttl,
+                                &file_attr(id, attr),
+                                GENERATION,
                             );
+                            if !full && nodes.insert_lookup(ino.0, entry_name, attr.into()).is_none() {
+                                tracing::warn!(ino = attr.ino, "readdirplus entry that claims to be the root; not registered");
+                            }
+                            (id, full)
+                        };
+                        if !full {
+                            shared.xattr_remember(id, attr);
+                            shared.attr_reported(id, attr);
                         }
                         full
                     }

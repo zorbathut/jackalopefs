@@ -2,11 +2,12 @@
 
 use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::{HandleKind, HandleTable};
+use crate::inodes::KeyNode;
 use crate::perf::{AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_proto::{
-    read_frame, write_frame, Attr, Auth, DirEntry, DirEntryPlus, ErrorCodec, Event, Name, Path,
-    Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
+    read_frame, write_frame, Attr, Auth, DirEntry, DirEntryPlus, ErrorCodec, Event, Identity, Name,
+    Path, Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
 };
 use quinn::{Connection, RecvStream, SendStream};
 use std::future::Future;
@@ -180,9 +181,37 @@ impl Timing {
     }
 }
 
+/// The export root as its server describes it. The kernel knows the root as node 1 and a server knows it by its real inode number, so every reply is passed through [`KeyRoot::as_node_one`] on its way in.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct KeyRoot {
+    pub ino: u64,
+    pub identity: Identity,
+}
+
+impl KeyRoot {
+    fn as_node_one(&self, resp: &mut Response) {
+        let rewrite = |attr: &mut Attr| {
+            if attr.ino == self.ino && attr.identity == self.identity {
+                attr.ino = crate::inodes::ROOT;
+            }
+        };
+        match resp {
+            Response::Entry(attr) | Response::Attr(attr) | Response::Opened { attr } => {
+                rewrite(attr)
+            }
+            Response::ReaddirPlus { entries, .. } => entries
+                .iter_mut()
+                .filter_map(|e| e.attr.as_mut())
+                .for_each(rewrite),
+            _ => {}
+        }
+    }
+}
+
 /// One request on one fresh bidi stream.
 pub(crate) async fn exchange(
     conn: &Connection,
+    root: &KeyRoot,
     req: &Request,
     timing: &mut Timing,
 ) -> Result<Response, ErrorExchange> {
@@ -201,11 +230,12 @@ pub(crate) async fn exchange(
         .map_err(|e| codec_error(e, ErrorExchange::NotSent))?;
     streams.send.finish().map_err(|_| ErrorExchange::Lost)?;
     timing.sent = Some(Instant::now());
-    let resp: Response = read_frame(&mut streams.recv)
+    let mut resp: Response = read_frame(&mut streams.recv)
         .await
         .map_err(|e| codec_error(e, ErrorExchange::Lost))?;
     timing.replied = Some(Instant::now());
     streams.done = true;
+    root.as_node_one(&mut resp);
     Ok(resp)
 }
 
@@ -364,7 +394,10 @@ impl Caller {
             let attempt = Instant::now();
             let exchanged = interruptible(
                 kernel,
-                within(self.op_timeout, exchange(&attached.conn, req, &mut timing)),
+                within(
+                    self.op_timeout,
+                    exchange(&attached.conn, &attached.root, req, &mut timing),
+                ),
             )
             .await;
             account.phases += timing.phases(attempt);
@@ -526,7 +559,9 @@ impl Client {
         match self.call(req).await {
             Ok(Response::Opened { attr }) => match node(&attr) {
                 Ok(nodeid) => {
-                    self.caller.handles.insert(fh, nodeid, path, flags, kind);
+                    self.caller
+                        .handles
+                        .insert(fh, nodeid, KeyNode::of(&attr), path, flags, kind);
                     Ok((fh, attr))
                 }
                 Err(e) => {
@@ -635,14 +670,20 @@ impl Client {
         .await
     }
 
-    pub async fn open(&self, nodeid: u64, path: Path, flags: i32) -> Result<(u64, Attr), Error> {
-        let (p, meant) = (path.clone(), path.clone());
+    /// `node` says which node the file the path led to is, or refuses it as not the one meant.
+    pub async fn open(
+        &self,
+        path: Path,
+        flags: i32,
+        node: impl FnOnce(&Attr) -> Result<u64, Error>,
+    ) -> Result<(u64, Attr), Error> {
+        let p = path.clone();
         self.open_handle(
             path,
             flags,
             HandleKind::File,
             move |fh| Request::Open { fh, path: p, flags },
-            move |attr| same_inode(&meant, nodeid, attr),
+            node,
         )
         .await
     }
@@ -749,14 +790,19 @@ impl Client {
         self.call_ok(Request::Fsync { fh, datasync }).await
     }
 
-    pub async fn opendir(&self, nodeid: u64, path: Path) -> Result<(u64, Attr), Error> {
-        let (p, meant) = (path.clone(), path.clone());
+    /// `node` as for [`Self::open`].
+    pub async fn opendir(
+        &self,
+        path: Path,
+        node: impl FnOnce(&Attr) -> Result<u64, Error>,
+    ) -> Result<(u64, Attr), Error> {
+        let p = path.clone();
         self.open_handle(
             path,
             libc::O_RDONLY | libc::O_DIRECTORY,
             HandleKind::Dir,
             move |fh| Request::Opendir { fh, path: p },
-            move |attr| same_inode(&meant, nodeid, attr),
+            node,
         )
         .await
     }
@@ -846,20 +892,6 @@ impl Client {
     pub async fn access(&self, path: Path, mask: i32) -> Result<(), Error> {
         self.call_ok(Request::Access { path, mask }).await
     }
-}
-
-/// The node an open meant, if the path still led to it.
-fn same_inode(path: &Path, nodeid: u64, attr: &Attr) -> Result<u64, Error> {
-    if attr.ino == nodeid {
-        return Ok(nodeid);
-    }
-    tracing::warn!(
-        ?path,
-        expected = nodeid,
-        actual = attr.ino,
-        "path led to a different inode than the one being opened"
-    );
-    Err(Error::Stale)
 }
 
 fn release_request(kind: HandleKind, fh: u64) -> Request {

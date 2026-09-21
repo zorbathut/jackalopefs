@@ -220,6 +220,19 @@ impl DirStream {
         names
     }
 
+    /// The `d_ino` of the entry called `wanted`, which `std::fs::read_dir` cannot show for the dots.
+    fn ino_of(&self, wanted: &str) -> u64 {
+        loop {
+            // SAFETY: as in `read_names`.
+            let entry = unsafe { libc::readdir(self.0) };
+            assert!(!entry.is_null(), "no entry called {wanted}");
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if name.to_bytes() == wanted.as_bytes() {
+                return unsafe { (*entry).d_ino };
+            }
+        }
+    }
+
     fn rewind(&self) {
         // SAFETY: `self.0` is an open stream until `Drop`.
         unsafe { libc::rewinddir(self.0) }
@@ -1173,6 +1186,127 @@ async fn seeking_data_and_holes_asks_the_server_unless_this_client_is_writing() 
     wait_for(Duration::from_secs(3), "the writer's release", || {
         let reader = fs::File::open(mnt.join("sparse")).unwrap();
         (seek(&reader, 0, libc::SEEK_DATA) == Ok(0)).then_some(())
+    })
+    .await;
+    m.finish().await;
+}
+
+/// A file with two names, opened through one of them; that name is then removed through the mount and the other looked up. It is one file throughout, so the descriptor must go on working: the client used to take the lookup for a new file with a recycled inode number, and the kernel then declared the open inode bad.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_descriptor_survives_its_name_when_the_file_has_another() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    fs::create_dir(export.join("e")).unwrap();
+    fs::write(export.join("d/a"), b"contents").unwrap();
+    fs::hard_link(export.join("d/a"), export.join("e/b")).unwrap();
+    let mnt = m.mnt();
+    blocking(move || {
+        let mut file = fs::File::open(mnt.join("d/a")).unwrap();
+        fs::remove_file(mnt.join("d/a")).unwrap();
+        let other = fs::metadata(mnt.join("e/b")).unwrap();
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut file, &mut contents).unwrap();
+        assert_eq!(contents, "contents");
+        assert_eq!(
+            file.metadata().unwrap().ino(),
+            other.ino(),
+            "one file by either route"
+        );
+        assert_eq!(
+            other.ino(),
+            fs::metadata(export.join("e/b")).unwrap().ino(),
+            "and by its real number"
+        );
+    })
+    .await;
+    m.finish().await;
+}
+
+/// Replaced on the export while open here, a file stays what it was for the descriptor, and its name leads to the new file, which is another node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_replaced_on_the_export_is_another_file_by_name_and_the_same_by_descriptor() {
+    use std::os::unix::fs::MetadataExt;
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::write(export.join("f"), b"old").unwrap();
+    let mnt = m.mnt();
+    blocking(move || {
+        let mut file = fs::File::open(mnt.join("f")).unwrap();
+        let before = file.metadata().unwrap().ino();
+        fs::remove_file(export.join("f")).unwrap();
+        fs::write(export.join("f"), b"new contents").unwrap();
+        let started = Instant::now();
+        let by_name = loop {
+            if let Ok(found) = fs::read(mnt.join("f")) {
+                if found == b"new contents" {
+                    break fs::metadata(mnt.join("f")).unwrap().ino();
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the new file never showed"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert_ne!(
+            by_name, before,
+            "two files, two numbers, while the kernel holds both"
+        );
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut file, &mut contents).unwrap();
+        assert_eq!(contents, "old");
+        assert_eq!(file.metadata().unwrap().ino(), before);
+    })
+    .await;
+    m.finish().await;
+}
+
+/// What a directory listing says an entry's inode number is must be what `stat` says, for `.` and `..` too, whichever kind of page the entry came in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listings_and_stat_agree_on_inode_numbers() {
+    use std::os::unix::fs::{DirEntryExt, MetadataExt};
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    for i in 0..300 {
+        fs::write(export.join(format!("d/file-{i:03}")), b"").unwrap();
+    }
+    let mnt = m.mnt();
+    blocking(move || {
+        // Twice: the first listing fills the kernel's cache through readdirplus, the second is answered from plain pages.
+        for round in 0..2 {
+            let mut seen = 0;
+            for entry in fs::read_dir(mnt.join("d")).unwrap() {
+                let entry = entry.unwrap();
+                assert_eq!(
+                    entry.ino(),
+                    entry.metadata().unwrap().ino(),
+                    "round {round}: {:?}",
+                    entry.file_name()
+                );
+                assert_eq!(
+                    entry.ino(),
+                    fs::metadata(export.join("d").join(entry.file_name()))
+                        .unwrap()
+                        .ino(),
+                    "round {round}: an ordinary file goes by its real number"
+                );
+                seen += 1;
+            }
+            assert_eq!(seen, 300);
+        }
+        for (name, dir) in [(".", mnt.join("d")), ("..", mnt.clone())] {
+            let listed = DirStream::open(&mnt.join("d")).ino_of(name);
+            assert_eq!(listed, fs::metadata(&dir).unwrap().ino(), "{name}");
+        }
     })
     .await;
     m.finish().await;

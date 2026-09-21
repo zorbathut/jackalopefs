@@ -1,6 +1,6 @@
 //! The connection manager: one background task that owns the QUIC connection, reconnects with backoff when it drops, resumes (or reopens) the handle table, and forwards the server's event stream.
 
-use crate::client::{exchange, Error, Timing};
+use crate::client::{exchange, Error, KeyRoot, Timing};
 use crate::handles::{HandleKind, HandleTable};
 use crate::transport::{client_config, ServerTrust};
 use jackalopefs_proto::{
@@ -46,6 +46,7 @@ pub struct Attached {
     pub resumed: bool,
     /// Increments with every successful connection; callers that lost a reply wait for a strictly newer generation before retrying.
     pub generation: u64,
+    pub root: KeyRoot,
 }
 
 #[derive(Clone, Debug)]
@@ -224,7 +225,7 @@ async fn run(
         });
         // Try the address that answered first from now on, so a dead candidate ahead of it costs its deadline once instead of on every reconnect.
         candidates.rotate_left(winner);
-        let (conn, resumed) = (attached.conn, attached.resumed);
+        let (conn, resumed, root) = (attached.conn, attached.resumed, attached.root);
         tracing::info!(
             session = attached.session_id,
             resumed,
@@ -235,7 +236,7 @@ async fn run(
 
         if !resumed {
             tokio::select! {
-                _ = reopen_handles(&conn, &handles, cfg.offline_timeout) => {}
+                _ = reopen_handles(&conn, &root, &handles, cfg.offline_timeout) => {}
                 _ = stop.changed() => {
                     conn.close(close_code::UNMOUNT.into(), b"unmount");
                     break;
@@ -247,6 +248,7 @@ async fn run(
             session_id: attached.session_id,
             resumed,
             generation,
+            root,
         });
         if state.send(ConnState::Connected(attached)).is_err() {
             break;
@@ -280,6 +282,7 @@ struct Handshaken {
     session_id: u64,
     resume_token: [u8; 16],
     resumed: bool,
+    root: KeyRoot,
 }
 
 /// A resolved server address and the socket that can reach it.
@@ -402,12 +405,18 @@ async fn connect_once(
             session_id,
             resume_token,
             resumed,
+            root_ino,
+            root_identity,
         } => Ok(Handshaken {
             conn,
             addr,
             session_id,
             resume_token,
             resumed,
+            root: KeyRoot {
+                ino: root_ino,
+                identity: root_identity,
+            },
         }),
         HelloReply::Reject { reason } => {
             conn.close(close_code::UNMOUNT.into(), b"rejected");
@@ -424,7 +433,12 @@ async fn connect_once(
 }
 
 /// The server has no memory of our handles: reopen each by path, concurrently, keep only those that still name the same inode, and release the rest so the server doesn't hold what we won't use. Every step has the offline deadline: reopening is part of getting the connection back, and the connection is not published until it is done, so a reopen without a bound would keep every call on the mount waiting. The steps run concurrently, so the whole phase is bounded by two of them.
-async fn reopen_handles(conn: &Connection, handles: &HandleTable, offline_timeout: Duration) {
+async fn reopen_handles(
+    conn: &Connection,
+    root: &KeyRoot,
+    handles: &HandleTable,
+    offline_timeout: Duration,
+) {
     let live = handles.live();
     if live.is_empty() {
         return;
@@ -432,11 +446,16 @@ async fn reopen_handles(conn: &Connection, handles: &HandleTable, offline_timeou
     tracing::info!(count = live.len(), "reopening handles after a new session");
     let mut reopens = tokio::task::JoinSet::new();
     for (fh, rec) in live {
-        let conn = conn.clone();
+        let (conn, root) = (conn.clone(), root.clone());
         reopens.spawn(async move {
             let outcome = match timeout(
                 offline_timeout,
-                exchange(&conn, &rec.reopen_request(fh), &mut Timing::default()),
+                exchange(
+                    &conn,
+                    &root,
+                    &rec.reopen_request(fh),
+                    &mut Timing::default(),
+                ),
             )
             .await
             {
@@ -452,7 +471,7 @@ async fn reopen_handles(conn: &Connection, handles: &HandleTable, offline_timeou
             Ok((fh, rec, outcome)) => {
                 handles.apply_reopen(fh, &rec, outcome);
                 if rec.is_dead() {
-                    let conn = conn.clone();
+                    let (conn, root) = (conn.clone(), root.clone());
                     let release = match rec.kind {
                         HandleKind::File => jackalopefs_proto::Request::Release { fh },
                         HandleKind::Dir => jackalopefs_proto::Request::Releasedir { fh },
@@ -460,7 +479,7 @@ async fn reopen_handles(conn: &Connection, handles: &HandleTable, offline_timeou
                     releases.spawn(async move {
                         match timeout(
                             offline_timeout,
-                            exchange(&conn, &release, &mut Timing::default()),
+                            exchange(&conn, &root, &release, &mut Timing::default()),
                         )
                         .await
                         {

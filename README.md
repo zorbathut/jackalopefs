@@ -77,7 +77,7 @@ Be aware that this was mostly Claude-coded. I've been thinking about this genera
 
 ## Semantics
 
-Single client: hardlinks share `st_ino`, `st_ino` is stable, unlink-while-open works, `readdir` uses real directory cookies, POSIX and BSD locks are handled by the local kernel. The kernel caches writes: a `write(2)` returns once the page cache has the data, the kernel sends it in 1 MiB requests with many in flight, and a failure to reach the server surfaces at `fsync(2)` or `close(2)` rather than at the write. `O_APPEND` is positioned by the client's kernel, which is exact for one client per file.
+Single client: hardlinks share `st_ino`, `st_ino` is stable and is the server's own inode number (except for files in another subvolume or snapshot than the export's root, which go by stable substitutes so that they do not collide with it, and for a file that got a recycled inode number while the kernel still remembers the number's previous owner), a recycled inode number is a new file, unlink-while-open works, `readdir` uses real directory cookies, POSIX and BSD locks are handled by the local kernel. The kernel caches writes: a `write(2)` returns once the page cache has the data, the kernel sends it in 1 MiB requests with many in flight, and a failure to reach the server surfaces at `fsync(2)` or `close(2)` rather than at the write. `O_APPEND` is positioned by the client's kernel, which is exact for one client per file.
 
 Several clients: each sees the others' changes through server push plus the cache TTL; locks are not shared. See `docs/design.md` for the full list of limitations.
 

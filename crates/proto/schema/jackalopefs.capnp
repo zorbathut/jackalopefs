@@ -26,6 +26,7 @@
 # - a name that is empty, longer than 255 bytes, contains '/' or NUL, or is "." or ".."
 # - a path longer than 4096 bytes when joined with '/' (the empty path, or an omitted path pointer, is the export root)
 # - a resume token that is not exactly 16 bytes
+# - a file handle longer than 128 bytes
 # - a reason that is not UTF-8 (every other byte field, the auth token included, is arbitrary bytes)
 # - an unknown union discriminant or enum value
 #
@@ -60,6 +61,17 @@ enum Whence {
   hole @1;
 }
 
+# What tells one file from another when inode numbers cannot: the file's handle as name_to_handle_at(2) returns it, its
+# type and the first handle_bytes bytes of f_handle (the rest of the kernel's buffer is uninitialised and never sent).
+# It is opaque and only ever compared for equality, within one export. It is equal for one file for as long as the file
+# exists, by whatever name it is reached and across server restarts, and different for different files that share an
+# inode number (a recycled number, a snapshot and its origin); the server takes both on trust from the export's
+# filesystem, and one that sets no inode generation cannot tell a recycled number apart.
+struct Identity {
+  handleType @0 :Int32;
+  handle @1 :Data;
+}
+
 struct Attr {
   ino @0 :UInt64;
   size @1 :UInt64;
@@ -83,6 +95,10 @@ struct Attr {
     unknown @16 :Void;
     some @17 :List(Data);
   }
+  identity @18 :Identity;
+  # The file lies outside the export root's subvolume (in another btrfs or bcachefs subvolume or snapshot), where
+  # inode numbers repeat the root subvolume's. ino is always the filesystem's own number, the export root's included.
+  foreign @19 :Bool;
 }
 
 struct Statfs {
@@ -145,6 +161,10 @@ struct HelloReply {
       sessionId @0 :UInt64;
       resumeToken @1 :Data;
       resumed @2 :Bool;
+      # The export root: its inode number and identity, by which a client knows on every connection that this is
+      # still the directory it mounted.
+      rootIno @5 :UInt64;
+      rootIdentity @6 :Identity;
     }
     reject :group {
       reason @3 :Text;

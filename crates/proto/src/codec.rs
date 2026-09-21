@@ -184,6 +184,16 @@ mod tests {
             rdev: 0,
             blksize: 4096,
             xattr_names: Some(vec![b"user.k".to_vec(), b"security.selinux".to_vec()]),
+            identity: sample_identity(ino),
+            foreign: false,
+        }
+    }
+
+    /// A handle the size ext4 makes them: inode number and generation.
+    fn sample_identity(ino: u64) -> Identity {
+        Identity {
+            handle_type: 1,
+            handle: [(ino as u32).to_le_bytes(), 0xfeed_beef_u32.to_le_bytes()].concat(),
         }
     }
 
@@ -471,6 +481,8 @@ mod tests {
                     session_id: 1,
                     resume_token: [1u8; 16],
                     resumed: true,
+                    root_ino: 2,
+                    root_identity: sample_identity(2),
                 },
                 HelloReply::Reject {
                     reason: "no".into(),
@@ -943,14 +955,16 @@ mod tests {
         let bytes = capnp_convert(
             "text:binary",
             "HelloReply",
-            b"(ack = (sessionId = 9, resumeToken = \"0123456789abcdef\", resumed = true))",
+b"(ack = (sessionId = 9, resumeToken = \"0123456789abcdef\", resumed = true, rootIno = 2, rootIdentity = (handleType = 1, handle = \"\\x02\\x00\\x00\\x00\\xef\\xbe\\xed\\xfe\")))",
         );
         assert_eq!(
             decode::<HelloReply>(&bytes).unwrap(),
             HelloReply::Ack {
                 session_id: 9,
                 resume_token: *b"0123456789abcdef",
-                resumed: true
+                resumed: true,
+                root_ino: 2,
+                root_identity: sample_identity(2),
             }
         );
         let bytes = capnp_convert(
@@ -986,6 +1000,24 @@ mod tests {
         assert!(schema.contains(&format!("fallocate covers at most {MAX_FALLOCATE} bytes")));
     }
 
+    #[test]
+    fn a_file_handle_longer_than_the_kernel_makes_is_a_decode_error() {
+        let attr = |len: usize| Attr {
+            identity: Identity {
+                handle_type: 1,
+                handle: vec![7; len],
+            },
+            ..sample_attr(3)
+        };
+        let longest = encode(&Response::Attr(attr(HANDLE_MAX))).unwrap();
+        assert!(decode::<Response>(&longest[4..]).is_ok());
+        let longer = encode(&Response::Attr(attr(HANDLE_MAX + 1))).unwrap();
+        assert!(matches!(
+            decode::<Response>(&longer[4..]),
+            Err(ErrorCodec::Decode(ErrorDecode::Invalid(_)))
+        ));
+    }
+
     /// `dir_entry_bytes` is what the server budgets a page with, so it must be the true marginal cost of an entry.
     #[test]
     fn dir_entry_bytes_is_the_marginal_cost_of_an_entry() {
@@ -1006,20 +1038,32 @@ mod tests {
         };
         assert_eq!(
             cost(&plain[..8]) - cost(&plain[..7]),
-            dir_entry_bytes(5, false, None)
+            dir_entry_bytes(5, None)
         );
-        for names in [
-            None,
-            Some(Vec::new()),
-            Some(vec![b"user.k".to_vec(), b"security.selinux".to_vec()]),
-        ] {
+        let cases = [
+            (None, 8),
+            (Some(Vec::new()), 8),
+            (
+                Some(vec![b"user.k".to_vec(), b"security.selinux".to_vec()]),
+                8,
+            ),
+            (None, 0),
+            (None, 12),
+            (Some(Vec::new()), HANDLE_MAX),
+        ];
+        for (names, handle_len) in cases {
+            let attr = |n: u64| Attr {
+                xattr_names: names.clone(),
+                identity: Identity {
+                    handle_type: 1,
+                    handle: vec![n as u8; handle_len],
+                },
+                ..sample_attr(n)
+            };
             let plus: Vec<DirEntryPlus> = (0..8)
                 .map(|n| DirEntryPlus {
                     entry: entry(n),
-                    attr: Some(Attr {
-                        xattr_names: names.clone(),
-                        ..sample_attr(n as u64)
-                    }),
+                    attr: Some(attr(n as u64)),
                 })
                 .collect();
             let cost = |entries: &[DirEntryPlus]| {
@@ -1032,8 +1076,8 @@ mod tests {
             };
             assert_eq!(
                 cost(&plus[..8]) - cost(&plus[..7]),
-                dir_entry_bytes(5, true, names.as_deref()),
-                "{names:?}"
+                dir_entry_bytes(5, Some(&attr(7))),
+                "{names:?} with a handle of {handle_len} bytes"
             );
         }
     }
@@ -1053,9 +1097,9 @@ mod tests {
         let cases: [(&str, Vec<u8>, &str); 6] = [
             ("readdir", frame_body(&readdir), "000000000a00000000000000020001000100000008000000000000000000000001000000270000000400000003000100030000000000000004000000000000000100000000000000010000000a0000006e00000000000000"),
             ("hello", frame_body(&hellos[1]), "000000000a0000000000000002000200080706050403020101000100000000000500000032000000040000000100010073656372657400000300000000000000010000008200000007070707070707070707070707070707"),
-            ("reply", frame_body(&replies[0]), "0000000006000000000000000200010001000000000000000100000000000000010000008200000001010101010101010101010101010101"),
+            ("reply", frame_body(&replies[0]), "000000000b000000000000000300020001000000000000000100000000000000020000000000000005000000820000000800000001000100010101010101010101010101010101010100000000000000010000004200000002000000efbeedfe"),
             ("request", frame_body(&Request::Rename { parent: path("a"), name: name("b"), newparent: path("c"), newname: name("d"), flags: 1 }), "000000001100000000000000060004000900000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000d0000000e000000110000000a000000110000000e000000150000000a000000010000000a00000061000000000000006200000000000000010000000a00000063000000000000006400000000000000"),
-            ("response", frame_body(&Response::Entry(sample_attr(9))), "0000000016000000000000000200010000000000010000000000000000000000000000000c00010009000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e80300000010000000000000000000000100000000000000010000001600000005000000320000000500000082000000757365722e6b000073656375726974792e73656c696e7578"),
+            ("response", frame_body(&Response::Entry(sample_attr(9))), "000000001a000000000000000200010000000000010000000000000000000000000000000c00020009000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e803000000100000000000000000000001000000000000000500000016000000140000000100010005000000320000000500000082000000757365722e6b000073656375726974792e73656c696e75780100000000000000010000004200000009000000efbeedfe"),
             ("event", frame_body(&event), "00000000110000000000000000000100010000004f0000000c0000000100020000000000000000001d00000006000000190000000a0000000100000000000000150000001600000000000000000000000200000000000000000000000000000000000000000000006600000000000000050000000a000000050000000a00000061000000000000006600000000000000"),
         ];
         for (what, actual, expected) in cases {

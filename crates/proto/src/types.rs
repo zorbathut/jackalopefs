@@ -165,7 +165,17 @@ pub struct TimeSpec {
     pub nsec: u32,
 }
 
-/// A `stat` result. `ino` is the server's real inode number; the client uses it directly as the FUSE nodeid.
+/// Longest file handle the kernel produces (`MAX_HANDLE_SZ`); a longer one on the wire is a decode error.
+pub const HANDLE_MAX: usize = 128;
+
+/// What tells one file from another when inode numbers cannot: the file's `name_to_handle_at(2)` handle, opaque and compared for equality only.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Identity {
+    pub handle_type: i32,
+    pub handle: Vec<u8>,
+}
+
+/// A `stat` result and what tells the file from any other. `ino` is the filesystem's own inode number, the export root's included.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Attr {
     pub ino: u64,
@@ -183,6 +193,9 @@ pub struct Attr {
     pub blksize: u32,
     /// The node's extended attribute names when the server looked: an empty list means it has none, which a client may answer `getxattr` and `listxattr` from; `None` means the client must ask.
     pub xattr_names: Option<Vec<Vec<u8>>>,
+    pub identity: Identity,
+    /// The file lies outside the export root's subvolume, where inode numbers repeat the root subvolume's.
+    pub foreign: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

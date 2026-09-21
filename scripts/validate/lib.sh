@@ -62,7 +62,7 @@ fs_start() {
     # The host runs whatever the working tree says; the container gets binaries built outside (JFS_BIN) and has no cargo.
     [ -n "${JFS_BIN:-}" ] || (cd "$REPO" && cargo build --workspace --quiet)
     [ -x "$BIN/jackalopefs-server" ] && [ -x "$BIN/jackalopefs-client" ] || fail "binaries missing in $BIN; run cargo build --workspace"
-    # The client uses the server's st_ino as the FUSE node id, so the export must sit on a filesystem with stable inode numbers, which overlayfs is not.
+    # The client tells files apart by their file handles, which must last as long as the files: FUSE's last as long as its daemon's mount, and overlayfs gives a file a new one when it is copied up.
     local fstype
     fstype=$(stat -f -c %T "$EXPORT")
     case "$fstype" in overlay*|fuse*) fail "export on $fstype; put the repository on a real filesystem" ;; esac

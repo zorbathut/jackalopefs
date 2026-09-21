@@ -177,6 +177,11 @@ impl Blackhole {
             session_id: 1,
             resume_token: [0; 16],
             resumed: false,
+            root_ino: 2,
+            root_identity: jackalopefs_proto::Identity {
+                handle_type: 1,
+                handle: vec![2, 0, 0, 0, 0, 0, 0, 0],
+            },
         }
     }
 
@@ -262,6 +267,18 @@ impl Blackhole {
             Auth::Anonymous,
             offline_timeout,
         )
+    }
+}
+
+/// For a test that opens by path and says which inode number it means, as the FUSE layer says which file: the node is the inode number, or the open is refused as stale.
+pub fn expect_ino(
+    attr: &jackalopefs_proto::Attr,
+    ino: u64,
+) -> Result<u64, jackalopefs_client::Error> {
+    if attr.ino == ino {
+        Ok(ino)
+    } else {
+        Err(jackalopefs_client::Error::Stale)
     }
 }
 

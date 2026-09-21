@@ -35,6 +35,9 @@ pub enum HelloReply {
         resume_token: [u8; 16],
         /// True when `Hello::resume` named a live session and its handles are still open.
         resumed: bool,
+        /// The export root's inode number and identity: on every connection, whether this is still the directory the client mounted.
+        root_ino: u64,
+        root_identity: Identity,
     },
     Reject {
         reason: String,

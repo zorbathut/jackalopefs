@@ -3,8 +3,8 @@
 use crate::jackalopefs_capnp as schema;
 use crate::msg::{Auth, Event, EventItem, Hello, HelloReply, Request, Response, Resume};
 use crate::types::{
-    Attr, DirEntry, DirEntryPlus, ErrorName, ErrorPathTooLong, FileKind, Name, Path, SetAttr,
-    Statfs, TimeOrNow, TimeSpec, Whence, PATH_MAX,
+    Attr, DirEntry, DirEntryPlus, ErrorName, ErrorPathTooLong, FileKind, Identity, Name, Path,
+    SetAttr, Statfs, TimeOrNow, TimeSpec, Whence, HANDLE_MAX, PATH_MAX,
 };
 use capnp::message::{self, HeapAllocator, ReaderSegments};
 
@@ -73,17 +73,27 @@ fn checked_len(declared: u32, message_words: usize) -> Result<usize, ErrorDecode
     Ok(declared as usize)
 }
 
-/// Wire size of one directory entry in a `readdir`/`readdirPlus` reply: four words of `DirEntry` plus the name rounded up to a word; with an `Attr`, sixteen more words (three for `DirEntryPlus`, thirteen for the `Attr`) and, when it carries xattr names, a pointer word per name plus each name rounded up to a word. The server budgets listings with this. Changing it is a protocol change: edit the schema so the revision moves.
-pub fn dir_entry_bytes(name_len: usize, plus: bool, xattr_names: Option<&[Vec<u8>]>) -> usize {
-    let names = xattr_names.map_or(0, |names| {
-        names.iter().map(|n| 8 + n.len().next_multiple_of(8)).sum()
+/// Wire size of one directory entry in a `readdir`/`readdirPlus` reply: four words of `DirEntry` plus the name rounded up to a word; with an `Attr`, the fixed part of `DirEntryPlus`, `Attr` and `Identity` ([`ENTRY_PLUS_BYTES`]), the file handle rounded up to a word and, when the `Attr` carries xattr names, a pointer word per name plus each name rounded up to a word. The server budgets listings with this. Changing it is a protocol change: edit the schema so the revision moves.
+pub fn dir_entry_bytes(name_len: usize, plus: Option<&Attr>) -> usize {
+    let attr = plus.map_or(0, |attr| {
+        let names: usize = attr.xattr_names.as_ref().map_or(0, |names| {
+            names.iter().map(|n| 8 + n.len().next_multiple_of(8)).sum()
+        });
+        ENTRY_PLUS_BYTES + attr.identity.handle.len().next_multiple_of(8) + names
     });
-    32 + name_len.next_multiple_of(8) + if plus { 128 + names } else { 0 }
+    32 + name_len.next_multiple_of(8) + attr
 }
 
-/// Words the names an `Attr` carries add to it: a pointer word per name and the name rounded up to a word.
-fn words_for_xattr_names(names: Option<&[Vec<u8>]>) -> u32 {
-    names.map_or(0, |names| names.iter().map(|n| words_for(n.len())).sum())
+/// What an entry's attributes add to it before anything of variable length: three words of `DirEntryPlus`, fourteen of `Attr`, two of `Identity`.
+const ENTRY_PLUS_BYTES: usize = 152;
+
+/// Words an `Attr`'s variable parts add to it: its file handle rounded up to a word, and for the names it carries a pointer word per name and the name rounded up to a word.
+fn words_for_attr(attr: &Attr) -> u32 {
+    let names: u32 = attr
+        .xattr_names
+        .as_ref()
+        .map_or(0, |names| names.iter().map(|n| words_for(n.len())).sum());
+    attr.identity.handle.len().div_ceil(8) as u32 + names
 }
 
 // ---------- value helpers ----------
@@ -174,14 +184,38 @@ fn build_attr(mut b: schema::attr::Builder<'_>, attr: &Attr) {
     b.set_rdev(attr.rdev);
     b.set_blksize(attr.blksize);
     match &attr.xattr_names {
-        None => b.init_xattr_names().set_unknown(()),
+        None => b.reborrow().init_xattr_names().set_unknown(()),
         Some(names) => {
-            let mut list = b.init_xattr_names().init_some(names.len() as u32);
+            let mut list = b
+                .reborrow()
+                .init_xattr_names()
+                .init_some(names.len() as u32);
             for (i, name) in names.iter().enumerate() {
                 list.set(i as u32, name);
             }
         }
     }
+    build_identity(b.reborrow().init_identity(), &attr.identity);
+    b.set_foreign(attr.foreign);
+}
+
+fn build_identity(mut b: schema::identity::Builder<'_>, identity: &Identity) {
+    b.set_handle_type(identity.handle_type);
+    b.set_handle(&identity.handle);
+}
+
+fn parse_identity(r: schema::identity::Reader<'_>) -> Result<Identity, ErrorDecode> {
+    let handle = r.get_handle()?;
+    if handle.len() > HANDLE_MAX {
+        return Err(ErrorDecode::Invalid(format!(
+            "file handle of {} bytes",
+            handle.len()
+        )));
+    }
+    Ok(Identity {
+        handle_type: r.get_handle_type(),
+        handle: handle.to_vec(),
+    })
 }
 
 fn parse_attr(r: schema::attr::Reader<'_>) -> Result<Attr, ErrorDecode> {
@@ -222,6 +256,8 @@ fn parse_attr(r: schema::attr::Reader<'_>) -> Result<Attr, ErrorDecode> {
                 Some(names)
             }
         },
+        identity: parse_identity(r.get_identity()?)?,
+        foreign: r.get_foreign(),
     })
 }
 
@@ -412,11 +448,15 @@ impl Message for HelloReply {
                 session_id,
                 resume_token,
                 resumed,
+                root_ino,
+                root_identity,
             } => {
                 let mut ack = b.init_ack();
                 ack.set_session_id(*session_id);
                 ack.set_resume_token(resume_token);
                 ack.set_resumed(*resumed);
+                ack.set_root_ino(*root_ino);
+                build_identity(ack.init_root_identity(), root_identity);
             }
             HelloReply::Reject { reason } => b.init_reject().set_reason(reason.as_str()),
             HelloReply::RevisionMismatch { revision } => {
@@ -432,6 +472,8 @@ impl Message for HelloReply {
                 session_id: ack.get_session_id(),
                 resume_token: resume_token(ack.get_resume_token()?)?,
                 resumed: ack.get_resumed(),
+                root_ino: ack.get_root_ino(),
+                root_identity: parse_identity(ack.get_root_identity()?)?,
             },
             schema::hello_reply::Which::Reject(reject) => {
                 let reason = reject
@@ -451,7 +493,7 @@ impl Message for HelloReply {
     fn size_hint(&self) -> u32 {
         BASE_WORDS
             + match self {
-                HelloReply::Ack { .. } => 4,
+                HelloReply::Ack { root_identity, .. } => 8 + words_for(root_identity.handle.len()),
                 HelloReply::Reject { reason } => words_for_text(reason.len()),
                 HelloReply::RevisionMismatch { .. } => 1,
             }
@@ -940,9 +982,9 @@ impl Message for Request {
 
 /// Words per directory entry in a composite list, excluding the name data; a `DirEntryPlus` adds its own three words and a thirteen-word `Attr`, whose names are added per name.
 const DIR_ENTRY_WORDS: u32 = 4;
-const DIR_ENTRY_PLUS_WORDS: u32 = 20;
+const DIR_ENTRY_PLUS_WORDS: u32 = 24;
 /// An `Attr` in a reply, with the reply's own words; a word or two over, on purpose, since an under-estimate costs a canonicalizing copy.
-const ATTR_WORDS: u32 = 18;
+const ATTR_WORDS: u32 = 22;
 
 /// Words per `EventItem` in a composite list, excluding path and name data.
 const EVENT_ITEM_WORDS: u32 = 3;
@@ -1048,7 +1090,7 @@ impl Message for Response {
             | Response::Copied(_)
             | Response::Seeked(_) => 0,
             Response::Entry(attr) | Response::Attr(attr) | Response::Opened { attr } => {
-                ATTR_WORDS + words_for_xattr_names(attr.xattr_names.as_deref())
+                ATTR_WORDS + words_for_attr(attr)
             }
             Response::Readlink(b) | Response::Read(b) | Response::Xattr(b) => words_for(b.len()),
             Response::Readdir { entries, .. } => entries
@@ -1060,9 +1102,7 @@ impl Message for Response {
                 .map(|e| {
                     DIR_ENTRY_PLUS_WORDS
                         + e.entry.name.len().div_ceil(8) as u32
-                        + words_for_xattr_names(
-                            e.attr.as_ref().and_then(|a| a.xattr_names.as_deref()),
-                        )
+                        + e.attr.as_ref().map_or(0, words_for_attr)
                 })
                 .sum(),
             Response::Statfs(_) => 8,

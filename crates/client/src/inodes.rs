@@ -1,12 +1,74 @@
-//! The client's inode table. A nodeid *is* the server's inode number (fuser reports `attr.ino` as the nodeid, and userspace sees it as `st_ino`), so hardlinks share a node and `st_ino` is stable. What the table adds is how to *address* each node on the wire: the `(parent, name)` aliases it has been reached through, the kernel's lookup count, and a generation that changes when the server recycles an inode number for a different file.
+//! The client's inode table. A node is one file on the server, known by its inode number and its identity together ([`KeyNode`]): inode numbers alone are recycled, and repeat between a snapshot and its origin. Each node has one number, which the kernel knows it by and userspace sees as `st_ino` (fuser reports `attr.ino` as both): the file's real inode number wherever that tells it apart, a substitute derived from its identity where it cannot (see [`NodeTable::id_for`]). Hardlinks share a node. What else the table keeps is how to *address* each node on the wire, the `(parent, name)` aliases it has been reached through, and the kernel's lookup count.
 //!
 //! Lock discipline: the owner wraps the table in a `parking_lot::Mutex`, takes it briefly to compute a path or apply a result, and never holds it across an `.await` or a notifier call.
 
-use jackalopefs_proto::{FileKind, Name, Path};
+use jackalopefs_proto::{Attr, FileKind, Identity, Name, Path};
 use std::collections::HashMap;
 
-/// The FUSE root nodeid; the server maps the export root's inode number to it.
+/// The FUSE root nodeid. A server knows the export root by its own inode number; the client rewrites that to this as replies come in.
 pub const ROOT: u64 = 1;
+
+/// What a node is: one file on the server.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct KeyNode {
+    pub ino: u64,
+    pub identity: Identity,
+}
+
+/// A file as a reply describes it, as far as the table cares.
+#[derive(Clone, Copy, Debug)]
+pub struct Seen<'a> {
+    pub ino: u64,
+    pub identity: &'a Identity,
+    /// Outside the export root's subvolume, where inode numbers repeat the root subvolume's.
+    pub foreign: bool,
+    pub kind: FileKind,
+}
+
+impl<'a> From<&'a Attr> for Seen<'a> {
+    fn from(attr: &'a Attr) -> Seen<'a> {
+        Seen {
+            ino: attr.ino,
+            identity: &attr.identity,
+            foreign: attr.foreign,
+            kind: attr.kind,
+        }
+    }
+}
+
+impl KeyNode {
+    pub fn of(attr: &Attr) -> KeyNode {
+        Seen::from(attr).key()
+    }
+
+    /// Whether `attr` describes this file.
+    pub fn describes(&self, attr: &Attr) -> bool {
+        self.ino == attr.ino && self.identity == attr.identity
+    }
+}
+
+impl Seen<'_> {
+    fn key(&self) -> KeyNode {
+        KeyNode {
+            ino: self.ino,
+            identity: self.identity.clone(),
+        }
+    }
+}
+
+/// Where the substitutes for a file start: a 64-bit FNV-1a of its handle, moved off the two numbers the kernel reserves (0 for "no entry", 1 for the root). Fixed, so that every mount gives a file outside the root's subvolume the same number.
+fn substitute(identity: &Identity) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in identity
+        .handle_type
+        .to_le_bytes()
+        .iter()
+        .chain(&identity.handle)
+    {
+        hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash.max(2)
+}
 
 /// Guard against an alias chain that never reaches the root; a real tree can't be deeper than `PATH_MAX` single-byte components.
 const MAX_DEPTH: usize = jackalopefs_proto::PATH_MAX / 2;
@@ -16,9 +78,9 @@ pub struct Node {
     /// Every `(parent, name)` this node has been looked up through, oldest first; the newest one is used to address it.
     pub aliases: Vec<(u64, Name)>,
     pub lookup_count: u64,
-    /// Bumped when a lookup returns this inode number for a file we know to be a different one.
-    pub generation: u64,
-    /// The last alias went away through this client (unlink, rmdir, rename-over), so the server may reuse the inode number.
+    /// `None` for the root until a reply has described it.
+    pub key: Option<KeyNode>,
+    /// The last alias this client knew went away (unlink, rmdir, rename-over, or the name found to lead elsewhere), so there is no path to address the node by. The file may well live on under a name this client never saw.
     pub unlinked: bool,
     pub kind: FileKind,
     pub children: HashMap<Name, u64>,
@@ -26,6 +88,7 @@ pub struct Node {
 
 pub struct NodeTable {
     nodes: HashMap<u64, Node>,
+    by_key: HashMap<KeyNode, u64>,
 }
 
 impl Default for NodeTable {
@@ -42,68 +105,85 @@ impl NodeTable {
             Node {
                 aliases: Vec::new(),
                 lookup_count: 1,
-                generation: 0,
+                key: None,
                 unlinked: false,
                 kind: FileKind::Directory,
                 children: HashMap::new(),
             },
         );
-        NodeTable { nodes }
+        NodeTable {
+            nodes,
+            by_key: HashMap::new(),
+        }
+    }
+
+    /// The node a file is, or would be if it were registered now; nothing is registered. A file already known keeps its node. A new one goes by its real inode number if it is in the root's subvolume and no other file's node has that number; otherwise by a substitute from its identity, the next free number from there if that one is taken too. Only a file whose inode number is held by another's node depends on what was seen first: it shows its substitute until both are forgotten. (`docs/design.md`, "Node table".)
+    pub fn id_for(&self, seen: Seen<'_>) -> u64 {
+        if seen.ino == ROOT
+            && self.nodes[&ROOT]
+                .key
+                .as_ref()
+                .is_none_or(|k| k.identity == *seen.identity)
+        {
+            return ROOT;
+        }
+        if let Some(id) = self.by_key.get(&seen.key()) {
+            return *id;
+        }
+        if !seen.foreign && seen.ino > ROOT && !self.nodes.contains_key(&seen.ino) {
+            return seen.ino;
+        }
+        let mut id = substitute(seen.identity);
+        while self.nodes.contains_key(&id) {
+            id = id.wrapping_add(1).max(2);
+        }
+        id
     }
 
     pub fn get(&self, ino: u64) -> Option<&Node> {
         self.nodes.get(&ino)
     }
 
-    /// Record that the kernel was told `parent/name` is `ino` (a lookup, create, mkdir, link, or accepted readdirplus entry) and will count one lookup for it. Returns the generation to reply with, or `None` if `ino` is the root, which can never be a child.
-    pub fn insert_lookup(
-        &mut self,
-        parent: u64,
-        name: Name,
-        ino: u64,
-        kind: FileKind,
-    ) -> Option<u64> {
-        if ino == ROOT {
+    /// Record that the kernel was told `parent/name` is this file (a lookup, create, mkdir, link, or accepted readdirplus entry) and will count one lookup for it. Returns the node, [`Self::id_for`]'s answer, or `None` if that is the root, which can never be a child.
+    pub fn insert_lookup(&mut self, parent: u64, name: Name, seen: Seen<'_>) -> Option<u64> {
+        let id = self.id_for(seen);
+        if id == ROOT {
             return None;
         }
         if let Some(previous) = self
             .nodes
             .get_mut(&parent)
-            .and_then(|p| p.children.insert(name.clone(), ino))
+            .and_then(|p| p.children.insert(name.clone(), id))
         {
-            if previous != ino {
+            if previous != id {
                 self.drop_alias(previous, parent, &name);
             }
         }
-        let node = self.nodes.entry(ino).or_insert_with(|| Node {
+        let node = self.nodes.entry(id).or_insert_with(|| Node {
             aliases: Vec::new(),
             lookup_count: 0,
-            generation: 0,
+            key: Some(seen.key()),
             unlinked: false,
-            kind,
+            kind: seen.kind,
             children: HashMap::new(),
         });
-        if node.unlinked {
-            node.generation += 1;
-            node.unlinked = false;
-            node.aliases.clear();
-            node.children.clear();
-        }
-        node.kind = kind;
+        self.by_key.insert(seen.key(), id);
+        node.unlinked = false;
+        node.kind = seen.kind;
         node.lookup_count += 1;
         let alias = (parent, name);
         node.aliases.retain(|a| *a != alias);
         node.aliases.push(alias);
-        Some(node.generation)
+        Some(id)
     }
 
-    /// The generation [`Self::insert_lookup`] would return for `ino` right now, without registering anything; readdirplus needs it before it knows whether the kernel accepted the entry.
-    pub fn generation_for_lookup(&self, ino: u64) -> u64 {
-        match self.nodes.get(&ino) {
-            Some(node) if node.unlinked => node.generation + 1,
-            Some(node) => node.generation,
-            None => 0,
-        }
+    /// The root as a reply described it.
+    pub fn root_seen(&mut self, identity: &Identity) {
+        let root = self.nodes.get_mut(&ROOT).expect("the root is always there");
+        root.key = Some(KeyNode {
+            ino: ROOT,
+            identity: identity.clone(),
+        });
     }
 
     /// The kernel dropped `n` lookups; at zero the node is forgotten, and the caller is told so.
@@ -119,6 +199,9 @@ impl NodeTable {
             return false;
         }
         let node = self.nodes.remove(&ino).expect("present");
+        if let Some(key) = &node.key {
+            self.by_key.remove(key);
+        }
         for (parent, name) in node.aliases {
             if let Some(p) = self.nodes.get_mut(&parent) {
                 if p.children.get(&name) == Some(&ino) {
@@ -265,6 +348,28 @@ mod tests {
         Name::new(s.as_bytes()).unwrap()
     }
 
+    /// The file with inode number `ino` in its `generation`th life, as ext4 would put it in a handle.
+    fn identity(ino: u64, generation: u32) -> Identity {
+        Identity {
+            handle_type: 1,
+            handle: [(ino as u32).to_le_bytes(), generation.to_le_bytes()].concat(),
+        }
+    }
+
+    fn seen(ino: u64, identity: &Identity, kind: FileKind) -> Seen<'_> {
+        Seen {
+            ino,
+            identity,
+            foreign: false,
+            kind,
+        }
+    }
+
+    /// A lookup of the first file ever to have inode number `ino`.
+    fn look(t: &mut NodeTable, parent: u64, name: Name, ino: u64, kind: FileKind) -> Option<u64> {
+        t.insert_lookup(parent, name, seen(ino, &identity(ino, 0), kind))
+    }
+
     fn p(s: &str) -> Path {
         if s.is_empty() {
             return Path::root();
@@ -276,15 +381,15 @@ mod tests {
     fn lookup_path_and_forget() {
         let mut t = NodeTable::new();
         assert_eq!(
-            t.insert_lookup(ROOT, n("a"), 10, FileKind::Directory),
-            Some(0)
+            look(&mut t, ROOT, n("a"), 10, FileKind::Directory),
+            Some(10)
         );
-        assert_eq!(t.insert_lookup(10, n("b"), 11, FileKind::Regular), Some(0));
+        assert_eq!(look(&mut t, 10, n("b"), 11, FileKind::Regular), Some(11));
         assert_eq!(t.path_of(11), Some(p("a/b")));
         assert_eq!(t.path_of(ROOT), Some(Path::root()));
         assert_eq!(t.resolve_path(&p("a/b")), Some(11));
         assert_eq!(t.resolve_path(&p("a/zz")), None);
-        assert_eq!(t.insert_lookup(10, n("b"), 11, FileKind::Regular), Some(0));
+        assert_eq!(look(&mut t, 10, n("b"), 11, FileKind::Regular), Some(11));
         assert_eq!(t.get(11).unwrap().lookup_count, 2);
         t.forget(11, 1);
         assert!(t.get(11).is_some());
@@ -296,7 +401,7 @@ mod tests {
             "forgotten nodes leave no dangling child entry"
         );
         assert_eq!(
-            t.insert_lookup(ROOT, n("x"), ROOT, FileKind::Directory),
+            look(&mut t, ROOT, n("x"), ROOT, FileKind::Directory),
             None,
             "the root cannot be a child"
         );
@@ -307,8 +412,8 @@ mod tests {
     #[test]
     fn hardlinks_share_a_node() {
         let mut t = NodeTable::new();
-        t.insert_lookup(ROOT, n("x"), 10, FileKind::Regular);
-        t.insert_lookup(ROOT, n("y"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("x"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("y"), 10, FileKind::Regular);
         assert_eq!(t.entries(100).len(), 2);
         assert_eq!(t.get(10).unwrap().aliases.len(), 2);
         assert_eq!(t.path_of(10), Some(p("y")));
@@ -320,14 +425,122 @@ mod tests {
         assert!(t.get(10).unwrap().unlinked);
     }
 
+    #[test]
+    fn unlink_then_create_same_name() {
+        let mut t = NodeTable::new();
+        look(&mut t, ROOT, n("f"), 10, FileKind::Regular);
+        t.unlink(ROOT, &n("f"));
+        assert_eq!(t.child(ROOT, &n("f")), None);
+        assert!(t.get(10).unwrap().unlinked);
+        assert_eq!(look(&mut t, ROOT, n("f"), 11, FileKind::Regular), Some(11));
+        assert_eq!(t.child(ROOT, &n("f")), Some(11));
+    }
+
+    /// One file, two names, only one of them known: unlinking that one leaves the node without a path, and finding the other gives the same node back, which is what keeps a descriptor opened through the first name working.
+    #[test]
+    fn a_file_found_again_by_another_name_is_the_same_node() {
+        let mut t = NodeTable::new();
+        look(&mut t, ROOT, n("a"), 10, FileKind::Regular);
+        t.unlink(ROOT, &n("a"));
+        assert_eq!(t.path_of(10), None);
+        assert_eq!(look(&mut t, ROOT, n("b"), 10, FileKind::Regular), Some(10));
+        assert!(!t.get(10).unwrap().unlinked, "it has a name again");
+        assert_eq!(t.path_of(10), Some(p("b")));
+        assert_eq!(t.get(10).unwrap().lookup_count, 2);
+    }
+
+    /// An inode number that comes back with another identity is another file. While the kernel still remembers the first, the second goes by a substitute; once both are forgotten the number is free again.
+    #[test]
+    fn a_recycled_inode_number_is_another_node() {
+        let mut t = NodeTable::new();
+        let (first, second) = (identity(10, 0), identity(10, 1));
+        look(&mut t, ROOT, n("f"), 10, FileKind::Regular);
+        t.unlink(ROOT, &n("f"));
+        let probed = t.id_for(seen(10, &second, FileKind::Regular));
+        let other = t
+            .insert_lookup(ROOT, n("g"), seen(10, &second, FileKind::Regular))
+            .unwrap();
+        assert_eq!(other, probed, "asking first changes nothing");
+        assert_ne!(other, 10);
+        assert!(other > ROOT);
+        assert_eq!(
+            t.get(10).unwrap().key.as_ref().unwrap().identity,
+            first,
+            "the first node is untouched"
+        );
+        assert!(t.get(10).unwrap().unlinked);
+        assert_eq!(t.path_of(other), Some(p("g")));
+        assert_eq!(
+            t.insert_lookup(ROOT, n("g"), seen(10, &second, FileKind::Regular)),
+            Some(other),
+            "and it keeps its number while it lives"
+        );
+        assert!(t.forget(10, 1));
+        assert!(t.forget(other, 2));
+        assert_eq!(
+            t.insert_lookup(ROOT, n("g"), seen(10, &second, FileKind::Regular)),
+            Some(10),
+            "with both forgotten the file goes by its real number"
+        );
+    }
+
+    /// A file outside the root's subvolume shares its inode number with whatever has that number inside it, so it never goes by the number, whatever the table holds: its number must not depend on what was looked up first.
+    #[test]
+    fn a_file_outside_the_roots_subvolume_always_goes_by_a_substitute() {
+        let snapshot = identity(10, 7);
+        let foreign = Seen {
+            foreign: true,
+            ..seen(10, &snapshot, FileKind::Regular)
+        };
+        let mut alone = NodeTable::new();
+        let id = alone.insert_lookup(ROOT, n("snap"), foreign).unwrap();
+        assert_ne!(id, 10);
+        let mut after_origin = NodeTable::new();
+        look(&mut after_origin, ROOT, n("origin"), 10, FileKind::Regular);
+        assert_eq!(
+            after_origin.insert_lookup(ROOT, n("snap"), foreign),
+            Some(id)
+        );
+        assert_eq!(after_origin.path_of(10), Some(p("origin")));
+    }
+
+    /// A substitute can sit on a number that is some other file's real inode number; that file then needs a substitute of its own, and nothing is ever shared.
+    #[test]
+    fn a_number_taken_by_a_substitute_is_taken() {
+        let mut t = NodeTable::new();
+        let snapshot = identity(10, 7);
+        let foreign = Seen {
+            foreign: true,
+            ..seen(10, &snapshot, FileKind::Regular)
+        };
+        let squatter = t.insert_lookup(ROOT, n("snap"), foreign).unwrap();
+        let genuine = look(&mut t, ROOT, n("real"), squatter, FileKind::Regular).unwrap();
+        assert_ne!(genuine, squatter);
+        assert_eq!(t.path_of(squatter), Some(p("snap")));
+        assert_eq!(t.path_of(genuine), Some(p("real")));
+    }
+
+    /// FNV-1a, 64 bits, over the handle type (four bytes, little-endian) and the handle, computed outside this program.
+    const GOLDEN_SUBSTITUTE: u64 = 0x750a_976a_808e_6259;
+
+    #[test]
+    fn substitutes_avoid_the_numbers_the_kernel_reserves() {
+        for ino in 0..2000u64 {
+            assert!(substitute(&identity(ino, 3)) >= 2);
+        }
+        assert_ne!(substitute(&identity(10, 7)), substitute(&identity(10, 8)));
+        // Pinned: a change here renumbers every file outside the root's subvolume for whoever recorded its `st_ino`.
+        assert_eq!(substitute(&identity(10, 7)), GOLDEN_SUBSTITUTE);
+    }
+
     /// The kernel forgets a directory nothing holds; a file held through a name elsewhere is still to be found by that name.
     #[test]
     fn a_name_in_a_forgotten_directory_is_passed_over() {
         let mut t = NodeTable::new();
-        t.insert_lookup(ROOT, n("d"), 5, FileKind::Directory);
-        t.insert_lookup(ROOT, n("e"), 6, FileKind::Directory);
-        t.insert_lookup(5, n("a"), 10, FileKind::Regular);
-        t.insert_lookup(6, n("b"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("d"), 5, FileKind::Directory);
+        look(&mut t, ROOT, n("e"), 6, FileKind::Directory);
+        look(&mut t, 5, n("a"), 10, FileKind::Regular);
+        look(&mut t, 6, n("b"), 10, FileKind::Regular);
         assert_eq!(t.path_of(10), Some(p("e/b")));
         assert!(t.forget(6, 1));
         assert_eq!(t.path_of(10), Some(p("d/a")));
@@ -335,39 +548,28 @@ mod tests {
         assert_eq!(t.path_of(10), None);
     }
 
+    /// The root is node 1 whatever inode number it has on the server, and a file that really is numbered 1 is not the root.
     #[test]
-    fn unlink_then_create_same_name_and_inode_reuse() {
+    fn the_root_is_node_one_and_inode_one_is_just_a_file() {
         let mut t = NodeTable::new();
-        t.insert_lookup(ROOT, n("f"), 10, FileKind::Regular);
-        t.unlink(ROOT, &n("f"));
-        assert_eq!(t.child(ROOT, &n("f")), None);
+        let root = identity(4096, 0);
+        t.root_seen(&root);
+        assert_eq!(t.id_for(seen(ROOT, &root, FileKind::Directory)), ROOT);
+        let one = look(&mut t, ROOT, n("one"), 1, FileKind::Regular).unwrap();
+        assert!(one > ROOT);
+        assert_eq!(t.path_of(one), Some(p("one")));
         assert_eq!(
-            t.insert_lookup(ROOT, n("f"), 11, FileKind::Regular),
-            Some(0)
-        );
-        assert_eq!(t.child(ROOT, &n("f")), Some(11));
-        assert_eq!(t.generation_for_lookup(10), 1);
-        assert_eq!(
-            t.insert_lookup(ROOT, n("g"), 10, FileKind::Regular),
-            Some(1),
-            "a recycled inode number gets a new generation"
-        );
-        assert_eq!(t.generation_for_lookup(10), 1);
-        assert_eq!(t.generation_for_lookup(999), 0);
-        assert_eq!(t.path_of(10), Some(p("g")));
-        assert_eq!(
-            t.insert_lookup(ROOT, n("g"), 10, FileKind::Regular),
-            Some(1),
-            "and keeps it while it lives"
+            t.insert_lookup(ROOT, n("self"), seen(ROOT, &root, FileKind::Directory)),
+            None
         );
     }
 
     #[test]
     fn rename_moves_alias_and_rename_over_orphans_target() {
         let mut t = NodeTable::new();
-        t.insert_lookup(ROOT, n("a"), 10, FileKind::Regular);
-        t.insert_lookup(ROOT, n("b"), 11, FileKind::Regular);
-        t.insert_lookup(ROOT, n("d"), 20, FileKind::Directory);
+        look(&mut t, ROOT, n("a"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("b"), 11, FileKind::Regular);
+        look(&mut t, ROOT, n("d"), 20, FileKind::Directory);
         t.rename(ROOT, &n("a"), 20, n("a2"));
         assert_eq!(t.path_of(10), Some(p("d/a2")));
         assert_eq!(t.child(ROOT, &n("a")), None);
@@ -381,8 +583,8 @@ mod tests {
     #[test]
     fn renaming_a_link_onto_its_twin_changes_nothing() {
         let mut t = NodeTable::new();
-        t.insert_lookup(ROOT, n("a"), 10, FileKind::Regular);
-        t.insert_lookup(ROOT, n("b"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("a"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("b"), 10, FileKind::Regular);
         t.rename(ROOT, &n("a"), ROOT, n("b"));
         assert_eq!(t.child(ROOT, &n("a")), Some(10));
         assert_eq!(t.child(ROOT, &n("b")), Some(10));
@@ -395,8 +597,8 @@ mod tests {
     #[test]
     fn directory_rename_carries_children() {
         let mut t = NodeTable::new();
-        t.insert_lookup(ROOT, n("d"), 20, FileKind::Directory);
-        t.insert_lookup(20, n("f"), 30, FileKind::Regular);
+        look(&mut t, ROOT, n("d"), 20, FileKind::Directory);
+        look(&mut t, 20, n("f"), 30, FileKind::Regular);
         t.rename(ROOT, &n("d"), ROOT, n("e"));
         assert_eq!(t.path_of(30), Some(p("e/f")));
         assert_eq!(t.resolve_path(&p("e/f")), Some(30));
@@ -405,8 +607,8 @@ mod tests {
     #[test]
     fn exchange_swaps_entries() {
         let mut t = NodeTable::new();
-        t.insert_lookup(ROOT, n("a"), 10, FileKind::Regular);
-        t.insert_lookup(ROOT, n("b"), 11, FileKind::Regular);
+        look(&mut t, ROOT, n("a"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("b"), 11, FileKind::Regular);
         t.exchange(ROOT, &n("a"), ROOT, &n("b"));
         assert_eq!(t.path_of(10), Some(p("b")));
         assert_eq!(t.path_of(11), Some(p("a")));
@@ -416,17 +618,17 @@ mod tests {
     #[test]
     fn server_side_rename_discovered_through_lookup() {
         let mut t = NodeTable::new();
-        t.insert_lookup(ROOT, n("a"), 10, FileKind::Regular);
-        t.insert_lookup(ROOT, n("b"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("a"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("b"), 10, FileKind::Regular);
         assert_eq!(t.path_of(10), Some(p("b")));
         assert_eq!(
-            t.insert_lookup(ROOT, n("a"), 12, FileKind::Regular),
-            Some(0),
+            look(&mut t, ROOT, n("a"), 12, FileKind::Regular),
+            Some(12),
             "the old name now belongs to another inode"
         );
         assert_eq!(t.get(10).unwrap().aliases, vec![(ROOT, n("b"))]);
         assert!(!t.get(10).unwrap().unlinked);
-        t.insert_lookup(ROOT, n("b"), 13, FileKind::Regular);
+        look(&mut t, ROOT, n("b"), 13, FileKind::Regular);
         assert!(
             t.get(10).unwrap().unlinked,
             "replaced under every known name"
@@ -438,7 +640,13 @@ mod tests {
     fn bounded_entry_snapshot() {
         let mut t = NodeTable::new();
         for i in 0..50u64 {
-            t.insert_lookup(ROOT, n(&format!("f{i}")), 100 + i, FileKind::Regular);
+            look(
+                &mut t,
+                ROOT,
+                n(&format!("f{i}")),
+                100 + i,
+                FileKind::Regular,
+            );
         }
         assert_eq!(t.entries(10).len(), 10);
         assert_eq!(t.entries(1000).len(), 50);

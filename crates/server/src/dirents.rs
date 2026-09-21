@@ -4,7 +4,7 @@ use crate::export::{kind_from_mode, Export};
 use jackalopefs_proto::{DirEntry, DirEntryPlus, FileKind, Name};
 use nix::errno::Errno;
 use nix::fcntl::AtFlags;
-use nix::sys::stat::{fstat, fstatat};
+use nix::sys::stat::fstatat;
 use nix::unistd::{lseek, Whence};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
@@ -123,7 +123,6 @@ pub fn read_dir(
     plus: bool,
 ) -> Result<Listing, Errno> {
     lseek(dir, offset as i64, Whence::SeekSet)?;
-    let self_ino = export.map_ino(fstat(dir)?.st_ino)?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut plain = Vec::new();
     let mut with_attr = Vec::new();
@@ -170,27 +169,10 @@ pub fn read_dir(
                     }
                 },
             };
-            let ino = if name == b"." {
-                self_ino
-            } else if name == b".." {
-                // The root's parent lies outside the export; a subdirectory's parent maps like any node, and the client overrides both anyway.
-                if self_ino == crate::export::ROOT_NODEID {
-                    self_ino
-                } else {
-                    export.map_ino(raw.ino).unwrap_or(self_ino)
-                }
-            } else {
-                match export.map_ino(raw.ino) {
-                    Ok(ino) => ino,
-                    Err(_) => continue,
-                }
-            };
+            // The dots included, whose numbers the client replaces with those of its own nodes for the two directories.
+            let ino = raw.ino;
             // `max_bytes` is clamped to `MAX_IO`, half of `MAX_FRAME`, so a budget that overshoots by one entry still fits a frame.
-            used += jackalopefs_proto::dir_entry_bytes(
-                name.len(),
-                plus,
-                attr.as_ref().and_then(|a| a.xattr_names.as_deref()),
-            );
+            used += jackalopefs_proto::dir_entry_bytes(name.len(), attr.as_ref());
             let entry = DirEntry {
                 ino,
                 next_offset: raw.off,
@@ -314,7 +296,7 @@ mod tests {
         let mut used = 0;
         while used < MAX_IO {
             plain.push(entry());
-            used += jackalopefs_proto::dir_entry_bytes(1, false, None);
+            used += jackalopefs_proto::dir_entry_bytes(1, None);
         }
         let frame = encode(&Response::Readdir {
             entries: plain,
@@ -340,6 +322,12 @@ mod tests {
             blksize: 4096,
             // The most names the server sends for one node, in the shape that costs the most words: many one-byte names, each with its own pointer word.
             xattr_names: Some(vec![vec![b'x']; 512]),
+            // And the longest handle the kernel makes.
+            identity: jackalopefs_proto::Identity {
+                handle_type: 1,
+                handle: vec![0; jackalopefs_proto::HANDLE_MAX],
+            },
+            foreign: false,
         };
         let mut plus = Vec::new();
         let mut used = 0;
@@ -348,7 +336,7 @@ mod tests {
                 entry: entry(),
                 attr: Some(attr.clone()),
             });
-            used += jackalopefs_proto::dir_entry_bytes(1, true, attr.xattr_names.as_deref());
+            used += jackalopefs_proto::dir_entry_bytes(1, Some(&attr));
         }
         let frame = encode(&Response::ReaddirPlus {
             entries: plus,
