@@ -1178,6 +1178,133 @@ async fn seeking_data_and_holes_asks_the_server_unless_this_client_is_writing() 
     m.finish().await;
 }
 
+/// `syncfs(2)` on `dir`, as the errno. It reports a writeback error recorded on the mount since `dir` was opened, once.
+fn syncfs(dir: &fs::File) -> Result<(), i32> {
+    use std::os::fd::AsRawFd;
+    match unsafe { libc::syncfs(dir.as_raw_fd()) } {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error().raw_os_error().unwrap()),
+    }
+}
+
+/// The kernel keeps a written file's times itself and flushes them, with a setattr that names no handle, from inside the `unlink(2)` or `rename(2)` that takes the file's name away. A failure there is recorded against the whole mount and reported by the next `syncfs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_a_written_file_leaves_no_error_for_syncfs() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    perf.report();
+    blocking(move || {
+        let dir = fs::File::open(&mnt).unwrap();
+        fs::write(mnt.join("unlinked"), b"x").unwrap();
+        fs::remove_file(mnt.join("unlinked")).unwrap();
+        assert_eq!(syncfs(&dir), Ok(()), "after an unlink");
+
+        let dir = fs::File::open(&mnt).unwrap();
+        fs::write(mnt.join("replaced"), b"x").unwrap();
+        fs::write(mnt.join("replacement"), b"y").unwrap();
+        fs::rename(mnt.join("replacement"), mnt.join("replaced")).unwrap();
+        assert_eq!(syncfs(&dir), Ok(()), "after a rename over a file");
+    })
+    .await;
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
+    })
+    .await;
+    let snap = perf.report();
+    let setattr = snap
+        .fuse
+        .get("setattr")
+        .expect("the kernel flushed no times, so this test saw nothing");
+    assert!(setattr.errnos.is_empty(), "{:?}", setattr.errnos);
+    m.finish().await;
+}
+
+/// An `O_PATH` descriptor reaches a file without the daemon ever having a handle for it, so with its name gone the daemon cannot address it; only the kernel's own flush is answered then, and anything else still fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unlinked_file_with_no_handle_takes_nothing_but_the_time_flush() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    blocking(move || {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        fs::write(mnt.join("f"), b"x").unwrap();
+        let path = std::ffi::CString::new(mnt.join("f").as_os_str().as_bytes()).unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH) };
+        assert!(fd >= 0, "open: {}", std::io::Error::last_os_error());
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        fs::remove_file(mnt.join("f")).unwrap();
+        let both = [
+            libc::timespec {
+                tv_sec: 1_000_000,
+                tv_nsec: 0,
+            },
+            libc::timespec {
+                tv_sec: 1_000_000,
+                tv_nsec: 0,
+            },
+        ];
+        let rc = unsafe {
+            libc::utimensat(
+                file.as_raw_fd(),
+                c"".as_ptr(),
+                both.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!((rc, errno), (-1, Some(libc::ESTALE)));
+        let rc =
+            unsafe { libc::fchmodat(file.as_raw_fd(), c"".as_ptr(), 0o600, libc::AT_EMPTY_PATH) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        assert_eq!((rc, errno), (-1, Some(libc::ESTALE)));
+    })
+    .await;
+    m.finish().await;
+}
+
+/// A file with no name left but a descriptor open is still there, and setting its times must reach the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn times_set_on_an_unlinked_open_file_reach_the_server() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    blocking(move || {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        fs::write(mnt.join("f"), b"x").unwrap();
+        let file = fs::File::open(mnt.join("f")).unwrap();
+        fs::remove_file(mnt.join("f")).unwrap();
+        perf.report();
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: 1_000_000,
+                tv_nsec: 0,
+            },
+        ];
+        let rc = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
+        assert_eq!(rc, 0, "futimens: {}", std::io::Error::last_os_error());
+        assert_eq!(file.metadata().unwrap().mtime(), 1_000_000);
+        let snap = perf.report();
+        assert!(
+            snap.call.get("setattr").is_some_and(|call| call.row.n >= 1),
+            "the server was not asked to set the times"
+        );
+    })
+    .await;
+    m.finish().await;
+}
+
 /// With the kernel positioning appends and the server's descriptor not appending on its own, re-flushed pages land where they belong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appends_through_the_mount_land_once_and_in_order() {

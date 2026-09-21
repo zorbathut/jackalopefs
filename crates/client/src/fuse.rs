@@ -327,6 +327,26 @@ fn dir_placeholder(ino: u64) -> FileAttr {
     }
 }
 
+/// Whether a setattr has the shape of the kernel's own flush of the times it keeps for a written file: a modification time given as a value, and nothing else that reaches the handler (the change time that comes with it is not settable and is dropped before this). A `utimensat` that sets only the modification time has the same shape.
+fn setattr_flushes_times(set: &SetAttr) -> bool {
+    matches!(set.mtime, Some(TimeOrNow::Time(_)))
+        && set.atime.is_none()
+        && set.mode.is_none()
+        && set.uid.is_none()
+        && set.gid.is_none()
+        && set.size.is_none()
+}
+
+/// Attributes for the reply to a time flush that was not sent (see [`Shared::unlinked_file`]); the kernel ignores them.
+fn unlinked_placeholder(ino: u64) -> FileAttr {
+    FileAttr {
+        kind: FileType::RegularFile,
+        perm: 0,
+        nlink: 0,
+        ..dir_placeholder(ino)
+    }
+}
+
 /// The open flags the server gets. With the kernel caching writes, it reads through write handles (to fill the rest of a partially written page) and positions appends itself from its own idea of the size, so the server's descriptor must be readable and must not append on its own: a server-side `O_APPEND` would put every re-flushed page at the end. The price is that a file writable but not readable (mode 0222) cannot be opened for writing through the mount.
 fn flags_for_server(flags: i32) -> i32 {
     let flags = flags & !libc::O_APPEND;
@@ -362,6 +382,14 @@ impl Shared {
             Some(fh) => Ok((None, Some(fh))),
             None => Err(Errno::ESTALE),
         }
+    }
+
+    /// Whether `ino` is a regular file this client can no longer address by any name it knew: its last known name was unlinked or renamed over through this client, or found to belong to another inode. With no handle open either, the kernel's flush of the file's times (see [`setattr_flushes_times`]) has nowhere to go, since the name may by now be another file's, and is answered without the server: the kernel ignores that reply, while an error would be recorded against the whole mount and fail its next `syncfs`. `docs/design.md`, "Node table", has what that gives up.
+    fn unlinked_file(&self, ino: u64) -> bool {
+        self.nodes
+            .lock()
+            .get(ino)
+            .is_some_and(|node| node.unlinked && node.kind == FileKind::Regular)
     }
 
     fn parent_of(&self, ino: u64) -> u64 {
@@ -764,10 +792,18 @@ impl Filesystem for Backend {
             size,
             ..KeyPerf::of("setattr", req, ino.0)
         };
+        let flushes_times = setattr_flushes_times(&set);
         self.spawn(key, async move {
             let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
                 Ok(path) => path,
-                Err(e) => return fail(reply, e),
+                Err(e) => {
+                    if flushes_times && shared.unlinked_file(ino.0) {
+                        tracing::debug!(ino = ino.0, "times of an unlinked file are not flushed");
+                        reply.attr(&Duration::ZERO, &unlinked_placeholder(ino.0));
+                        return Outcome::default();
+                    }
+                    return fail(reply, e);
+                }
             };
             match shared.client.setattr(path, fh, set).await {
                 Ok(attr) => {
@@ -1703,6 +1739,49 @@ fn reply_xattr(reply: ReplyXattr, size: u32, value: &[u8]) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_lone_modification_time_value_is_a_time_flush() {
+        let time = Some(TimeOrNow::Time(TimeSpec { sec: 1, nsec: 0 }));
+        let flush = SetAttr {
+            mtime: time,
+            ..SetAttr::default()
+        };
+        assert!(setattr_flushes_times(&flush));
+        assert!(
+            !setattr_flushes_times(&SetAttr::default()),
+            "an observation sets nothing"
+        );
+        let others = [
+            SetAttr {
+                mtime: Some(TimeOrNow::Now),
+                ..SetAttr::default()
+            },
+            SetAttr {
+                atime: time,
+                ..flush
+            },
+            SetAttr {
+                size: Some(0),
+                ..flush
+            },
+            SetAttr {
+                mode: Some(0o600),
+                ..flush
+            },
+            SetAttr {
+                uid: Some(1),
+                ..flush
+            },
+            SetAttr {
+                gid: Some(1),
+                ..flush
+            },
+        ];
+        for set in others {
+            assert!(!setattr_flushes_times(&set), "{set:?}");
+        }
+    }
 
     #[test]
     fn time_conversions_round_trip() {
