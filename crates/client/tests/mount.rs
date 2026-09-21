@@ -1229,10 +1229,11 @@ async fn an_unlinked_file_with_no_handle_takes_nothing_but_the_time_flush() {
         return;
     };
     let mnt = m.mnt();
+    // Made on the export, so that no handle was ever opened for it through the mount: one whose release is still on its way would serve the daemon as a way to reach the file.
+    fs::write(m.export.path().join("f"), b"x").unwrap();
     blocking(move || {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::ffi::OsStrExt;
-        fs::write(mnt.join("f"), b"x").unwrap();
         let path = std::ffi::CString::new(mnt.join("f").as_os_str().as_bytes()).unwrap();
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH) };
         assert!(fd >= 0, "open: {}", std::io::Error::last_os_error());
