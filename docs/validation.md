@@ -9,6 +9,7 @@
 | `fsstress.sh` | many processes doing random metadata and data operations at once: crashes, hangs, a mount that stops answering, a tree that disagrees with the export, an operation failing that is not expected to | data contents (fsstress verifies nothing itself) |
 | `fio.sh` | concurrent verified I/O: eight processes writing their own files and reading every block back against a checksum | file sizes (fsx owns those); the weakest of the four |
 | `sparse.sh` | holes: the mount's `SEEK_DATA`/`SEEK_HOLE` map of a sparse file equals the export's, a hole-skipping copy is right, and data still only in the kernel's cache is never taken for a hole | sparse files under concurrency |
+| `recycle.sh` | a recycled inode number: a cached file deleted on the export and another created with the same number shows as the new file through the mount | filesystems that do not recycle numbers (it skips); snapshots and subvolumes, which need btrfs or bcachefs |
 | `resilience.sh` | a server that stops answering, dies and restarts under load: deadlines, recovery, open files across a restart, lazy detach | multi-client behaviour |
 | `coherence.sh` | two mounts of one export with 60 s cache TTLs: changes pushed within 2 s, fsstress on one while the other reads | conflicting writers |
 | `permissions.sh` | root only: the kernel enforcing modes and sticky bits against the server's attributes for another uid, setuid stripping | anything else |
@@ -105,6 +106,12 @@ fuser logs an operation the client does not implement at warn level, once per mo
 ## sparse
 
 A 64 MiB file on the export with data at its start, middle and end. `xfs_io -c 'seek -a -r 0'` walks it with `SEEK_DATA` and `SEEK_HOLE` through the mount and on the export, and the two maps must be identical (the suite fails if the export's filesystem reports no hole at all, since it would prove nothing); `cp --sparse=auto` off the mount must reproduce the file. Then a process writes into a hole through the mount and, with that data still only in the kernel's cache, seeks for it through a descriptor it opened before writing: the answer must be the data's offset or `EINVAL`, never an offset beyond it. That seek is the check that fails if the client asks the server about a file it is writing (`docs/sparse-files.md`); a copy made at the same moment is compared as well, though opening the file flushes it, so the copy is right either way.
+
+## recycle
+
+A file read through the mount, deleted on the export, and files created there until one gets the same inode number, which ext4 gives the very next file; tmpfs never does, and there the suite says so and checks nothing, that being a property of the host. Through the mount the name must then show the new file's contents and size within the attribute TTL. What it would catch is a mount that serves what it cached for the old file, or refuses the name; that the two are different nodes cannot be seen here, since seeing it needs the old file held open, and an open descriptor keeps its inode, and its number, alive on the server. The node table's unit tests pin that.
+
+Not covered by any suite, for want of a btrfs or bcachefs here: a snapshot inside the export. The manual check, on a server whose export has one: `stat -c '%i %s' <file> <snapshot>/<file>` through the mount shows two different inode numbers where the server shows one, the snapshot's being a large substitute; both files read their own contents after one of them is changed on the server; and the numbers are the same on a second mount and after a remount. On a bcachefs server this needs a kernel that reports `stx_subvol` (6.10); on an older one the two files are told apart all the same, by identity, but which of them keeps the real inode number depends on which was seen first.
 
 ## resilience
 
