@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Fixture tests for the parts of the harness that have logic of their own: the TAP parser and the baseline diff (tap.sh), the log check and the mount table parse (lib.sh).
+# Fixture tests for the parts of the harness that have logic of their own: the TAP parser and the baseline diff (tap.sh), the fsstress log parser (fsstress-parse.sh), the log check and the mount table parse (lib.sh).
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=lib.sh
 source ./lib.sh
 # shellcheck source=tap.sh
 source ./tap.sh
+# shellcheck source=fsstress-parse.sh
+source ./fsstress-parse.sh
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -100,6 +102,85 @@ EXPECT
 cp "$work/failed.txt" "$work/baseline"
 baseline_diff "$work/failed.txt" "$work/baseline" "$work" || { echo "clean diff reported regressions"; exit 1; }
 [ ! -s "$work/fixed.txt" ] || { echo "clean diff reported fixes"; exit 1; }
+
+# fsstress_parse: one line of every shape fsstress prints. A result is the last number, the number before a parenthesised message, the absence of `error` after a copy, or `Bus error`; chatter carries none; and a line of no known shape must surface instead of vanishing.
+mkdir "$work/fsstress"
+cat > "$work/fsstress.log" <<'LOG'
+seed = 1
+0/0: mkdir d0 0
+0/0: mkdir add id=0,parent=-1
+0/1: dwrite - no filename
+0/2: read - d0/f1[52068721 1 1000 1000 0 0] zero size
+0/3: do_aio_rw - xfsctl(XFS_IOC_DIOINFO) d0/f1[52068700 1 1000 1000 16 474026] return 25, fallback to stat()
+0/4: listfattr d0/f4 - has no extended attributes
+0/5: rename(REXCHANGE) d0 and d0/da have ancestor-descendant relationship
+0/6: getdents d0 0
+0/7: syncfs 116
+0/8: fallocate(KEEP_SIZE|PUNCH_HOLE) d0/f1[52068700 1 1000 1000 16 474026] [10,20] 95
+0/9: rename(NOREPLACE) d0/f1 to d0/f2 22
+0/10: setxattr f1 4 -1
+0/11: subvol_create s0 16(Could not create subvolume)
+0/12: subvol_delete s0 0(Success)
+0/13: copyrange d0/f1[1 1 0 0 8 100] [0,10] -> d0/f2[2 1 0 0 8 100] [0,10]
+0/14: copyrange d0/f1[1 1 0 0 8 100] [0,10] -> d0/f2[2 1 0 0 8 100] [0,10] error 95
+0/15: copyrange d0/f1[1 1 0 0 8 100] [0,10] -> d0/f2[2 1 0 0 8 100] [0,10] asked for 10, copied 20??
+0/16: mwrite d0/f1[1 1 0 0 8 100] [0,10,MAP_SHARED] 0
+0/17: mread d0/f1[1 1 0 0 8 100] [0,10,MAP_SHARED] Bus error
+0/18: deduperange from d0/f1[1 1 0 0 8 100] [0,10]
+0/18: ...to d0/f2[2 1 0 0 8 100] [0,10] error -22
+0/18: ...to d0/f3[3 1 0 0 8 100] [0,10] differed
+0/19: chown d0/f1 1234/5678 999
+0/21: clonerange d0/f1[1 1 0 0 8 100] [0,10] -> d0/f2[2 1 0 0 8 100] [0,10]
+0/22: exchangerange d0/f1[1 1 0 0 8 100] [0,10] -> d0/f2[2 1 0 0 8 100] [0,10] error 25
+0/23: bulkstat nent 4 total 300
+0/24: fsync d0/f1 117
+0/20: do_uring_rw - malloc failed
+3:21: subvol_delete - no subvolume
+LOG
+fsstress_parse "$work/fsstress.log" "$work/fsstress"
+diff -u - "$work/fsstress/results.txt" <<'EXPECT'
+mkdir 0
+getdents 0
+syncfs ESTALE
+fallocate(KEEP_SIZE|PUNCH_HOLE) EOPNOTSUPP
+rename(NOREPLACE) EINVAL
+setxattr -1
+subvol_create btrfsutil(16)
+subvol_delete 0
+copyrange 0
+copyrange EOPNOTSUPP
+mwrite 0
+mread SIGBUS
+deduperange 0
+deduperange EINVAL
+chown E999
+clonerange 0
+exchangerange ENOTTY
+fsync EUCLEAN
+EXPECT
+diff -u - "$work/fsstress/failed.txt" <<'EXPECT'
+chown E999
+copyrange EOPNOTSUPP
+deduperange EINVAL
+exchangerange ENOTTY
+fallocate(KEEP_SIZE|PUNCH_HOLE) EOPNOTSUPP
+fsync EUCLEAN
+mread SIGBUS
+rename(NOREPLACE) EINVAL
+setxattr -1
+subvol_create btrfsutil(16)
+syncfs ESTALE
+EXPECT
+diff -u - "$work/fsstress/unparsed.txt" <<'EXPECT'
+0/15: copyrange d0/f1[1 1 0 0 8 100] [0,10] -> d0/f2[2 1 0 0 8 100] [0,10] asked for 10, copied 20??
+0/20: do_uring_rw - malloc failed
+EXPECT
+
+diff -u - <(fsstress_denied "$work/fsstress/failed.txt") <<'EXPECT'
+fsync EUCLEAN
+mread SIGBUS
+syncfs ESTALE
+EXPECT
 
 # log_check: a coloured ERROR line (as a binary on a terminal would write it) must fail the run and land in errors.txt; warnings are counted without fuser's not-implemented notices.
 RESULTS=$work/logs
