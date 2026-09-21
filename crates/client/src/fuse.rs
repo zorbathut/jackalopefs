@@ -7,7 +7,8 @@ use crate::perf::{Outcome, TRACE_TARGET};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
     KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, RequestId,
+    ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
+    RequestId,
 };
 use jackalopefs_proto::{
     Attr, DirEntry, DirEntryPlus, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, MAX_IO,
@@ -216,6 +217,7 @@ reply_error!(
     ReplyDirectoryPlus,
     ReplyEmpty,
     ReplyEntry,
+    ReplyIoctl,
     ReplyOpen,
     ReplyStatfs,
     ReplyWrite,
@@ -1537,6 +1539,34 @@ impl Filesystem for Backend {
                 }
                 Err(e) => fail(reply, errno(&e)),
             }
+        });
+    }
+
+    /// No ioctl is carried to the server, and `ENOTTY` is the errno for an ioctl a file does not support. The kernel remembers no such answer, so every probe arrives here.
+    #[allow(clippy::too_many_arguments)]
+    fn ioctl(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        flags: fuser::IoctlFlags,
+        cmd: u32,
+        in_data: &[u8],
+        out_size: u32,
+        reply: ReplyIoctl,
+    ) {
+        tracing::trace!(
+            target: TRACE_TARGET,
+            unique = req.unique().0,
+            fh = fh.0,
+            %flags,
+            cmd = format_args!("{cmd:#x}"),
+            in_len = in_data.len(),
+            out_size,
+            "ioctl refused"
+        );
+        self.spawn(KeyPerf::of("ioctl", req, ino.0), async move {
+            fail(reply, Errno::ENOTTY)
         });
     }
 }

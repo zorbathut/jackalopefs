@@ -757,6 +757,40 @@ async fn perf_tables_see_the_kernel_requests() {
     m.finish().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_ioctl_is_refused_and_counted() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    fs::create_dir(m.export.path().join("d")).unwrap();
+    let dir = m.mnt().join("d");
+    let code = blocking(move || {
+        let handle = fs::File::open(&dir).unwrap();
+        // FS_IOC_GETFSLABEL, which libc does not name.
+        const GETFSLABEL: libc::c_ulong = 0x8100_9431;
+        let mut label = [0u8; 256];
+        let rc = unsafe {
+            use std::os::fd::AsRawFd;
+            libc::ioctl(handle.as_raw_fd(), GETFSLABEL as _, label.as_mut_ptr())
+        };
+        assert_eq!(rc, -1);
+        std::io::Error::last_os_error().raw_os_error().unwrap()
+    })
+    .await;
+    assert_eq!(code, libc::ENOTTY);
+
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
+    })
+    .await;
+    let snap = perf.report();
+    let ioctl = &snap.fuse["ioctl"];
+    assert_eq!(ioctl.n, 1);
+    assert_eq!(ioctl.errnos.get(&libc::ENOTTY), Some(&1));
+    m.finish().await;
+}
+
 fn xattr_get(path: &Path, name: &str) -> Result<Vec<u8>, i32> {
     let path = CString::new(path.as_os_str().as_bytes()).unwrap();
     let name = CString::new(name).unwrap();
