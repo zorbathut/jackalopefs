@@ -167,10 +167,10 @@ pub enum Request {
 }
 
 impl Request {
-    /// The handle this request operates on, if any.
-    pub fn fh(&self) -> Option<u64> {
+    /// Every handle this request names.
+    pub fn fhs(&self) -> [Option<u64>; 2] {
         match self {
-            Request::Getattr { fh, .. } | Request::Setattr { fh, .. } => *fh,
+            Request::Getattr { fh, .. } | Request::Setattr { fh, .. } => [*fh, None],
             Request::Open { fh, .. }
             | Request::Create { fh, .. }
             | Request::Read { fh, .. }
@@ -179,8 +179,22 @@ impl Request {
             | Request::Fsync { fh, .. }
             | Request::Opendir { fh, .. }
             | Request::Readdir { fh, .. }
-            | Request::Releasedir { fh } => Some(*fh),
-            _ => None,
+            | Request::Releasedir { fh } => [Some(*fh), None],
+            Request::Lookup { .. }
+            | Request::Readlink { .. }
+            | Request::Mknod { .. }
+            | Request::Mkdir { .. }
+            | Request::Unlink { .. }
+            | Request::Rmdir { .. }
+            | Request::Symlink { .. }
+            | Request::Rename { .. }
+            | Request::Link { .. }
+            | Request::Statfs { .. }
+            | Request::Setxattr { .. }
+            | Request::Getxattr { .. }
+            | Request::Listxattr { .. }
+            | Request::Removexattr { .. }
+            | Request::Access { .. } => [None, None],
         }
     }
 
@@ -197,7 +211,7 @@ impl Request {
                 max_bytes,
                 ..
             } => (Some(*fh), Some(*offset), Some(*max_bytes as u64)),
-            other => (other.fh(), None, None),
+            other => (other.fhs()[0], None, None),
         }
     }
 
@@ -279,4 +293,25 @@ pub enum EventItem {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Event {
     pub items: Vec<EventItem>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fhs_names_every_handle() {
+        let write = Request::Write {
+            fh: 3,
+            offset: 0,
+            data: Vec::new(),
+        };
+        assert_eq!(write.fhs(), [Some(3), None]);
+        let getattr = Request::Getattr {
+            path: Some(Path::root()),
+            fh: None,
+        };
+        assert_eq!(getattr.fhs(), [None, None]);
+        assert_eq!(Request::Statfs { path: Path::root() }.fhs(), [None, None]);
+    }
 }

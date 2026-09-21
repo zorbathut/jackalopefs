@@ -340,11 +340,11 @@ impl Caller {
         let kernel = current_request();
         let kernel = kernel.as_deref();
         let mut offline_deadline = Instant::now() + self.offline_timeout;
-        let handle = req.fh().and_then(|fh| self.handles.get(fh));
+        let handles = req.fhs().map(|fh| fh.and_then(|fh| self.handles.get(fh)));
         let mut min_generation = 0;
         let mut lost_once = false;
         loop {
-            if handle.as_ref().is_some_and(|h| h.is_dead()) {
+            if handles.iter().flatten().any(|h| h.is_dead()) {
                 return Err(Error::Stale);
             }
             let waiting = Instant::now();
