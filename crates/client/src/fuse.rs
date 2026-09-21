@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -396,14 +397,48 @@ impl Shared {
             .is_some_and(|node| node.unlinked && node.kind == FileKind::Regular)
     }
 
-    /// The node `id` if `attr`, the reply to an open of it by path, describes the file the node is; a path that led to another file is refused. The root is whatever the server says it is.
-    fn same_file(&self, id: u64, attr: &Attr) -> Result<u64, Error> {
+    /// Whether `attr`, the reply to a request that addressed node `id` by path, describes the file the node is. Nothing else checks: the kernel takes whatever attributes it is given for the inode it asked about, inode number included. The root is whatever the server says it is, there being no other way to reach it.
+    fn describes(&self, id: u64, attr: &Attr) -> bool {
+        if id == ROOT {
+            return true;
+        }
         let nodes = self.nodes.lock();
         let known = nodes.get(id).and_then(|node| node.key.as_ref());
-        if id == ROOT || known.is_some_and(|key| key.describes(attr)) {
+        if known.is_some_and(|key| key.describes(attr)) {
+            return true;
+        }
+        tracing::debug!(node = id, was = ?known, now = ?KeyNode::of(attr), "the path to a node led to another file");
+        false
+    }
+
+    /// `path`, by which node `id` was addressed, led to another file (see [`Self::describes`]): forget that name here and in the kernel, so the next request for the node goes by another name, or fails with `ESTALE` if it has none, and the next lookup of the name finds what is there now.
+    fn alias_was_wrong(&self, id: u64, path: &Path) {
+        let Some((parent, name)) = self.nodes.lock().alias_was_wrong(id, path) else {
+            return;
+        };
+        match self.invalidations.lock().as_ref() {
+            Some(tx) => {
+                if let Err(e) = tx.try_send(Work::Entry(parent, name)) {
+                    tracing::debug!(node = id, "cannot queue an entry invalidation: {e}");
+                }
+            }
+            None => tracing::debug!(node = id, "no invalidation queue to drop the name through"),
+        }
+    }
+
+    /// For an open of node `id` by `path`: the node, if `attr` describes its file. If not, the name goes (see [`Self::alias_was_wrong`]), `wrong_name` says so, and the open is refused, for the caller to try the node's next name.
+    fn same_file(
+        &self,
+        id: u64,
+        path: &Path,
+        attr: &Attr,
+        wrong_name: &AtomicBool,
+    ) -> Result<u64, Error> {
+        if self.describes(id, attr) {
             return Ok(id);
         }
-        tracing::warn!(node = id, was = ?known, now = ?KeyNode::of(attr), "path led to a different file than the one being opened");
+        self.alias_was_wrong(id, path);
+        wrong_name.store(true, Ordering::Relaxed);
         Err(Error::Stale)
     }
 
@@ -761,11 +796,19 @@ impl Filesystem for Backend {
             ..KeyPerf::of("getattr", req, ino.0)
         };
         self.spawn(key, async move {
-            let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
-                Ok(path) => path,
-                Err(e) => return fail(reply, e),
+            // A reply by handle is the handle's file. One by path is whatever the path leads to now, and if that is another file the node is tried by its next name.
+            let attr = loop {
+                let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
+                    Ok(path) => path,
+                    Err(e) => return fail(reply, e),
+                };
+                match shared.client.getattr(path.clone(), fh).await {
+                    Ok(attr) if fh.is_some() || shared.describes(ino.0, &attr) => break Ok(attr),
+                    Ok(_) => shared.alias_was_wrong(ino.0, &path.unwrap_or_else(Path::root)),
+                    Err(e) => break Err(e),
+                }
             };
-            match shared.client.getattr(path, fh).await {
+            match attr {
                 Ok(attr) => {
                     if ino.0 == ROOT {
                         shared.nodes.lock().root_seen(&attr.identity);
@@ -819,18 +862,29 @@ impl Filesystem for Backend {
         };
         let flushes_times = setattr_flushes_times(&set);
         self.spawn(key, async move {
-            let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
-                Ok(path) => path,
-                Err(e) => {
-                    if flushes_times && shared.unlinked_file(ino.0) {
-                        tracing::debug!(ino = ino.0, "times of an unlinked file are not flushed");
-                        reply.attr(&Duration::ZERO, &unlinked_placeholder(ino.0));
-                        return Outcome::default();
+            // As for getattr, except that a change sent down a path that led elsewhere has been made to that other file by the time the reply says so; it is made again to the right one.
+            let attr = loop {
+                let (path, fh) = match shared.path_for_handle_op(ino.0, fh) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        if flushes_times && shared.unlinked_file(ino.0) {
+                            tracing::debug!(
+                                ino = ino.0,
+                                "times of an unlinked file are not flushed"
+                            );
+                            reply.attr(&Duration::ZERO, &unlinked_placeholder(ino.0));
+                            return Outcome::default();
+                        }
+                        return fail(reply, e);
                     }
-                    return fail(reply, e);
+                };
+                match shared.client.setattr(path.clone(), fh, set).await {
+                    Ok(attr) if fh.is_some() || shared.describes(ino.0, &attr) => break Ok(attr),
+                    Ok(_) => shared.alias_was_wrong(ino.0, &path.unwrap_or_else(Path::root)),
+                    Err(e) => break Err(e),
                 }
             };
-            match shared.client.setattr(path, fh, set).await {
+            match attr {
                 Ok(attr) => {
                     shared.xattr_remember(ino.0, &attr);
                     if observes_only {
@@ -1059,8 +1113,18 @@ impl Filesystem for Backend {
                 (Ok(a), Ok(b)) => (a, b),
                 (Err(e), _) | (_, Err(e)) => return fail(reply, e),
             };
-            match shared.client.link(path, newpath, newname.clone()).await {
-                Ok(attr) => shared.reply_created(reply, newparent.0, newname, &attr),
+            match shared
+                .client
+                .link(path.clone(), newpath, newname.clone())
+                .await
+            {
+                Ok(attr) => {
+                    // The reply describes the file that was linked. If the path led to another than the one meant, the new name is that other file's, and is registered as such.
+                    if !shared.describes(ino.0, &attr) {
+                        shared.alias_was_wrong(ino.0, &path);
+                    }
+                    shared.reply_created(reply, newparent.0, newname, &attr)
+                }
                 Err(e) => fail(reply, errno(&e)),
             }
         });
@@ -1070,15 +1134,24 @@ impl Filesystem for Backend {
         let shared = self.shared.clone();
         let flags = flags_for_server(flags.0);
         self.spawn(KeyPerf::of("open", req, ino.0), async move {
-            let path = match shared.path_of(ino.0) {
-                Ok(path) => path,
-                Err(e) => return fail(reply, e),
+            // A path that led to another file costs the node that name, and the open is tried by the next.
+            let opened = loop {
+                let path = match shared.path_of(ino.0) {
+                    Ok(path) => path,
+                    Err(e) => return fail(reply, e),
+                };
+                let (meant, by, wrong_name) =
+                    (shared.clone(), path.clone(), AtomicBool::new(false));
+                let opened = shared
+                    .client
+                    .open(path, flags, |attr| {
+                        meant.same_file(ino.0, &by, attr, &wrong_name)
+                    })
+                    .await;
+                if !wrong_name.load(Ordering::Relaxed) {
+                    break opened;
+                }
             };
-            let meant = shared.clone();
-            let opened = shared
-                .client
-                .open(path, flags, move |attr| meant.same_file(ino.0, attr))
-                .await;
             match opened {
                 Ok((fh, attr)) => {
                     shared.xattr_remember(ino.0, &attr);
@@ -1406,15 +1479,21 @@ impl Filesystem for Backend {
     fn opendir(&self, req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
         let shared = self.shared.clone();
         self.spawn(KeyPerf::of("opendir", req, ino.0), async move {
-            let path = match shared.path_of(ino.0) {
-                Ok(path) => path,
-                Err(e) => return fail(reply, e),
+            let opened = loop {
+                let path = match shared.path_of(ino.0) {
+                    Ok(path) => path,
+                    Err(e) => return fail(reply, e),
+                };
+                let (meant, by, wrong_name) =
+                    (shared.clone(), path.clone(), AtomicBool::new(false));
+                let opened = shared
+                    .client
+                    .opendir(path, |attr| meant.same_file(ino.0, &by, attr, &wrong_name))
+                    .await;
+                if !wrong_name.load(Ordering::Relaxed) {
+                    break opened;
+                }
             };
-            let meant = shared.clone();
-            let opened = shared
-                .client
-                .opendir(path, move |attr| meant.same_file(ino.0, attr))
-                .await;
             match opened {
                 Ok((fh, _)) => {
                     shared.dirs.lock().insert(

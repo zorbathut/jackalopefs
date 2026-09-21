@@ -1226,6 +1226,59 @@ async fn a_descriptor_survives_its_name_when_the_file_has_another() {
     m.finish().await;
 }
 
+/// The client addresses a node by the last name it was reached through. When someone else replaces that name with another file, the node is still the file it was, reachable by its other name, and must not take on the other file's attributes. Two ways there: with the replaced name's directory still held, the client asks by the stale name, is told about another file, and has to notice; with nothing holding it, the kernel forgets the directory and the client has to pass over a name it can no longer spell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_whose_newest_name_was_replaced_is_reached_by_its_other_name() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for directory_held in [true, false] {
+        let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+            return;
+        };
+        let export = m.export.path().to_path_buf();
+        fs::create_dir(export.join("d")).unwrap();
+        fs::create_dir(export.join("e")).unwrap();
+        fs::write(export.join("d/a"), b"the file").unwrap();
+        fs::hard_link(export.join("d/a"), export.join("e/b")).unwrap();
+        let mnt = m.mnt();
+        blocking(move || {
+            use std::os::fd::FromRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            // An `O_PATH` descriptor holds the node without a handle, so its `fstat` asks about the node itself and the client has to find a path to it.
+            let path = std::ffi::CString::new(mnt.join("d/a").as_os_str().as_bytes()).unwrap();
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH) };
+            assert!(fd >= 0, "open: {}", std::io::Error::last_os_error());
+            let held = unsafe { fs::File::from_raw_fd(fd) };
+            let first = held.metadata().unwrap();
+            let _directory = directory_held.then(|| fs::File::open(mnt.join("e")).unwrap());
+            assert_eq!(fs::metadata(mnt.join("e/b")).unwrap().ino(), first.ino());
+            // The other file differs in its mode: of what a reply says, the size and times of a regular file are what the kernel keeps to itself while it caches writes, and would show nothing.
+            fs::write(export.join("e/other"), b"another file, and longer").unwrap();
+            fs::set_permissions(export.join("e/other"), fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(export.join("e/other"), export.join("e/b")).unwrap();
+            // Past the attribute TTL, so the kernel asks again.
+            std::thread::sleep(Duration::from_millis(1200));
+            let again = held.metadata().unwrap();
+            assert_eq!(
+                (again.ino(), again.mode()),
+                (first.ino(), first.mode()),
+                "directory held: {directory_held}"
+            );
+            assert_eq!(fs::read(mnt.join("d/a")).unwrap(), b"the file");
+            let started = Instant::now();
+            while fs::read(mnt.join("e/b")).unwrap() != b"another file, and longer" {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "the replaced name never showed its new file"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_ne!(fs::metadata(mnt.join("e/b")).unwrap().ino(), first.ino());
+        })
+        .await;
+        m.finish().await;
+    }
+}
+
 /// Replaced on the export while open here, a file stays what it was for the descriptor, and its name leads to the new file, which is another node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_file_replaced_on_the_export_is_another_file_by_name_and_the_same_by_descriptor() {

@@ -260,6 +260,26 @@ impl NodeTable {
         }
     }
 
+    /// `path`, which [`Self::path_of`] gave for `id`, led to another file: forget the alias it ended in, so the node is addressed by another name if it has one, and say which alias that was. The file itself may be perfectly well; it is a name that went stale, renamed or replaced by someone else. The alias is found by its path because it need not be the newest: `path_of` passes over names it cannot spell.
+    pub fn alias_was_wrong(&mut self, id: u64, path: &Path) -> Option<(u64, Name)> {
+        let (dir, last) = path.names().split_last().map(|(last, dir)| (dir, last))?;
+        let node = self.nodes.get(&id)?;
+        let at = node.aliases.iter().rposition(|(parent, name)| {
+            name == last && self.names_to(*parent, 0).is_some_and(|names| names == dir)
+        })?;
+        let node = self.nodes.get_mut(&id)?;
+        let (parent, name) = node.aliases.remove(at);
+        if node.aliases.is_empty() {
+            node.unlinked = true;
+        }
+        if let Some(p) = self.nodes.get_mut(&parent) {
+            if p.children.get(&name) == Some(&id) {
+                p.children.remove(&name);
+            }
+        }
+        Some((parent, name))
+    }
+
     /// `parent/name` was removed through this client.
     pub fn unlink(&mut self, parent: u64, name: &Name) {
         let Some(child) = self
@@ -546,6 +566,44 @@ mod tests {
         assert_eq!(t.path_of(10), Some(p("d/a")));
         assert!(t.forget(5, 1));
         assert_eq!(t.path_of(10), None);
+    }
+
+    #[test]
+    fn a_wrong_name_falls_back_to_the_one_before() {
+        let mut t = NodeTable::new();
+        look(&mut t, ROOT, n("d"), 5, FileKind::Directory);
+        look(&mut t, 5, n("a"), 10, FileKind::Regular);
+        look(&mut t, ROOT, n("b"), 10, FileKind::Regular);
+        assert_eq!(t.path_of(10), Some(p("b")));
+        assert_eq!(t.alias_was_wrong(10, &p("b")), Some((ROOT, n("b"))));
+        assert_eq!(t.child(ROOT, &n("b")), None);
+        assert_eq!(t.path_of(10), Some(p("d/a")));
+        assert!(!t.get(10).unwrap().unlinked);
+        assert_eq!(t.alias_was_wrong(10, &p("d/a")), Some((5, n("a"))));
+        assert!(t.get(10).unwrap().unlinked, "no name left");
+        assert_eq!(t.alias_was_wrong(10, &p("d/a")), None);
+        assert_eq!(t.alias_was_wrong(ROOT, &Path::root()), None);
+    }
+
+    /// The name that led elsewhere is the one that was used, which is not the newest when the newest could not be spelled.
+    #[test]
+    fn the_wrong_name_is_the_one_that_was_used() {
+        let mut t = NodeTable::new();
+        look(&mut t, ROOT, n("d"), 5, FileKind::Directory);
+        look(&mut t, ROOT, n("e"), 6, FileKind::Directory);
+        look(&mut t, 5, n("a"), 10, FileKind::Regular);
+        look(&mut t, 6, n("b"), 10, FileKind::Regular);
+        assert!(t.forget(6, 1));
+        let used = t.path_of(10).unwrap();
+        assert_eq!(used, p("d/a"));
+        assert_eq!(t.alias_was_wrong(10, &used), Some((5, n("a"))));
+        assert_eq!(
+            t.get(10).unwrap().aliases,
+            vec![(6, n("b"))],
+            "the name not used is kept"
+        );
+        assert!(!t.get(10).unwrap().unlinked);
+        assert_eq!(t.path_of(10), None, "though it cannot be spelled for now");
     }
 
     /// The root is node 1 whatever inode number it has on the server, and a file that really is numbered 1 is not the root.
