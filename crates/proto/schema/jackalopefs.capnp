@@ -54,6 +54,12 @@ enum FileKind {
   blockDevice @6;
 }
 
+# What an lseek looks for from its offset: the next data, or the next hole (the end of the file counts as one).
+enum Whence {
+  data @0;
+  hole @1;
+}
+
 struct Attr {
   ino @0 :UInt64;
   size @1 :UInt64;
@@ -188,6 +194,7 @@ struct Request {
     access :group { path @68 :Path; mask @69 :Int32; }
     copyFileRange :group { fhIn @70 :UInt64; offsetIn @71 :UInt64; fhOut @72 :UInt64; offsetOut @73 :UInt64; len @74 :UInt64; }
     fallocate :group { fh @75 :UInt64; offset @76 :UInt64; len @77 :UInt64; mode @78 :Int32; }
+    lseek :group { fh @79 :UInt64; offset @80 :UInt64; whence @81 :Whence; }
   }
 }
 
@@ -210,6 +217,7 @@ struct Response {
     statfs @10 :Statfs;
     xattr @11 :Data;
     copied @14 :UInt32;
+    seeked @15 :UInt64;
   }
 }
 

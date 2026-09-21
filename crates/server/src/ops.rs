@@ -5,7 +5,7 @@ use crate::export::{kind_from_mode, proc_path, Export};
 use crate::handles::{Handle, Handles};
 use crate::watch::ChangeLog;
 use jackalopefs_proto::{
-    Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, MAX_FALLOCATE, MAX_IO,
+    Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, Whence, MAX_FALLOCATE, MAX_IO,
     NAME_MAX,
 };
 use nix::errno::Errno;
@@ -15,7 +15,7 @@ use nix::sys::stat::{
 };
 use nix::sys::time::TimeSpec;
 use nix::unistd::{
-    faccessat, fchown, fchownat, fdatasync, fsync, ftruncate, linkat, symlinkat, unlinkat,
+    faccessat, fchown, fchownat, fdatasync, fsync, ftruncate, linkat, lseek, symlinkat, unlinkat,
     AccessFlags, Gid, Uid, UnlinkatFlags,
 };
 use parking_lot::Mutex;
@@ -399,6 +399,19 @@ impl Ops {
                     }
                 }
                 Ok(Response::Ok)
+            }
+            Request::Lseek { fh, offset, whence } => {
+                let file = self.handles.file(fh)?;
+                let offset = i64::try_from(offset).map_err(|_| Errno::EINVAL)?;
+                let whence = match whence {
+                    Whence::Data => nix::unistd::Whence::SeekData,
+                    Whence::Hole => nix::unistd::Whence::SeekHole,
+                };
+                // There is no positional seek, so this moves the position of a descriptor every request on the handle shares; nothing reads it.
+                let found = lseek(&*file, offset, whence)?;
+                Ok(Response::Seeked(
+                    u64::try_from(found).expect("lseek returns no negative offset"),
+                ))
             }
             Request::Release { fh } | Request::Releasedir { fh } => {
                 if self.handles.remove(fh).is_none() {
@@ -980,6 +993,83 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    fn seek(ops: &Ops, fh: u64, offset: u64, whence: Whence) -> Response {
+        dispatch(ops, Request::Lseek { fh, offset, whence })
+    }
+
+    /// Where a filesystem draws the line between data and hole is its own business, so the server's answer is held against the same `lseek` on the export's file.
+    #[test]
+    fn lseek_finds_what_the_syscall_finds() {
+        let (dir, ops) = fixture();
+        let file = fs::File::create(dir.path().join("sparse")).unwrap();
+        file.write_all_at(b"data", 1 << 20).unwrap();
+        file.write_all_at(b"more", 3 << 20).unwrap();
+        file.set_len(4 << 20).unwrap();
+        open(&ops, 1, "sparse", libc::O_RDONLY);
+        let control = fs::File::open(dir.path().join("sparse")).unwrap();
+        for offset in [0, 1 << 20, (1 << 20) + 2, 2 << 20, 3 << 20, (4 << 20) - 1] {
+            for (whence, local) in [
+                (Whence::Data, nix::unistd::Whence::SeekData),
+                (Whence::Hole, nix::unistd::Whence::SeekHole),
+            ] {
+                let expected = match nix::unistd::lseek(&control, offset, local) {
+                    Ok(found) => Response::Seeked(found as u64),
+                    Err(errno) => Response::Err(errno as i32),
+                };
+                assert_eq!(
+                    seek(&ops, 1, offset as u64, whence),
+                    expected,
+                    "{whence:?} from {offset}"
+                );
+            }
+        }
+        let refused = |errno: Errno| Response::Err(errno as i32);
+        assert_eq!(
+            seek(&ops, 1, 4 << 20, Whence::Data),
+            refused(Errno::ENXIO),
+            "at the end"
+        );
+        assert_eq!(
+            seek(&ops, 1, 4 << 20, Whence::Hole),
+            refused(Errno::ENXIO),
+            "at the end"
+        );
+        assert_eq!(
+            seek(&ops, 1, u64::MAX, Whence::Data),
+            refused(Errno::EINVAL),
+            "past off_t"
+        );
+        assert_eq!(
+            seek(&ops, 9, 0, Whence::Data),
+            refused(Errno::EBADF),
+            "unknown handle"
+        );
+        dispatch(
+            &ops,
+            Request::Opendir {
+                fh: 2,
+                path: Path::root(),
+            },
+        );
+        assert_eq!(
+            seek(&ops, 2, 0, Whence::Data),
+            refused(Errno::EBADF),
+            "directory handle"
+        );
+        // A seek moves the descriptor's position, which nothing reads: a read still starts where it says.
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Read {
+                    fh: 1,
+                    offset: 1 << 20,
+                    size: 4
+                }
+            ),
+            Response::Read(b"data".to_vec())
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@
 | `fsx.sh` | single-file data integrity: random reads, writes, truncates, mapped I/O, every read checked against a shadow copy, file size after every operation | concurrency |
 | `fsstress.sh` | many processes doing random metadata and data operations at once: crashes, hangs, a mount that stops answering, a tree that disagrees with the export | data contents (fsstress verifies nothing itself) |
 | `fio.sh` | concurrent verified I/O: eight processes writing their own files and reading every block back against a checksum | file sizes (fsx owns those); the weakest of the four |
+| `sparse.sh` | holes: the mount's `SEEK_DATA`/`SEEK_HOLE` map of a sparse file equals the export's, a hole-skipping copy is right, and data still only in the kernel's cache is never taken for a hole | sparse files under concurrency |
 | `resilience.sh` | a server that stops answering, dies and restarts under load: deadlines, recovery, open files across a restart, lazy detach | multi-client behaviour |
 | `coherence.sh` | two mounts of one export with 60 s cache TTLs: changes pushed within 2 s, fsstress on one while the other reads | conflicting writers |
 | `permissions.sh` | root only: the kernel enforcing modes and sticky bits against the server's attributes for another uid, setuid stripping | anything else |
@@ -76,6 +77,10 @@ Disabled explicitly because the client implements none of them: `-Y` write zeroe
 ## fio
 
 `verify.fio`: `ioengine=psync`, `verify=crc32c`, `verify_fatal=1`, four `randwrite` jobs with 4 KiB to 64 KiB blocks and four sequential 1 MiB `write` jobs, 32 MiB each, `fsync_on_close`. fio writes, then reads back and checks every block; a mismatch or I/O error is fatal. fio runs from the results directory so its state files stay off the mount. It checks block contents only.
+
+## sparse
+
+A 64 MiB file on the export with data at its start, middle and end. `xfs_io -c 'seek -a -r 0'` walks it with `SEEK_DATA` and `SEEK_HOLE` through the mount and on the export, and the two maps must be identical (the suite fails if the export's filesystem reports no hole at all, since it would prove nothing); `cp --sparse=auto` off the mount must reproduce the file. Then a process writes into a hole through the mount and, with that data still only in the kernel's cache, seeks for it through a descriptor it opened before writing: the answer must be the data's offset or `EINVAL`, never an offset beyond it. That seek is the check that fails if the client asks the server about a file it is writing (`docs/sparse-files.md`); a copy made at the same moment is compared as well, though opening the file flushes it, so the copy is right either way.
 
 ## resilience
 

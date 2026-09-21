@@ -1104,6 +1104,80 @@ async fn fallocate_reaches_the_server_and_moves_no_data() {
     m.finish().await;
 }
 
+/// `lseek(2)` on `file`, as the offset found or the errno.
+fn seek(file: &fs::File, offset: i64, whence: i32) -> Result<i64, i32> {
+    use std::os::fd::AsRawFd;
+    let found = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
+    if found < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+    } else {
+        Ok(found)
+    }
+}
+
+/// Refused, the kernel answers by itself that the whole file is data, so the request count is what shows the server was asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seeking_data_and_holes_asks_the_server_unless_this_client_is_writing() {
+    use std::os::unix::fs::FileExt;
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    let on_export = fs::File::create(m.export.path().join("sparse")).unwrap();
+    on_export.write_all_at(b"data", 1 << 20).unwrap();
+    on_export.set_len(2 << 20).unwrap();
+    perf.report();
+    blocking(move || {
+        let reader = fs::File::open(mnt.join("sparse")).unwrap();
+        for offset in [0, 1 << 20, (1 << 20) + 4096] {
+            for whence in [libc::SEEK_DATA, libc::SEEK_HOLE] {
+                assert_eq!(
+                    seek(&reader, offset, whence),
+                    seek(&on_export, offset, whence),
+                    "whence {whence} from {offset}"
+                );
+            }
+        }
+        assert_eq!(seek(&reader, 2 << 20, libc::SEEK_DATA), Err(libc::ENXIO));
+
+        // With the file open for writing here, the kernel may hold data the server has not seen.
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .open(mnt.join("sparse"))
+            .unwrap();
+        writer.write_all_at(b"cached", 0).unwrap();
+        assert_eq!(seek(&reader, 0, libc::SEEK_DATA), Err(libc::EINVAL));
+        assert_eq!(seek(&reader, 0, libc::SEEK_HOLE), Err(libc::EINVAL));
+        drop(writer);
+    })
+    .await;
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
+    })
+    .await;
+    let snap = perf.report();
+    let lseek = snap
+        .fuse
+        .get("lseek")
+        .expect("no lseek reached the daemon: the kernel answered that the file is all data");
+    assert_eq!(lseek.errnos.get(&libc::EINVAL), Some(&2));
+    assert_eq!(
+        snap.call["lseek"].row.n + 2,
+        lseek.n,
+        "a refused seek asks the server nothing"
+    );
+
+    // Once the writer is released the kernel holds nothing unwritten, and the server is asked again.
+    let mnt = m.mnt();
+    wait_for(Duration::from_secs(3), "the writer's release", || {
+        let reader = fs::File::open(mnt.join("sparse")).unwrap();
+        (seek(&reader, 0, libc::SEEK_DATA) == Ok(0)).then_some(())
+    })
+    .await;
+    m.finish().await;
+}
+
 /// With the kernel positioning appends and the server's descriptor not appending on its own, re-flushed pages land where they belong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appends_through_the_mount_land_once_and_in_order() {

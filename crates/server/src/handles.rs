@@ -8,7 +8,7 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
-/// Files are shared freely because every access is positional (`pread`/`pwrite`); a directory's read position is shared state and so carries its own lock.
+/// Files are shared freely because every access that depends on a position carries its own offset (`pread`/`pwrite`); an `lseek` for data or a hole moves the descriptor's position, which nothing reads. A directory's read position is shared state and so carries its own lock.
 #[derive(Clone)]
 pub enum Handle {
     /// `path` is where the file was opened; it identifies the client's own writes for echo suppression and may go stale after a rename, which only costs a spurious invalidation.

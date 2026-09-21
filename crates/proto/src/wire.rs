@@ -4,7 +4,7 @@ use crate::jackalopefs_capnp as schema;
 use crate::msg::{Auth, Event, EventItem, Hello, HelloReply, Request, Response, Resume};
 use crate::types::{
     Attr, DirEntry, DirEntryPlus, ErrorName, ErrorPathTooLong, FileKind, Name, Path, SetAttr,
-    Statfs, TimeOrNow, TimeSpec, PATH_MAX,
+    Statfs, TimeOrNow, TimeSpec, Whence, PATH_MAX,
 };
 use capnp::message::{self, HeapAllocator, ReaderSegments};
 
@@ -97,6 +97,20 @@ fn kind_to_wire(kind: FileKind) -> schema::FileKind {
         FileKind::Socket => schema::FileKind::Socket,
         FileKind::CharDevice => schema::FileKind::CharDevice,
         FileKind::BlockDevice => schema::FileKind::BlockDevice,
+    }
+}
+
+fn whence_to_wire(whence: Whence) -> schema::Whence {
+    match whence {
+        Whence::Data => schema::Whence::Data,
+        Whence::Hole => schema::Whence::Hole,
+    }
+}
+
+fn whence_from_wire(whence: schema::Whence) -> Whence {
+    match whence {
+        schema::Whence::Data => Whence::Data,
+        schema::Whence::Hole => Whence::Hole,
     }
 }
 
@@ -695,6 +709,12 @@ impl Message for Request {
                 g.set_len(*len);
                 g.set_mode(*mode);
             }
+            Request::Lseek { fh, offset, whence } => {
+                let mut g = b.init_lseek();
+                g.set_fh(*fh);
+                g.set_offset(*offset);
+                g.set_whence(whence_to_wire(*whence));
+            }
         }
     }
 
@@ -841,6 +861,11 @@ impl Message for Request {
                 len: g.get_len(),
                 mode: g.get_mode(),
             },
+            rq::Which::Lseek(g) => Request::Lseek {
+                fh: g.get_fh(),
+                offset: g.get_offset(),
+                whence: whence_from_wire(g.get_whence()?),
+            },
         })
     }
 
@@ -904,7 +929,8 @@ impl Message for Request {
             | Request::Readdir { .. }
             | Request::Releasedir { .. }
             | Request::CopyFileRange { .. }
-            | Request::Fallocate { .. } => 0,
+            | Request::Fallocate { .. }
+            | Request::Lseek { .. } => 0,
         };
         BASE_WORDS + payload
     }
@@ -935,6 +961,7 @@ impl Message for Response {
             Response::Read(data) => b.init_read().set_data(data),
             Response::Written(n) => b.set_written(*n),
             Response::Copied(n) => b.set_copied(*n),
+            Response::Seeked(offset) => b.set_seeked(*offset),
             Response::Readdir { entries, end } => {
                 let mut g = b.init_readdir();
                 g.set_end(*end);
@@ -976,6 +1003,7 @@ impl Message for Response {
             rs::Which::Read(g) => Response::Read(g.get_data()?.to_vec()),
             rs::Which::Written(n) => Response::Written(n),
             rs::Which::Copied(n) => Response::Copied(n),
+            rs::Which::Seeked(offset) => Response::Seeked(offset),
             rs::Which::Readdir(g) => {
                 let list = g.get_entries()?;
                 let mut entries =
@@ -1014,7 +1042,11 @@ impl Message for Response {
 
     fn size_hint(&self) -> u32 {
         let payload = match self {
-            Response::Err(_) | Response::Ok | Response::Written(_) | Response::Copied(_) => 0,
+            Response::Err(_)
+            | Response::Ok
+            | Response::Written(_)
+            | Response::Copied(_)
+            | Response::Seeked(_) => 0,
             Response::Entry(attr) | Response::Attr(attr) | Response::Opened { attr } => {
                 ATTR_WORDS + words_for_xattr_names(attr.xattr_names.as_deref())
             }

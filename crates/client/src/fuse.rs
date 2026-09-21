@@ -7,11 +7,12 @@ use crate::perf::{Outcome, TRACE_TARGET};
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
     KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
-    ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
-    RequestId,
+    ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
+    Request, RequestId,
 };
 use jackalopefs_proto::{
-    Attr, DirEntry, DirEntryPlus, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, MAX_IO,
+    Attr, DirEntry, DirEntryPlus, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, Whence,
+    MAX_IO,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -218,6 +219,7 @@ reply_error!(
     ReplyEmpty,
     ReplyEntry,
     ReplyIoctl,
+    ReplyLseek,
     ReplyOpen,
     ReplyStatfs,
     ReplyWrite,
@@ -1192,6 +1194,51 @@ impl Filesystem for Backend {
                     reply.ok();
                     Outcome::default()
                 }
+                Err(e) => fail(reply, errno(&e)),
+            }
+        });
+    }
+
+    /// The kernel asks only for `SEEK_DATA` and `SEEK_HOLE`, and without writing anything back first, so while it may hold pages the server has not seen, the server's answer could call data just written a hole, or past the end, and a copy that skips holes would drop it. The seek is refused then, with the errno of a filesystem that cannot look for holes; callers fall back to reading the file.
+    fn lseek(
+        &self,
+        req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        let shared = self.shared.clone();
+        let key = KeyPerf {
+            fh: Some(fh.0),
+            offset: u64::try_from(offset).ok(),
+            ..KeyPerf::of("lseek", req, ino.0)
+        };
+        self.spawn(key, async move {
+            let whence = match whence {
+                libc::SEEK_DATA => Whence::Data,
+                libc::SEEK_HOLE => Whence::Hole,
+                _ => return fail(reply, Errno::EINVAL),
+            };
+            // A negative offset is past every end to Linux too.
+            let Ok(offset) = u64::try_from(offset) else {
+                return fail(reply, Errno::ENXIO);
+            };
+            if shared.client.handles().may_be_dirty(ino.0) {
+                return fail(reply, Errno::EINVAL);
+            }
+            match shared.client.lseek(fh.0, offset, whence).await {
+                Ok(found) => match i64::try_from(found) {
+                    Ok(found) => {
+                        reply.offset(found);
+                        Outcome::default()
+                    }
+                    Err(_) => {
+                        tracing::warn!(fh = fh.0, found, "lseek reply is past any file offset");
+                        fail(reply, Errno::EIO)
+                    }
+                },
                 Err(e) => fail(reply, errno(&e)),
             }
         });

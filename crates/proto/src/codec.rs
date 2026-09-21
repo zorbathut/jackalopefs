@@ -327,10 +327,15 @@ mod tests {
                 len: MAX_FALLOCATE,
                 mode: 3,
             },
+            Request::Lseek {
+                fh: 1,
+                offset: 4096,
+                whence: Whence::Hole,
+            },
         ]
     }
 
-    const REQUEST_VARIANTS: usize = 28;
+    const REQUEST_VARIANTS: usize = 29;
 
     fn variant_index(req: &Request) -> usize {
         match req {
@@ -362,10 +367,11 @@ mod tests {
             Request::Access { .. } => 25,
             Request::CopyFileRange { .. } => 26,
             Request::Fallocate { .. } => 27,
+            Request::Lseek { .. } => 28,
         }
     }
 
-    const RESPONSE_VARIANTS: usize = 13;
+    const RESPONSE_VARIANTS: usize = 14;
 
     fn response_index(resp: &Response) -> usize {
         match resp {
@@ -382,6 +388,7 @@ mod tests {
             Response::Statfs(_) => 10,
             Response::Xattr(_) => 11,
             Response::Copied(_) => 12,
+            Response::Seeked(_) => 13,
         }
     }
 
@@ -438,6 +445,7 @@ mod tests {
             }),
             Response::Xattr(b"a\0b\0".to_vec()),
             Response::Copied(1 << 26),
+            Response::Seeked(u64::MAX),
         ]
     }
 
@@ -763,7 +771,7 @@ mod tests {
             Err(ErrorCodec::Decode(ErrorDecode::NotInSchema(n))) if n == unknown
         ));
 
-        // A readdir reply: root struct (8 data + 8 pointer), list tag word (8), then the first DirEntry whose kind is at bits 128..144.
+        // A readdir reply: root struct (16 data + 8 pointer), list tag word (8), then the first DirEntry whose kind is at bits 128..144.
         let entry = DirEntry {
             ino: 1,
             next_offset: 2,
@@ -774,7 +782,7 @@ mod tests {
             entries: vec![entry],
             end: false,
         });
-        let kind_at = ROOT_DATA + 16 + 8 + 16;
+        let kind_at = ROOT_DATA + 24 + 8 + 16;
         assert_eq!(
             &body[kind_at..kind_at + 2],
             &6u16.to_le_bytes(),
@@ -785,17 +793,34 @@ mod tests {
             decode::<Response>(&body),
             Err(ErrorCodec::Decode(ErrorDecode::NotInSchema(99)))
         ));
+
+        // An lseek's whence shares the first data word with the union tag, at bits 16..32.
+        let mut body = frame_body(&Request::Lseek {
+            fh: 1,
+            offset: 0,
+            whence: Whence::Hole,
+        });
+        assert_eq!(
+            &body[ROOT_DATA + 2..ROOT_DATA + 4],
+            &1u16.to_le_bytes(),
+            "layout assumption"
+        );
+        body[ROOT_DATA + 2..ROOT_DATA + 4].copy_from_slice(&2u16.to_le_bytes());
+        assert!(matches!(
+            decode::<Request>(&body),
+            Err(ErrorCodec::Decode(ErrorDecode::NotInSchema(2)))
+        ));
     }
 
     /// A composite list's tag word carries the element count and the element size; with a zero element size the count is limited only by the traversal budget, so a tiny frame could otherwise decode into a huge `Vec`.
     #[test]
     fn a_list_cannot_declare_more_elements_than_the_frame_has_words() {
-        // Response { readdir = [] }: root data (8), root pointer to the list (8), then the list tag word at body offset 32 for a zero-length composite list.
+        // Response { readdir = [] }: root data (16), root pointer to the list (8), then the list tag word at body offset 40 for a zero-length composite list.
         let mut body = frame_body(&Response::Readdir {
             entries: Vec::new(),
             end: false,
         });
-        let list_ptr = ROOT_DATA + 8;
+        let list_ptr = ROOT_DATA + 16;
         // A composite list pointer: kind 1, element size 7 (composite), word count in the upper 29 bits; the tag word after it holds the element count.
         let tag_at = list_ptr + 8;
         assert!(body.len() >= tag_at + 8, "layout assumption");
@@ -1026,11 +1051,11 @@ mod tests {
             end: true,
         };
         let cases: [(&str, Vec<u8>, &str); 6] = [
-            ("readdir", frame_body(&readdir), "00000000090000000000000001000100010000000800000001000000270000000400000003000100030000000000000004000000000000000100000000000000010000000a0000006e00000000000000"),
+            ("readdir", frame_body(&readdir), "000000000a00000000000000020001000100000008000000000000000000000001000000270000000400000003000100030000000000000004000000000000000100000000000000010000000a0000006e00000000000000"),
             ("hello", frame_body(&hellos[1]), "000000000a0000000000000002000200080706050403020101000100000000000500000032000000040000000100010073656372657400000300000000000000010000008200000007070707070707070707070707070707"),
             ("reply", frame_body(&replies[0]), "0000000006000000000000000200010001000000000000000100000000000000010000008200000001010101010101010101010101010101"),
             ("request", frame_body(&Request::Rename { parent: path("a"), name: name("b"), newparent: path("c"), newname: name("d"), flags: 1 }), "000000001100000000000000060004000900000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000d0000000e000000110000000a000000110000000e000000150000000a000000010000000a00000061000000000000006200000000000000010000000a00000063000000000000006400000000000000"),
-            ("response", frame_body(&Response::Entry(sample_attr(9))), "000000001500000000000000010001000000000001000000000000000c00010009000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e80300000010000000000000000000000100000000000000010000001600000005000000320000000500000082000000757365722e6b000073656375726974792e73656c696e7578"),
+            ("response", frame_body(&Response::Entry(sample_attr(9))), "0000000016000000000000000200010000000000010000000000000000000000000000000c00010009000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e80300000010000000000000000000000100000000000000010000001600000005000000320000000500000082000000757365722e6b000073656375726974792e73656c696e7578"),
             ("event", frame_body(&event), "00000000110000000000000000000100010000004f0000000c0000000100020000000000000000001d00000006000000190000000a0000000100000000000000150000001600000000000000000000000200000000000000000000000000000000000000000000006600000000000000050000000a000000050000000a00000061000000000000006600000000000000"),
         ];
         for (what, actual, expected) in cases {

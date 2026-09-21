@@ -219,6 +219,68 @@ async fn fallocate_is_split_into_requests_the_server_accepts() {
 }
 
 #[tokio::test]
+async fn lseek_finds_data_and_holes_on_the_server() {
+    use jackalopefs_proto::Whence;
+    use std::os::unix::fs::FileExt;
+    let export = tempfile::tempdir().unwrap();
+    let file = fs::File::create(export.path().join("sparse")).unwrap();
+    file.write_all_at(b"data", 1 << 20).unwrap();
+    file.set_len(2 << 20).unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = server.client().await;
+    let ino = client
+        .lookup(Path::root(), name("sparse"))
+        .await
+        .unwrap()
+        .ino;
+    let (fh, _) = client
+        .open(ino, path("sparse"), libc::O_RDONLY)
+        .await
+        .unwrap();
+    let local = |offset: i64, whence| lseek_local(&file, offset, whence);
+    for offset in [0u64, 1 << 20, (1 << 20) + 4096] {
+        assert_eq!(
+            client
+                .lseek(fh, offset, Whence::Data)
+                .await
+                .map_err(|e| e.errno()),
+            local(offset as i64, libc::SEEK_DATA),
+            "data from {offset}"
+        );
+        assert_eq!(
+            client
+                .lseek(fh, offset, Whence::Hole)
+                .await
+                .map_err(|e| e.errno()),
+            local(offset as i64, libc::SEEK_HOLE),
+            "hole from {offset}"
+        );
+    }
+    assert_eq!(
+        client
+            .lseek(fh, 2 << 20, Whence::Data)
+            .await
+            .unwrap_err()
+            .errno(),
+        libc::ENXIO
+    );
+    client.release(fh).await.unwrap();
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// `lseek(2)` on a local file, as the offset found or the errno.
+fn lseek_local(file: &fs::File, offset: i64, whence: i32) -> Result<u64, i32> {
+    use std::os::fd::AsRawFd;
+    let found = unsafe { libc::lseek(file.as_raw_fd(), offset, whence) };
+    if found < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap())
+    } else {
+        Ok(found as u64)
+    }
+}
+
+#[tokio::test]
 async fn unlink_while_open_and_stale_open() {
     let export = tempfile::tempdir().unwrap();
     let server = TestServer::start(export.path(), None).await;
@@ -679,6 +741,11 @@ async fn handles_are_reopened_and_verified_after_a_server_restart() {
         "handle to a replaced inode must not silently read the new file: {err}"
     );
     assert_eq!(err.errno(), libc::ESTALE);
+    let err = client
+        .lseek(swap_fh, 0, jackalopefs_proto::Whence::Data)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Stale), "{err}");
     for (fh_in, fh_out) in [(swap_fh, keep_fh), (keep_fh, swap_fh)] {
         let err = client
             .copy_file_range(fh_in, 0, fh_out, 0, 1)

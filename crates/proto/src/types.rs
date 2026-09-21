@@ -141,6 +141,13 @@ impl fmt::Debug for Path {
     }
 }
 
+/// What an `lseek` looks for from its offset: `SEEK_DATA` or `SEEK_HOLE`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Whence {
+    Data,
+    Hole,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileKind {
     Regular,

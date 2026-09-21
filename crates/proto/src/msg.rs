@@ -182,6 +182,12 @@ pub enum Request {
         len: u64,
         mode: i32,
     },
+    /// `lseek(2)` for the next data or hole in an open file.
+    Lseek {
+        fh: u64,
+        offset: u64,
+        whence: Whence,
+    },
 }
 
 impl Request {
@@ -196,6 +202,7 @@ impl Request {
             | Request::Release { fh }
             | Request::Fsync { fh, .. }
             | Request::Fallocate { fh, .. }
+            | Request::Lseek { fh, .. }
             | Request::Opendir { fh, .. }
             | Request::Readdir { fh, .. }
             | Request::Releasedir { fh } => [Some(*fh), None],
@@ -234,6 +241,7 @@ impl Request {
             Request::Fallocate {
                 fh, offset, len, ..
             } => (Some(*fh), Some(*offset), Some(*len)),
+            Request::Lseek { fh, offset, .. } => (Some(*fh), Some(*offset), None),
             Request::CopyFileRange {
                 fh_out,
                 offset_out,
@@ -276,6 +284,7 @@ impl Request {
             Request::Access { .. } => "access",
             Request::CopyFileRange { .. } => "copy_file_range",
             Request::Fallocate { .. } => "fallocate",
+            Request::Lseek { .. } => "lseek",
         }
     }
 }
@@ -299,6 +308,8 @@ pub enum Response {
     Written(u32),
     /// copy_file_range: how many bytes the server copied
     Copied(u32),
+    /// lseek: the offset found
+    Seeked(u64),
     /// `end`: no entry follows the last one, so the client may answer a read at its `next_offset` itself; meaningless with no entries.
     Readdir {
         entries: Vec<DirEntry>,

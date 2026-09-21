@@ -106,11 +106,19 @@ impl HandleTable {
             .map(|(fh, _)| *fh)
     }
 
-    /// Whether a live handle on `nodeid` was opened for writing, in which case the kernel may hold dirty pages for it.
+    /// Whether a live handle on `nodeid` was opened for writing, in which case the kernel may hold dirty pages for it that it can still write back; through a dead handle a write fails at once, so [`Self::may_be_dirty`] is the question when the pages themselves matter.
     pub fn has_writer(&self, nodeid: u64) -> bool {
         self.map.lock().values().any(|r| {
             r.nodeid == nodeid && !r.is_dead() && r.flags & libc::O_ACCMODE != libc::O_RDONLY
         })
+    }
+
+    /// Whether the kernel may hold pages for `nodeid` that the server has not seen: some handle on it was opened for writing and the kernel has not released it. A dead handle counts, since what a reconnect did to the handle did nothing to the kernel's pages.
+    pub fn may_be_dirty(&self, nodeid: u64) -> bool {
+        self.map
+            .lock()
+            .values()
+            .any(|r| r.nodeid == nodeid && r.flags & libc::O_ACCMODE != libc::O_RDONLY)
     }
 
     /// Node ids of every live handle, for post-reconnect invalidation.
@@ -235,13 +243,22 @@ mod tests {
             HandleKind::Dir,
         );
         assert!(!table.has_writer(42));
+        assert!(!table.may_be_dirty(42));
         let w = table.alloc();
         let rec_w = table.insert(w, 42, Path::root(), libc::O_RDWR, HandleKind::File);
         assert!(table.has_writer(42));
         assert!(!table.has_writer(43));
+        assert!(table.may_be_dirty(42));
+        assert!(!table.may_be_dirty(43));
         table.apply_reopen(w, &rec_w, Ok(Response::Opened { attr: attr(99) }));
         assert!(rec_w.is_dead());
         assert!(!table.has_writer(42));
+        assert!(
+            table.may_be_dirty(42),
+            "the kernel still holds what was written through a handle that died"
+        );
+        table.remove(w);
+        assert!(!table.may_be_dirty(42));
         let w2 = table.alloc();
         table.insert(
             w2,
