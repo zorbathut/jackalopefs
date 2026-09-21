@@ -1,0 +1,40 @@
+# Expected failures of scripts/validate/fsstress.sh in user mode: one `op RESULT` line per failing pair, as scripts/validate/fsstress-parse.sh writes them to failed.txt. A pair failing that is not listed here fails the suite; so does any operation failing with a result that means the mount broke (FSSTRESS_DENIED in fsstress-parse.sh), listed or not. The run is deterministic (every fsstress process has its own seed and directory), so a pair listed here that stops failing is news too, and is reported.
+# Every entry sits under the reason that explains it, and the reasons were established by experiment, not read off the errno. A run with per-request tracing on both sides (RUST_LOG=info,jackalopefs_client::perf=trace,jackalopefs_server::perf=trace) shows which layer refused: the client's kernel (no request reaches the daemon), the daemon (a kernel-level row with the errno and no call to the server) or the server (a server row). scripts/validate/fsstress-native.sh runs the same fsstress directly on the export's filesystem and shows what fails there too; that is evidence in one direction only, since a native run draws the same operations but, once any outcome differs, not the same targets. An entry with no established reason is a bug to report, not a line to add. docs/validation.md has the verdict on each group: inherent, fixable, or noise. To re-record after a deliberate change, take the new lines from validation/results/fsstress/failed.txt, put each under its reason, and update the line below from the suite's log.
+# What fails depends on the op sequence (seed, process count, op count, and the fsstress build, whose operation table depends on the libraries it found) and on the export's filesystem, so the list is held against a run only when all of those match:
+# recorded with: seed=1 procs=4 ops=1000 export_fs=ext2/ext3 fsstress=6b39fd31e42f
+
+# The client's kernel refuses these itself and no request reaches the daemon: FUSE has no remap_file_range, so clone and dedupe are EOPNOTSUPP on every FUSE filesystem; fuse_file_fallocate forwards only keep-size, punch-hole and zero-range and answers EOPNOTSUPP for any other mode; and a punch without keep-size is refused by vfs_fallocate whatever the filesystem. Natively on ext4 they fail too, ext4 having none of them, with its own EINVAL for an unaligned collapse or insert without keep-size.
+clonerange EOPNOTSUPP
+deduperange EOPNOTSUPP
+fallocate(COLLAPSE_RANGE) EOPNOTSUPP
+fallocate(INSERT_RANGE) EOPNOTSUPP
+fallocate(KEEP_SIZE|COLLAPSE_RANGE) EOPNOTSUPP
+fallocate(KEEP_SIZE|INSERT_RANGE) EOPNOTSUPP
+fallocate(KEEP_SIZE|UNSHARE_RANGE) EOPNOTSUPP
+fallocate(PUNCH_HOLE) EOPNOTSUPP
+fallocate(UNSHARE_RANGE) EOPNOTSUPP
+fallocate(WRITE_ZEROES) EOPNOTSUPP
+
+# ioctls. The daemon answers every ioctl that reaches it with ENOTTY; the trace shows XFS_IOC_EXCHANGE_RANGE for exchangerange, XFS_IOC_FSBULKSTAT_SINGLE for bulkstat1, FS_IOC_GETFLAGS for getattr and FS_IOC_FSGETXATTR for setxattr, and BTRFS_IOC_SUBVOL_CREATE_V2 for subvol_create, which reports libbtrfsutil's error code, hence btrfsutil(16). fsstress prints what the call returned, -1, for getattr, setxattr and FIEMAP. Half of the getattr and setxattr failures never get as far as an ioctl: for a directory or a symlink fsstress's own open(O_RDWR) fails and it runs the ioctl on descriptor -1. FIEMAP never reaches the daemon, FUSE having no fiemap operation. All of these fail natively on ext4 as well, which has no XFS or btrfs ioctls and rejects fsstress's random FIEMAP flags.
+bulkstat1 ENOTTY
+exchangerange ENOTTY
+getattr -1
+ioctl(FIEMAP) -1
+setxattr -1
+subvol_create btrfsutil(16)
+
+# Device nodes. fsstress's mknod makes the character device 0/0, which the server refuses with EPERM like every device node, whatever its privilege (docs/design.md, Known limitations); the trace shows the server answering. This one is ours: natively the same mknod succeeds even unprivileged, because 0/0 is the whiteout device, which needs no CAP_MKNOD. With no device ever created, fsstress's whiteout renames find no source and never run.
+mknod EPERM
+
+# The export's filesystem's own answers, passed through from the server (server rows in the trace) and the same natively: reading or removing an extended attribute that is not there (ENODATA), setting one with XATTR_CREATE where it exists (EEXIST), and removing a directory that is not empty.
+getfattr ENODATA
+removefattr ENODATA
+rmdir ENOTEMPTY
+setfattr EEXIST
+
+# Renaming a directory into its own subtree, refused by the client's kernel (no request reaches the daemon) as it is natively.
+rename() EINVAL
+rename(NOREPLACE) EINVAL
+
+# chown to a random uid by a server that is not root: the server's fchown fails with EPERM (a server row in the trace), as the same chown does natively.
+chown EPERM

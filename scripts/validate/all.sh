@@ -4,7 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 source ./lib.sh
 
-suites=(pjdfstest fsx fsstress fio sparse resilience coherence)
+# selftest first: the suites' verdicts rest on the parsers it checks.
+suites=(selftest pjdfstest fsx fsstress fio sparse resilience coherence)
 [ "$(id -u)" = 0 ] && suites+=(permissions)
 # Enough for the longest suite, fsx with three tool runs, plus start-up and teardown; the tool deadline inside a suite therefore always fires first, and that is the one that collects diagnostics.
 budget=$(( 3 * TOOL_TIMEOUT + 300 ))
