@@ -715,6 +715,52 @@ async fn session_resumes_after_a_connection_drop() {
     server.stop().await;
 }
 
+/// A server that comes back serving another directory is another export, whatever its paths lead to. The file here is even the same file, hardlinked into the second directory, so reopening it by path would find nothing amiss: it is the root that says the mount is no longer where it was.
+#[tokio::test]
+async fn a_server_that_returns_with_another_export_stales_every_handle() {
+    let first_export = tempfile::tempdir().unwrap();
+    let second_export = tempfile::tempdir().unwrap();
+    fs::write(first_export.path().join("f"), b"contents").unwrap();
+    fs::hard_link(
+        first_export.path().join("f"),
+        second_export.path().join("f"),
+    )
+    .unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let identity = jackalopefs_server::tls::Identity::generate().unwrap();
+    let first = TestServer::start_with(first_export.path(), None, socket, identity.clone()).await;
+    let client = jackalopefs_client::Client::connect(config_for(
+        first.addr,
+        first.fingerprint,
+        Auth::Anonymous,
+        Duration::from_secs(10),
+    ))
+    .await
+    .unwrap();
+    let (fh, _) = client
+        .open(path("f"), libc::O_RDONLY, |attr| Ok(attr.ino))
+        .await
+        .unwrap();
+    assert_eq!(client.read(fh, 0, 100).await.unwrap(), b"contents");
+
+    first.stop().await;
+    let socket = wait_for(Duration::from_secs(5), "port to be free again", || {
+        std::net::UdpSocket::bind(("127.0.0.1", port)).ok()
+    })
+    .await;
+    let second = TestServer::start_with(second_export.path(), None, socket, identity).await;
+    wait_for_generation(&client, 2).await;
+    let err = client.read(fh, 0, 100).await.unwrap_err();
+    assert!(matches!(err, Error::Stale), "{err}");
+    let root = client.getattr(Some(Path::root()), None).await.unwrap();
+    assert_eq!(root.ino, 1, "the new root is the root");
+
+    client.release(fh).await.unwrap();
+    client.shutdown().await;
+    second.stop().await;
+}
+
 #[tokio::test]
 async fn handles_are_reopened_and_verified_after_a_server_restart() {
     let export = tempfile::tempdir().unwrap();

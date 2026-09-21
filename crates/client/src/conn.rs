@@ -179,6 +179,7 @@ async fn run(
     let mut first = Some(first);
     let mut resume: Option<Resume> = None;
     let mut generation = 0u64;
+    let mut root_mounted: Option<KeyRoot> = None;
     let mut backoff = BACKOFF_MIN;
     let mut failures = 0u32;
     loop {
@@ -234,6 +235,15 @@ async fn run(
             attached.addr
         );
 
+        // The mount is of one directory. If the server now serves another one here (the export replaced or restored, a filesystem whose handles did not survive a remount), every name may lead to another file: nothing open can be reopened by its path, and what the kernel caches is swept as after any reconnect.
+        if root_mounted
+            .as_ref()
+            .is_some_and(|mounted| *mounted != root)
+        {
+            tracing::error!(was = ?root_mounted, now = ?root, "the server's export is not the directory this mount attached to; every open file is stale");
+            handles.kill_all();
+        }
+        root_mounted = Some(root.clone());
         if !resumed {
             tokio::select! {
                 _ = reopen_handles(&conn, &root, &handles, cfg.offline_timeout) => {}

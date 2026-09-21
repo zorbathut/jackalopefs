@@ -146,6 +146,13 @@ impl HandleTable {
             .collect()
     }
 
+    /// Every handle is stale: what the paths led to is gone.
+    pub fn kill_all(&self) {
+        for rec in self.map.lock().values() {
+            rec.mark_dead();
+        }
+    }
+
     /// Judge a reopen reply: the same file keeps the handle alive, anything else kills it. The same inode number is not the same file: numbers are recycled, and a server restart is ample time.
     pub fn apply_reopen(
         &self,
