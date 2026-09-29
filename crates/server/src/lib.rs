@@ -5,6 +5,7 @@
 pub mod dirents;
 pub mod export;
 pub mod handles;
+pub mod ids;
 pub mod ops;
 pub mod perf;
 pub mod session;

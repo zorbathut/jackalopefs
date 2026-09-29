@@ -4,6 +4,7 @@
 
 pub mod codec;
 pub mod msg;
+pub mod owners;
 pub mod types;
 pub mod wire;
 

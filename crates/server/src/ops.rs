@@ -3,7 +3,9 @@
 use crate::dirents::{read_dir_fd, Entries};
 use crate::export::{kind_from_mode, proc_path, Export};
 use crate::handles::{Handle, Handles};
+use crate::ids::IdMap;
 use crate::watch::ChangeLog;
+use jackalopefs_proto::owners::reads_posix_acl;
 use jackalopefs_proto::{
     Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, Whence, MAX_FALLOCATE, MAX_IO,
     NAME_MAX,
@@ -54,13 +56,21 @@ pub struct Ops {
     pub handles: Arc<Handles>,
     pub session_id: u64,
     pub changes: Arc<ChangeLog>,
+    pub ids: IdMap,
 }
 
-/// Run one request; every failure becomes an errno for the client. Running out of file descriptors, whether the session's cap or the process's limit, is logged with what this session holds, since the handles of every session share that limit.
+/// Run one request; every failure becomes an errno for the client. The owner policy (`--ids`) is checked before anything is touched and applied to what goes back. Running out of file descriptors, whether the session's cap or the process's limit, is logged with what this session holds, since the handles of every session share that limit.
 pub fn dispatch(ops: &Ops, req: Request) -> Response {
     let op = req.op_name();
+    if let Err(errno) = ops.ids.admit(&req) {
+        return Response::Err(errno as i32);
+    }
+    let posix_acl_read = reads_posix_acl(&req);
     match ops.run(req) {
-        Ok(resp) => resp,
+        Ok(mut resp) => {
+            ops.ids.reply(posix_acl_read, &mut resp);
+            resp
+        }
         Err(errno @ (Errno::EMFILE | Errno::ENFILE)) => {
             let open_handles = ops.handles.len();
             if open_handles >= ops.handles.max() {
@@ -690,6 +700,8 @@ fn statfs<F: AsFd>(fd: &F) -> Result<Statfs, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::ModeIds;
+    use jackalopefs_proto::owners::NOBODY;
     use jackalopefs_proto::FileKind;
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -705,6 +717,7 @@ mod tests {
                 handles: Arc::new(Handles::new(crate::handles::MAX_HANDLES)),
                 session_id: 1,
                 changes: Arc::new(ChangeLog::default()),
+                ids: IdMap::of_process(ModeIds::Direct).unwrap(),
             },
         )
     }
@@ -1724,5 +1737,132 @@ mod tests {
         );
         assert_eq!(dispatch(&ops, Request::Release { fh: 1 }), Response::Ok);
         assert!(matches!(dispatch(&ops, open(2)), Response::Opened { .. }));
+    }
+
+    fn flattening(ops: Ops) -> Ops {
+        Ops {
+            ids: IdMap::of_process(ModeIds::Flatten).unwrap(),
+            ..ops
+        }
+    }
+
+    /// A valid access ACL granting `rw-` to the owner, the owning group, others, and the named user `uid`.
+    fn acl_naming(uid: u32) -> Vec<u8> {
+        let mut blob = 2u32.to_le_bytes().to_vec();
+        for (tag, id) in [
+            (0x01u16, u32::MAX),
+            (0x02, uid),
+            (0x04, u32::MAX),
+            (0x10, u32::MAX),
+            (0x20, u32::MAX),
+        ] {
+            blob.extend(tag.to_le_bytes());
+            blob.extend(6u16.to_le_bytes());
+            blob.extend(id.to_le_bytes());
+        }
+        blob
+    }
+
+    fn set_acl(name: &str, value: Vec<u8>) -> Request {
+        Request::Setxattr {
+            path: path(name),
+            name: b"system.posix_acl_access".to_vec(),
+            value,
+            flags: 0,
+        }
+    }
+
+    fn get_acl(name: &str) -> Request {
+        Request::Getxattr {
+            path: path(name),
+            name: b"system.posix_acl_access".to_vec(),
+        }
+    }
+
+    /// An owner may name any uid in an ACL, so the kernel alone would allow this; refusing it is the server's own policy.
+    #[test]
+    fn flatten_refuses_an_acl_naming_another_user_that_the_kernel_would_allow() {
+        let (dir, ops) = fixture();
+        fs::write(dir.path().join("f"), b"").unwrap();
+        let direct = dispatch(&ops, set_acl("f", acl_naming(4242)));
+        if direct == Response::Err(Errno::EOPNOTSUPP as i32) {
+            eprintln!("skipping: filesystem does not support POSIX ACLs");
+            return;
+        }
+        assert_eq!(direct, Response::Ok);
+        assert_eq!(
+            dispatch(&ops, get_acl("f")),
+            Response::Xattr(acl_naming(4242))
+        );
+
+        let ops = flattening(ops);
+        assert_eq!(
+            dispatch(&ops, get_acl("f")),
+            Response::Xattr(acl_naming(NOBODY))
+        );
+        fs::write(dir.path().join("g"), b"").unwrap();
+        assert_eq!(
+            dispatch(&ops, set_acl("g", acl_naming(4243))),
+            Response::Err(Errno::EPERM as i32)
+        );
+        assert_eq!(
+            dispatch(&ops, set_acl("g", acl_naming(NOBODY))),
+            Response::Err(Errno::EPERM as i32)
+        );
+        let own = nix::unistd::geteuid().as_raw();
+        assert_eq!(dispatch(&ops, set_acl("g", acl_naming(own))), Response::Ok);
+        assert_eq!(
+            dispatch(&ops, get_acl("g")),
+            Response::Xattr(acl_naming(own))
+        );
+    }
+
+    /// A refused chown is refused whole: the chmod that came with it is not applied either. The group is one the user is in besides their own, which the kernel would let them give the file, so the refusal is the server's.
+    #[test]
+    fn flatten_refuses_a_chown_before_changing_anything() {
+        let egid = nix::unistd::getegid();
+        let Some(other) = nix::unistd::getgroups()
+            .unwrap()
+            .into_iter()
+            .find(|g| *g != egid)
+        else {
+            eprintln!("skipping: the user is in no group besides their own");
+            return;
+        };
+        let (dir, ops) = fixture();
+        let file = dir.path().join("f");
+        fs::write(&file, b"").unwrap();
+        let chgrp = |gid: u32| Request::Setattr {
+            path: Some(path("f")),
+            fh: None,
+            set: SetAttr {
+                mode: Some(0o600),
+                gid: Some(gid),
+                ..SetAttr::default()
+            },
+        };
+        let refresh = |mode| fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+
+        refresh(0o644);
+        let attr = expect_attr(dispatch(&ops, chgrp(other.as_raw())));
+        assert_eq!(
+            (attr.gid, attr.perm & 0o7777),
+            (other.as_raw(), 0o600),
+            "direct applies what the kernel allows"
+        );
+
+        let ops = flattening(ops);
+        refresh(0o644);
+        assert_eq!(
+            dispatch(&ops, chgrp(other.as_raw())),
+            Response::Err(Errno::EPERM as i32)
+        );
+        assert_eq!(
+            fs::metadata(&file).unwrap().mode() & 0o7777,
+            0o644,
+            "nothing of a refused setattr is applied"
+        );
+        let attr = expect_attr(dispatch(&ops, chgrp(egid.as_raw())));
+        assert_eq!((attr.gid, attr.perm & 0o7777), (egid.as_raw(), 0o600));
     }
 }

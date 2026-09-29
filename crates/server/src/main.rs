@@ -1,6 +1,7 @@
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use jackalopefs_server::export::Export;
+use jackalopefs_server::ids::{IdMap, ModeIds};
 use jackalopefs_server::session::{self, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch};
@@ -30,6 +31,9 @@ struct Args {
     /// Require clients to present this token.
     #[arg(long)]
     token: Option<String>,
+    /// Which file owners clients see and may set. `flatten`: only this process's own uid and gid, every other owner shown as nobody and refused in chown and POSIX ACLs (every other `system.*` attribute, other ACL formats among them, is refused). `direct`: every owner as the filesystem has it, and any id a client asks for, as far as this process's privileges allow.
+    #[arg(long, value_enum, default_value_t = ModeIds::Flatten)]
+    ids: ModeIds,
     /// Log a per-operation performance summary this often (e.g. `5s`); SIGUSR1 logs one at any time.
     #[arg(long, value_parser = humantime::parse_duration)]
     perf_interval: Option<Duration>,
@@ -138,6 +142,17 @@ fn main() -> anyhow::Result<()> {
         limits.handles_per_session
     );
 
+    let ids = IdMap::of_process(args.ids).map_err(anyhow::Error::msg)?;
+    tracing::info!(
+        "owners: --ids {} as uid {} gid {}",
+        args.ids
+            .to_possible_value()
+            .expect("every mode has a name")
+            .get_name(),
+        ids.uid,
+        ids.gid
+    );
+
     let state_dir = match args.state_dir {
         Some(dir) => dir,
         None => default_state_dir()?,
@@ -166,7 +181,9 @@ fn main() -> anyhow::Result<()> {
         let (events, _) = broadcast::channel::<Arc<EventBatch>>(256);
         let changes = Arc::new(ChangeLog::default());
         let _watcher = watch::spawn(&args.export, changes.clone(), events.clone());
-        let server = Arc::new(Server::new(export, args.token, events, changes, limits));
+        let server = Arc::new(Server::new(
+            export, args.token, events, changes, limits, ids,
+        ));
 
         let closer = {
             let endpoint = endpoint.clone();

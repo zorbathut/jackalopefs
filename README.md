@@ -13,10 +13,10 @@ Jackalope FS has been used by exactly one person in exactly one situation. You s
 Server:
 
 ```
-jackalopefs-server --export /srv/share --listen 0.0.0.0:1933 [--token SECRET]
+jackalopefs-server --export /srv/share --listen 0.0.0.0:1933 [--token SECRET] [--ids flatten|direct]
 ```
 
-On first start it generates a certificate under `$XDG_STATE_HOME/jackalopefs` (or `~/.local/state/jackalopefs`) and logs its fingerprint. The default listen address is loopback, port 1933; anything else without `--token` lets every host that can reach the port read and write the export as the server user. On your own head be it.
+On first start it generates a certificate under `$XDG_STATE_HOME/jackalopefs` (or `~/.local/state/jackalopefs`) and logs its fingerprint. The default listen address is loopback, port 1933; anything else without `--token` lets every host that can reach the port read and write the export as the server user. On your own head be it. `--ids flatten`, the default, lets only the server user's own uid and gid reach clients (every other owner shows as nobody) and refuses to give files to anyone else; `--ids direct` passes owners through both ways (`docs/design.md`, "Ownership").
 
 Client:
 

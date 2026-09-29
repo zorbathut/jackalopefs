@@ -13,6 +13,8 @@ ATTR_TTL=1
 # Deadline on every external tool run (fs_run); all.sh derives its per-suite budget from it.
 TOOL_TIMEOUT=${JFS_TOOL_TIMEOUT:-600}
 export JFS_OFFLINE_TIMEOUT=${JFS_OFFLINE_TIMEOUT:-15s}
+# The server's owner mode (--ids) for server_start. The suites check conformance, which needs real owners and chown to other users, so the server passes owners through unless a suite says otherwise.
+JFS_SERVER_IDS=${JFS_SERVER_IDS:-direct}
 
 SERVER_PID=
 PORT=
@@ -92,7 +94,7 @@ server_start() {
     before=$(grep -c "exporting .* on 127.0.0.1:" "$RESULTS/server.log" 2>/dev/null || true)
     before=${before:-0}
     # Descriptors 3-9 are closed for the child: a suite that holds a file on the mount open while restarting the server would otherwise hand that file to the server, which then pins the mount.
-    RUST_LOG=${RUST_LOG:-info} "$BIN/jackalopefs-server" --export "$EXPORT" --listen "127.0.0.1:${PORT:-0}" --state-dir "$STATE" >> "$RESULTS/server.log" 2>&1 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&- &
+    RUST_LOG=${RUST_LOG:-info} "$BIN/jackalopefs-server" --export "$EXPORT" --listen "127.0.0.1:${PORT:-0}" --state-dir "$STATE" --ids "$JFS_SERVER_IDS" >> "$RESULTS/server.log" 2>&1 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&- &
     SERVER_PID=$!
     wait_for 15 sh -c "[ \"\$(grep -c 'exporting .* on 127.0.0.1:' '$RESULTS/server.log')\" -gt $before ]" || fail "server did not start: $(tail -5 "$RESULTS/server.log")"
     PORT=$(grep -o 'on 127.0.0.1:[0-9]*' "$RESULTS/server.log" | tail -1 | cut -d: -f2)

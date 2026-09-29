@@ -23,6 +23,7 @@
 
 ### Breaking
 
+- `jackalopefs-server --ids flatten` is the default: only the server's own uid and gid reach clients, every other owner goes out as nobody (65534) in attributes and in POSIX ACLs, and a chown or ACL naming another id is refused with `EPERM`, an ACL that does not parse with `EINVAL`, and any other `system.*` attribute (other ACL formats among them) with `EOPNOTSUPP`. It refuses to start as uid or gid 65534. `--ids direct` is the previous behaviour, owners passed through both ways; `docs/design.md`, "Ownership", has both, and "Known limitations" what flattening costs (supplementary groups, setgid under `--default-permissions`, tools that copy a group). The validation suites run the server with `--ids direct`.
 - Protocol revision: the hello's `Ack` carries the server's effective uid and gid. Client and server must be rebuilt together.
 - Protocol revision: every `Attr` carries the file's identity (its `name_to_handle_at` handle) and whether it lies outside the export root's subvolume, the hello's `Ack` carries the root's, and the server no longer rewrites the root's inode number to 1. A directory entry with attributes is 32 bytes larger with ext4's handles. Client and server must be rebuilt together.
 - `jackalopefs-server` refuses to export a directory on a filesystem that gives no file handles, which with Linux 6.5 or later is none, and before that one that cannot be exported over NFS either (overlayfs without `nfs_export`). Files outside the export root's subvolume change their `st_ino`.

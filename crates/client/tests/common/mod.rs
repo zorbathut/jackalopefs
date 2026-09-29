@@ -5,6 +5,7 @@
 use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::{read_frame, write_frame, Auth, Hello, HelloReply, Request, Response};
 use jackalopefs_server::export::Export;
+use jackalopefs_server::ids::{IdMap, ModeIds};
 use jackalopefs_server::session::{self, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch, WatcherHandle};
@@ -44,6 +45,7 @@ impl TestServer {
             UdpSocket::bind("127.0.0.1:0").unwrap(),
             Identity::generate().unwrap(),
             false,
+            ModeIds::Direct,
         )
         .await
     }
@@ -55,7 +57,7 @@ impl TestServer {
         socket: UdpSocket,
         identity: Identity,
     ) -> TestServer {
-        TestServer::start_full(export, token, socket, identity, true).await
+        TestServer::start_full(export, token, socket, identity, true, ModeIds::Direct).await
     }
 
     async fn start_full(
@@ -64,6 +66,7 @@ impl TestServer {
         socket: UdpSocket,
         identity: Identity,
         watched: bool,
+        ids: ModeIds,
     ) -> TestServer {
         // The server binary zeroes its umask so client modes are honoured; the in-process server needs the same.
         unsafe { libc::umask(0) };
@@ -92,6 +95,7 @@ impl TestServer {
                 connections: 64,
                 handles_per_session: jackalopefs_server::handles::MAX_HANDLES,
             },
+            IdMap::of_process(ids).unwrap(),
         ));
         let task = tokio::spawn(session::serve(endpoint.clone(), server.clone()));
         TestServer {

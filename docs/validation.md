@@ -23,6 +23,8 @@ Not used, and why: the rest of xfstests needs `TEST_DEV`/`SCRATCH_DEV` block dev
 - `fio`, `fusermount3`, `prove` (package `perl`), GNU coreutils and `util-linux`.
 - For the root-only parts: rootless `podman` (see "Deep mode").
 
+Every suite runs the server with `--ids direct` (`JFS_SERVER_IDS` in `lib.sh`): the conformance suites need owners as the filesystem has them and chown to other users, which the default hides and refuses by design (`docs/design.md`, "Ownership").
+
 `validation/` is ignored by git; it holds the tools and the results.
 
 ## Running

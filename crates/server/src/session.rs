@@ -2,6 +2,7 @@
 
 use crate::export::Export;
 use crate::handles::Handles;
+use crate::ids::IdMap;
 use crate::ops::{self, Ops};
 use crate::perf::{Outcome, Perf, Phases, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch};
@@ -185,6 +186,8 @@ pub struct Server {
     pub sessions: Arc<Sessions>,
     pub events: broadcast::Sender<Arc<EventBatch>>,
     pub changes: Arc<ChangeLog>,
+    /// Which owners cross to clients; its ids are this process's, which the hello tells every client.
+    pub ids: IdMap,
     /// Request accounting across every session.
     pub perf: Arc<Perf>,
     /// The connection of every attached session with the attachment epoch it belongs to and the tracker of its last sample, so a report can ask each for its QUIC statistics over the window; the epoch keeps a takeover's newer connection from being displaced or removed by the older one.
@@ -202,9 +205,11 @@ impl Server {
         events: broadcast::Sender<Arc<EventBatch>>,
         changes: Arc<ChangeLog>,
         limits: Limits,
+        ids: IdMap,
     ) -> Server {
         Server {
             export,
+            ids,
             sessions: Arc::new(Sessions::new(limits.handles_per_session)),
             events,
             changes,
@@ -395,6 +400,7 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         handles: session.handles.clone(),
         session_id: session.id,
         changes: server.changes.clone(),
+        ids: server.ids,
     });
     loop {
         match conn.accept_bi().await {
@@ -507,8 +513,8 @@ async fn handshake(
                     resumed,
                     root_ino: server.export.root_key().0,
                     root_identity: server.export.root_key().1.clone(),
-                    uid: nix::unistd::geteuid().as_raw(),
-                    gid: nix::unistd::getegid().as_raw(),
+                    uid: server.ids.uid,
+                    gid: server.ids.gid,
                 },
             )
             .await?;
