@@ -38,6 +38,9 @@ pub enum HelloReply {
         /// The export root's inode number and identity: on every connection, whether this is still the directory the client mounted.
         root_ino: u64,
         root_identity: Identity,
+        /// The server process's effective uid and gid, which own everything it creates.
+        uid: u32,
+        gid: u32,
     },
     Reject {
         reason: String,

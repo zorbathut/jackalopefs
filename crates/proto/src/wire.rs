@@ -450,12 +450,16 @@ impl Message for HelloReply {
                 resumed,
                 root_ino,
                 root_identity,
+                uid,
+                gid,
             } => {
                 let mut ack = b.init_ack();
                 ack.set_session_id(*session_id);
                 ack.set_resume_token(resume_token);
                 ack.set_resumed(*resumed);
                 ack.set_root_ino(*root_ino);
+                ack.set_uid(*uid);
+                ack.set_gid(*gid);
                 build_identity(ack.init_root_identity(), root_identity);
             }
             HelloReply::Reject { reason } => b.init_reject().set_reason(reason.as_str()),
@@ -474,6 +478,8 @@ impl Message for HelloReply {
                 resumed: ack.get_resumed(),
                 root_ino: ack.get_root_ino(),
                 root_identity: parse_identity(ack.get_root_identity()?)?,
+                uid: ack.get_uid(),
+                gid: ack.get_gid(),
             },
             schema::hello_reply::Which::Reject(reject) => {
                 let reason = reject
@@ -493,7 +499,7 @@ impl Message for HelloReply {
     fn size_hint(&self) -> u32 {
         BASE_WORDS
             + match self {
-                HelloReply::Ack { root_identity, .. } => 8 + words_for(root_identity.handle.len()),
+                HelloReply::Ack { root_identity, .. } => 9 + words_for(root_identity.handle.len()),
                 HelloReply::Reject { reason } => words_for_text(reason.len()),
                 HelloReply::RevisionMismatch { .. } => 1,
             }

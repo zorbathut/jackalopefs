@@ -507,6 +507,8 @@ async fn handshake(
                     resumed,
                     root_ino: server.export.root_key().0,
                     root_identity: server.export.root_key().1.clone(),
+                    uid: nix::unistd::geteuid().as_raw(),
+                    gid: nix::unistd::getegid().as_raw(),
                 },
             )
             .await?;

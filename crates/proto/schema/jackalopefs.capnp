@@ -165,6 +165,9 @@ struct HelloReply {
       # still the directory it mounted.
       rootIno @5 :UInt64;
       rootIdentity @6 :Identity;
+      # The server process's effective uid and gid: they own everything it creates and are whom its access checks run as.
+      uid @7 :UInt32;
+      gid @8 :UInt32;
     }
     reject :group {
       reason @3 :Text;

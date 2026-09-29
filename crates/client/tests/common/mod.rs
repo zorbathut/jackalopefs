@@ -182,6 +182,8 @@ impl Blackhole {
                 handle_type: 1,
                 handle: vec![2, 0, 0, 0, 0, 0, 0, 0],
             },
+            uid: 4242,
+            gid: 4343,
         }
     }
 

@@ -417,6 +417,7 @@ async fn connect_once(
             resumed,
             root_ino,
             root_identity,
+            ..
         } => Ok(Handshaken {
             conn,
             addr,
