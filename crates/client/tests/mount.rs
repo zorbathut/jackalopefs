@@ -4,6 +4,7 @@ mod common;
 
 use common::*;
 use jackalopefs_client::mount::{Mount, MountOptions};
+use jackalopefs_proto::{Request, Response};
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -218,6 +219,36 @@ impl DirStream {
             names.push(name.to_bytes().to_vec());
         }
         names
+    }
+
+    /// The names `readdir(3)` yields until at least `at_least` have come, and whatever else the same `getdents` batch held.
+    fn read_names_until(&self, at_least: usize) -> Vec<Vec<u8>> {
+        let mut names = Vec::new();
+        while names.len() < at_least {
+            // SAFETY: as in `read_names`.
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            names.push(name.to_bytes().to_vec());
+        }
+        names
+    }
+
+    /// Every entry `readdir(3)` still yields, with its `d_ino`: the dots included, when the directory lists them.
+    fn read_entries(&self) -> Vec<(Vec<u8>, u64)> {
+        let mut entries = Vec::new();
+        loop {
+            // SAFETY: as in `read_names`.
+            let entry = unsafe { libc::readdir(self.0) };
+            if entry.is_null() {
+                break;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+            entries.push((name.to_bytes().to_vec(), unsafe { (*entry).d_ino }));
+        }
+        entries
     }
 
     /// The `d_ino` of the entry called `wanted`, which `std::fs::read_dir` cannot show for the dots.
@@ -456,6 +487,43 @@ async fn large_directory_pages_through_the_kernel_correctly() {
     m.finish().await;
 }
 
+/// A readdirplus page hands the kernel attributes to cache, so it is not served from a buffer fetched longer ago than the attribute TTL; a plain page, whose numbers do not depend on attributes, still is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_old_buffer_serves_plain_pages_but_not_readdirplus() {
+    // No events: the files made below would reach the client during the wait, and each clears the end the fetch reported.
+    let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(1)).await
+    else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    // Several kernel pages, all inside the first fetch.
+    for i in 0..600 {
+        fs::write(export.join(format!("d/entry-{i:04}")), b"").unwrap();
+    }
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    for stat in [false, true] {
+        perf.report();
+        let dir = mnt.join("d");
+        blocking(move || {
+            let stream = DirStream::open(&dir);
+            // The first getdents: the first kernel page, and the fetch behind it.
+            assert!(!stream.read_names_until(1).is_empty());
+            if stat {
+                // A lookup under the directory makes the kernel ask for its next page as readdirplus.
+                fs::metadata(dir.join("entry-0000")).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1300));
+            stream.read_names();
+        })
+        .await;
+        let fetches = perf.report().call.get("readdirplus").map_or(0, |r| r.row.n);
+        assert_eq!(fetches, if stat { 2 } else { 1 }, "stat={stat}");
+    }
+    m.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_listing_longer_than_one_kernel_page_is_fetched_once() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
@@ -620,13 +688,13 @@ async fn a_handle_parked_at_the_end_reads_like_one_on_the_export() {
             "after this client's own addition"
         );
         assert!(
-            probes.report().call.contains_key("readdir"),
+            probes.report().call.contains_key("readdirplus"),
             "the parked handle asked the server again"
         );
         fs::write(export.join("d/on-the-export"), b"").unwrap();
         // The server's event for the new name arrives within its debounce window; after it the parked handle must go to the server again.
         let started = Instant::now();
-        while !probes.report().call.contains_key("readdir") {
+        while !probes.report().call.contains_key("readdirplus") {
             assert!(
                 started.elapsed() < Duration::from_secs(5),
                 "the server's event did not reach the parked handle"
@@ -1320,7 +1388,164 @@ async fn a_file_replaced_on_the_export_is_another_file_by_name_and_the_same_by_d
     m.finish().await;
 }
 
-/// What a directory listing says an entry's inode number is must be what `stat` says, for `.` and `..` too, whichever kind of page the entry came in.
+/// A scripted export: the root (inode 2, the fake server's root), a directory `d` in it, and in `d` the files `f-0000`, `f-0001`… in another subvolume, as a snapshot's are: each goes by a substitute, never by its own inode number, which the scripted numbers make plain by starting at 100.
+fn script_foreign_files(files: usize) -> impl Fn(&Request) -> Response + Send + Sync {
+    use jackalopefs_proto::{Attr, DirEntry, DirEntryPlus, FileKind, Identity, TimeSpec};
+    let attr = |ino: u64, kind: FileKind, foreign: bool, handle: Vec<u8>| Attr {
+        ino,
+        size: 0,
+        blocks: 0,
+        atime: TimeSpec { sec: 0, nsec: 0 },
+        mtime: TimeSpec { sec: 0, nsec: 0 },
+        ctime: TimeSpec { sec: 0, nsec: 0 },
+        kind,
+        perm: if kind == FileKind::Directory {
+            0o755
+        } else {
+            0o644
+        },
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        blksize: 4096,
+        xattr_names: Some(Vec::new()),
+        identity: Identity {
+            handle_type: 1,
+            handle,
+        },
+        foreign,
+    };
+    let root = attr(2, FileKind::Directory, false, vec![2, 0, 0, 0, 0, 0, 0, 0]);
+    let dir = attr(3, FileKind::Directory, false, vec![3, 0, 0, 0, 0, 0, 0, 0]);
+    // A snapshot's handle names its subvolume: here, 7.
+    let file = move |i: usize| {
+        attr(
+            100 + i as u64,
+            FileKind::Regular,
+            true,
+            [(100 + i as u64).to_le_bytes(), 7u64.to_le_bytes()].concat(),
+        )
+    };
+    let named = move |name: &[u8]| -> Option<usize> {
+        std::str::from_utf8(name)
+            .ok()?
+            .strip_prefix("f-")?
+            .parse()
+            .ok()
+            .filter(|i| *i < files)
+    };
+    let describe = move |path: &jackalopefs_proto::Path| -> Option<Attr> {
+        match path.names() {
+            [] => Some(root.clone()),
+            [d] if d.as_bytes() == b"d" => Some(dir.clone()),
+            [d, f] if d.as_bytes() == b"d" => named(f.as_bytes()).map(file),
+            _ => None,
+        }
+    };
+    let enoent = Response::Err(libc::ENOENT);
+    move |req: &Request| match req {
+        Request::Getattr {
+            path: Some(path), ..
+        }
+        | Request::Opendir { path, .. } => match (describe(path), req) {
+            (Some(attr), Request::Opendir { .. }) => Response::Opened { attr },
+            (Some(attr), _) => Response::Attr(attr),
+            (None, _) => enoent.clone(),
+        },
+        Request::Lookup { parent, name } => parent
+            .join(name.clone())
+            .ok()
+            .and_then(|path| describe(&path))
+            .map_or(enoent.clone(), Response::Entry),
+        // Pages of 500 entries; a cookie is the index of the entry after it.
+        Request::Readdir { offset, .. } => {
+            let first = *offset as usize;
+            let last = (first + 500).min(files);
+            let entries = (first..last)
+                .map(|i| DirEntryPlus {
+                    entry: DirEntry {
+                        ino: 100 + i as u64,
+                        next_offset: i as u64 + 1,
+                        kind: FileKind::Regular,
+                        name: format!("f-{i:04}").into_bytes(),
+                    },
+                    attr: Some(file(i)),
+                })
+                .collect();
+            Response::ReaddirPlus {
+                entries,
+                end: last == files,
+            }
+        }
+        Request::Releasedir { .. } | Request::Release { .. } | Request::Access { .. } => {
+            Response::Ok
+        }
+        Request::Getxattr { .. } => Response::Err(libc::ENODATA),
+        Request::Listxattr { .. } => Response::Xattr(Vec::new()),
+        _ => Response::Err(libc::ENOSYS),
+    }
+}
+
+/// The reported case: a large directory of files in another subvolume. Its first page comes as readdirplus and the rest as plain pages, since nothing stats in between, and every file must be listed under the number `stat` then reports, its substitute, not the inode number it has in its subvolume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_page_lists_a_file_in_another_subvolume_as_stat_reports_it() {
+    if !fuse_available() {
+        return;
+    }
+    const FILES: usize = 2000;
+    let blackhole = Blackhole::start_answering(script_foreign_files(FILES)).await;
+    let (mount, mountpoint) = Mounted::mount(
+        blackhole.config(Duration::from_secs(10)),
+        Duration::from_secs(1),
+    )
+    .await;
+    let m = Mounted {
+        mount: Some(mount),
+        server: None,
+        _blackhole: Some(blackhole),
+        export: tempfile::tempdir().unwrap(),
+        mountpoint,
+    };
+    let dir = m.mnt().join("d");
+    let (disagree, plain_pages) = {
+        let dir = dir.clone();
+        let (listed, disagree) = blocking(move || {
+            let listed = DirStream::open(&dir).read_entries();
+            let disagree: Vec<_> = listed
+                .iter()
+                .filter_map(|(name, listed)| {
+                    let stat = fs::symlink_metadata(dir.join(OsStr::from_bytes(name)))
+                        .unwrap()
+                        .ino();
+                    (*listed != stat)
+                        .then(|| (String::from_utf8_lossy(name).into_owned(), *listed, stat))
+                })
+                .collect();
+            (listed, disagree)
+        })
+        .await;
+        assert_eq!(listed.len(), FILES, "every file, once");
+        let snapshot = m.mount.as_ref().unwrap().perf().report();
+        (
+            disagree,
+            snapshot.fuse.get("readdir").map_or(0, |row| row.n),
+        )
+    };
+    assert!(
+        plain_pages > 0,
+        "no plain page was asked for, so this tests nothing"
+    );
+    assert!(
+        disagree.is_empty(),
+        "{} of {FILES} files listed under another number than stat's, e.g. {:?}",
+        disagree.len(),
+        disagree.first()
+    );
+    m.finish().await;
+}
+
+/// What a directory listing says an entry's inode number is must be what `stat` says, for `.` and `..` too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn listings_and_stat_agree_on_inode_numbers() {
     use std::os::unix::fs::{DirEntryExt, MetadataExt};
@@ -1334,7 +1559,7 @@ async fn listings_and_stat_agree_on_inode_numbers() {
     }
     let mnt = m.mnt();
     blocking(move || {
-        // Twice: the first listing fills the kernel's cache through readdirplus, the second is answered from plain pages.
+        // Twice: the second listing finds every name already known to the kernel. Stats in between keep the kernel asking for readdirplus; plain pages are `a_plain_page_lists_a_file_in_another_subvolume_as_stat_reports_it`'s.
         for round in 0..2 {
             let mut seen = 0;
             for entry in fs::read_dir(mnt.join("d")).unwrap() {

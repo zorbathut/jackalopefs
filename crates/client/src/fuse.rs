@@ -12,8 +12,7 @@ use fuser::{
     Request, RequestId,
 };
 use jackalopefs_proto::{
-    Attr, DirEntry, DirEntryPlus, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, Whence,
-    MAX_IO,
+    Attr, DirEntryPlus, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, Whence, MAX_IO,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -23,8 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Bytes of directory entries fetched from the server per request; the kernel asks for far less at a time, and the rest is served from the handle's buffer.
-const READDIR_FETCH: u32 = 256 * 1024;
+/// Bytes of directory entries fetched from the server per request; the kernel asks for far less at a time, and the rest is served from the handle's buffer. The first fetch of a listing is smaller, since many readers stop after a few entries (an emptiness check, a file manager's "has children" probe) and every entry fetched is one the server described.
+const READDIR_FETCH: u32 = 1024 * 1024;
+const READDIR_FETCH_FIRST: u32 = 256 * 1024;
 
 /// Concurrent background requests (readahead and the writeback of cached pages) the kernel may keep in flight; it bounds how many writes a flush has on the wire at once.
 const MAX_BACKGROUND: u16 = 64;
@@ -59,33 +59,17 @@ struct AttrReported {
     mtime: TimeSpec,
 }
 
-/// Entries fetched from the server but not yet handed to the kernel, each tagged with the cookie that yields it. The variant says what the fetch carried: a plain page can be served from either, a readdirplus page only from `Plus`. An empty `Plain` is also the state with nothing buffered.
-enum DirBuffer {
-    Plain(VecDeque<(u64, DirEntry)>),
-    Plus(VecDeque<(u64, DirEntryPlus)>),
-}
-
-impl Default for DirBuffer {
-    fn default() -> Self {
-        DirBuffer::Plain(VecDeque::new())
-    }
-}
+/// Entries fetched from the server but not yet handed to the kernel, each tagged with the cookie that yields it. Every fetch carries attributes, so one buffer serves either kind of page.
+type DirBuffer = VecDeque<(u64, DirEntryPlus)>;
 
 /// What a directory handle holds between kernel requests.
 struct DirState {
     ino: u64,
     buffer: DirBuffer,
+    /// When the buffer was fetched: its attributes are as old as that, and a readdirplus page hands them to the kernel to cache.
+    fetched: Instant,
     /// The cookie after the last entry of a fetch that said the directory ended; a read there is answered empty without a round trip. A handle left at its end after a full listing reads there again, so a name added under the directory, by this client or reported by the server, clears it; the next fetch replaces it, and offset 0 always goes to the server so `rewinddir` sees everything regardless.
     end: Option<u64>,
-}
-
-impl DirBuffer {
-    fn front_cookie(&self) -> Option<u64> {
-        match self {
-            DirBuffer::Plain(entries) => entries.front().map(|(cookie, _)| *cookie),
-            DirBuffer::Plus(entries) => entries.front().map(|(cookie, _)| *cookie),
-        }
-    }
 }
 
 pub struct Backend {
@@ -609,44 +593,37 @@ impl Shared {
         }
     }
 
-    /// A page for a plain readdir starting at `offset`: the buffer when it continues where the kernel left off, whatever kind of fetch filled it, and the server otherwise. A handle without a buffer has been released.
-    async fn dir_page(&self, fh: u64, offset: u64) -> Result<DirBuffer, Error> {
+    /// A page starting at `offset`: the buffer when it continues where the kernel left off, and the server otherwise; for a readdirplus page (`plus`), whose attributes the kernel caches, only a buffer younger than the attribute TTL. A handle without a buffer has been released.
+    async fn dir_page(&self, fh: u64, offset: u64, plus: bool) -> Result<DirBuffer, Error> {
         {
             let mut dirs = self.dirs.lock();
             let state = dirs.get_mut(&fh).ok_or(Error::Remote(libc::EBADF))?;
-            if offset != 0 && state.buffer.front_cookie() == Some(offset) {
+            let fresh = !plus || state.fetched.elapsed() < self.attr_ttl;
+            if offset != 0
+                && fresh
+                && state
+                    .buffer
+                    .front()
+                    .is_some_and(|(cookie, _)| *cookie == offset)
+            {
                 return Ok(std::mem::take(&mut state.buffer));
             }
-            state.buffer = DirBuffer::default();
+            state.buffer.clear();
             if offset != 0 && state.end == Some(offset) {
-                return Ok(DirBuffer::default());
+                return Ok(DirBuffer::new());
             }
         }
-        let (entries, end) = self.client.readdir(fh, offset, READDIR_FETCH).await?;
-        self.note_end(fh, entries.last().map(|e| e.next_offset), end);
-        Ok(DirBuffer::Plain(
-            tag_with_cookies(entries, offset, |e| e.next_offset).into(),
-        ))
-    }
-
-    /// A page for a readdirplus starting at `offset`: the buffer only when a readdirplus fetch filled it, since the kernel is about to link every entry, and the server otherwise.
-    async fn dir_page_plus(&self, fh: u64, offset: u64) -> Result<Vec<(u64, DirEntryPlus)>, Error> {
-        {
-            let mut dirs = self.dirs.lock();
-            let state = dirs.get_mut(&fh).ok_or(Error::Remote(libc::EBADF))?;
-            if let DirBuffer::Plus(entries) = &mut state.buffer {
-                if offset != 0 && entries.front().is_some_and(|(cookie, _)| *cookie == offset) {
-                    return Ok(entries.drain(..).collect());
-                }
-            }
-            state.buffer = DirBuffer::default();
-            if offset != 0 && state.end == Some(offset) {
-                return Ok(Vec::new());
-            }
+        let fetch = if offset == 0 {
+            READDIR_FETCH_FIRST
+        } else {
+            READDIR_FETCH
+        };
+        let (entries, end) = self.client.readdirplus(fh, offset, fetch).await?;
+        if let Some(state) = self.dirs.lock().get_mut(&fh) {
+            state.fetched = Instant::now();
         }
-        let (entries, end) = self.client.readdirplus(fh, offset, READDIR_FETCH).await?;
         self.note_end(fh, entries.last().map(|e| e.entry.next_offset), end);
-        Ok(tag_with_cookies(entries, offset, |e| e.entry.next_offset))
+        Ok(tag_with_cookies(entries, offset, |e| e.entry.next_offset).into())
     }
 
     /// Keep what the kernel's buffer did not take for its next request on the handle.
@@ -673,27 +650,34 @@ impl Shared {
         }
     }
 
-    /// Hand a plain page to the kernel until its buffer is full; what it did not take comes back, in the buffer's own kind, to be stashed.
-    fn add_plain<T>(
+    /// Hand a plain page to the kernel until its buffer is full; what it did not take comes back to be stashed.
+    fn add_plain(
         &self,
         reply: &mut ReplyDirectory,
         ino: u64,
-        entries: VecDeque<(u64, T)>,
-        entry_of: impl Fn(&T) -> &DirEntry,
-    ) -> (usize, VecDeque<(u64, T)>) {
+        entries: DirBuffer,
+    ) -> (usize, DirBuffer) {
         let mut entries = entries.into_iter();
         let mut added = 0;
         let parent = self.parent_of(ino);
         let nodes = self.nodes.lock();
-        while let Some((cookie, item)) = entries.next() {
-            let entry = entry_of(&item);
+        while let Some((cookie, entry)) = entries.next() {
+            let Some(number) = plain_number(&nodes, ino, parent, &entry) else {
+                tracing::warn!(dir = ino, name = %String::from_utf8_lossy(&entry.entry.name), "directory entry without attributes; skipped");
+                continue;
+            };
+            // The dots are directories, and every other entry numbered has attributes.
+            let kind = entry
+                .attr
+                .as_ref()
+                .map_or(FileKind::Directory, |attr| attr.kind);
             if reply.add(
-                INodeNo(plain_number(&nodes, ino, parent, entry)),
-                entry.next_offset,
-                file_type(entry.kind),
-                OsStr::from_bytes(&entry.name),
+                INodeNo(number),
+                entry.entry.next_offset,
+                file_type(kind),
+                OsStr::from_bytes(&entry.entry.name),
             ) {
-                let mut rest = VecDeque::from([(cookie, item)]);
+                let mut rest = VecDeque::from([(cookie, entry)]);
                 rest.extend(entries);
                 return (added, rest);
             }
@@ -703,16 +687,12 @@ impl Shared {
     }
 }
 
-/// The number a plain page lists an entry of directory `dir` (whose parent is `parent`) under.
-fn plain_number(nodes: &NodeTable, dir: u64, parent: u64, entry: &DirEntry) -> u64 {
-    match entry.name.as_slice() {
-        b"." => dir,
-        b".." => parent,
-        // A name the table knows goes by its node's number, which is what `stat` will say; one it does not know yet goes by the file's own inode number, which is what its node will have unless it turns out to need a substitute.
-        name => Name::new(name)
-            .ok()
-            .and_then(|name| nodes.child(dir, &name))
-            .unwrap_or(entry.ino),
+/// The number a plain page lists an entry of directory `dir` (whose parent is `parent`) under: the one the node table gives the file, which is what a lookup of it registers and `stat` then reports, substitute included, without registering anything, since a plain page takes no lookup count. `None` for an entry without attributes, which cannot be numbered.
+fn plain_number(nodes: &NodeTable, dir: u64, parent: u64, entry: &DirEntryPlus) -> Option<u64> {
+    match entry.entry.name.as_slice() {
+        b"." => Some(dir),
+        b".." => Some(parent),
+        _ => entry.attr.as_ref().map(|attr| nodes.id_for(attr.into())),
     }
 }
 
@@ -1545,7 +1525,8 @@ impl Filesystem for Backend {
                         fh,
                         DirState {
                             ino: ino.0,
-                            buffer: DirBuffer::default(),
+                            buffer: DirBuffer::new(),
+                            fetched: Instant::now(),
                             end: None,
                         },
                     );
@@ -1572,20 +1553,11 @@ impl Filesystem for Backend {
             ..KeyPerf::of("readdir", req, ino.0)
         };
         self.spawn(key, async move {
-            let page = match shared.dir_page(fh.0, offset).await {
+            let page = match shared.dir_page(fh.0, offset, false).await {
                 Ok(page) => page,
                 Err(e) => return fail(reply, errno(&e)),
             };
-            let (added, rest) = match page {
-                DirBuffer::Plain(entries) => {
-                    let (added, rest) = shared.add_plain(&mut reply, ino.0, entries, |e| e);
-                    (added, DirBuffer::Plain(rest))
-                }
-                DirBuffer::Plus(entries) => {
-                    let (added, rest) = shared.add_plain(&mut reply, ino.0, entries, |e| &e.entry);
-                    (added, DirBuffer::Plus(rest))
-                }
-            };
+            let (added, rest) = shared.add_plain(&mut reply, ino.0, page);
             shared.stash(fh.0, rest);
             reply.ok();
             Outcome::items(added)
@@ -1607,18 +1579,17 @@ impl Filesystem for Backend {
             ..KeyPerf::of("readdirplus", req, ino.0)
         };
         self.spawn(key, async move {
-            let mut entries = match shared.dir_page_plus(fh.0, offset).await {
+            let mut entries = match shared.dir_page(fh.0, offset, true).await {
                 Ok(entries) => entries.into_iter(),
                 Err(e) => return fail(reply, errno(&e)),
             };
             let mut added = 0;
-            for (cookie, item) in entries.by_ref() {
-                let entry = &item.entry;
-                let name = OsStr::from_bytes(&entry.name);
-                let full = match (entry.name.as_slice(), &item.attr) {
+            for (cookie, entry) in entries.by_ref() {
+                let name = OsStr::from_bytes(&entry.entry.name);
+                let full = match (entry.entry.name.as_slice(), &entry.attr) {
                     (b".", _) => reply.add(
                         INodeNo(ino.0),
-                        entry.next_offset,
+                        entry.entry.next_offset,
                         name,
                         &shared.entry_ttl,
                         &dir_placeholder(ino.0),
@@ -1628,7 +1599,7 @@ impl Filesystem for Backend {
                         let parent = shared.parent_of(ino.0);
                         reply.add(
                             INodeNo(parent),
-                            entry.next_offset,
+                            entry.entry.next_offset,
                             name,
                             &shared.entry_ttl,
                             &dir_placeholder(parent),
@@ -1636,8 +1607,8 @@ impl Filesystem for Backend {
                         )
                     }
                     (_, Some(attr)) => {
-                        let Ok(entry_name) = Name::new(entry.name.as_slice()) else {
-                            tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.name), "readdirplus entry with an invalid name; skipped");
+                        let Ok(entry_name) = Name::new(entry.entry.name.as_slice()) else {
+                            tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.entry.name), "readdirplus entry with an invalid name; skipped");
                             continue;
                         };
                         // The kernel may refuse the entry for want of room, and one it refused must leave no node behind, so the node is asked for first and registered once the entry is in; the table stays locked between the two, or another request could be given the number meanwhile.
@@ -1646,7 +1617,7 @@ impl Filesystem for Backend {
                             let id = nodes.id_for(attr.into());
                             let full = reply.add(
                                 INodeNo(id),
-                                entry.next_offset,
+                                entry.entry.next_offset,
                                 name,
                                 &shared.entry_ttl,
                                 &file_attr(id, attr),
@@ -1664,14 +1635,14 @@ impl Filesystem for Backend {
                         full
                     }
                     (_, None) => {
-                        tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.name), "readdirplus entry without attributes; skipped");
+                        tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.entry.name), "readdirplus entry without attributes; skipped");
                         continue;
                     }
                 };
                 if full {
-                    let mut rest = VecDeque::from([(cookie, item)]);
+                    let mut rest = VecDeque::from([(cookie, entry)]);
                     rest.extend(entries);
-                    shared.stash(fh.0, DirBuffer::Plus(rest));
+                    shared.stash(fh.0, rest);
                     break;
                 }
                 added += 1;
@@ -1917,6 +1888,97 @@ fn reply_xattr(reply: ReplyXattr, size: u32, value: &[u8]) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jackalopefs_proto::{DirEntry, Identity};
+
+    /// The file with inode number `ino` in its `generation`th life, as ext4 would put it in a handle.
+    fn identity(ino: u64, generation: u32) -> Identity {
+        Identity {
+            handle_type: 1,
+            handle: [(ino as u32).to_le_bytes(), generation.to_le_bytes()].concat(),
+        }
+    }
+
+    fn listed(name: &str, ino: u64, generation: u32, foreign: bool) -> DirEntryPlus {
+        let t = TimeSpec { sec: 0, nsec: 0 };
+        DirEntryPlus {
+            entry: DirEntry {
+                ino,
+                next_offset: 1,
+                kind: FileKind::Regular,
+                name: name.as_bytes().to_vec(),
+            },
+            attr: Some(Attr {
+                ino,
+                size: 0,
+                blocks: 0,
+                atime: t,
+                mtime: t,
+                ctime: t,
+                kind: FileKind::Regular,
+                perm: 0o644,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 4096,
+                xattr_names: None,
+                identity: identity(ino, generation),
+                foreign,
+            }),
+        }
+    }
+
+    /// What a lookup of the listed name registers, which is what `stat` then reports.
+    fn looked_up(nodes: &mut NodeTable, dir: u64, item: &DirEntryPlus) -> Option<u64> {
+        nodes.insert_lookup(
+            dir,
+            Name::new(item.entry.name.as_slice()).unwrap(),
+            item.attr.as_ref().unwrap().into(),
+        )
+    }
+
+    /// A plain page lists every entry under the number `stat` will report for it, which the entry's own inode number is not whenever the file needs a substitute.
+    #[test]
+    fn a_plain_page_numbers_an_entry_as_stat_will() {
+        let mut nodes = NodeTable::new();
+        // Known, by a lookup.
+        let known = listed("known", 30, 0, false);
+        looked_up(&mut nodes, ROOT, &known);
+        // A name the table maps to one file, which now shows another.
+        looked_up(&mut nodes, ROOT, &listed("replaced", 40, 0, false));
+        // A number another file's node holds: the old life of 20, under another name.
+        looked_up(&mut nodes, ROOT, &listed("old", 20, 0, false));
+        let cases = [
+            ("in another subvolume", listed("snap", 10, 0, true)),
+            (
+                "a recycled number another node holds",
+                listed("new", 20, 1, false),
+            ),
+            ("known", known),
+            (
+                "a name now showing another file",
+                listed("replaced", 41, 0, false),
+            ),
+        ];
+        for (what, item) in cases {
+            let plain = plain_number(&nodes, ROOT, ROOT, &item);
+            assert_eq!(plain, looked_up(&mut nodes, ROOT, &item), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_plain_page_numbers_the_dots_and_skips_what_it_cannot_number() {
+        let nodes = NodeTable::new();
+        let mut dot = listed(".", 99, 0, false);
+        dot.attr = None;
+        let mut dotdot = listed("..", 98, 0, false);
+        dotdot.attr = None;
+        assert_eq!(plain_number(&nodes, 7, 3, &dot), Some(7));
+        assert_eq!(plain_number(&nodes, 7, 3, &dotdot), Some(3));
+        let mut bare = listed("bare", 50, 0, false);
+        bare.attr = None;
+        assert_eq!(plain_number(&nodes, 7, 3, &bare), None);
+    }
 
     #[test]
     fn only_a_lone_modification_time_value_is_a_time_flush() {

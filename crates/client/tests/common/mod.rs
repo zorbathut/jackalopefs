@@ -171,7 +171,10 @@ pub fn config_for(
 pub const SERVER_UID: u32 = 4242;
 pub const SERVER_GID: u32 = 4343;
 
-/// Accepts connections and answers the hello from a list (one reply per connection in order, the last one repeating; a refusal closes that connection), then either swallows every request forever (recording when the client gives up on a stream) or answers every one with the same canned reply.
+/// How a [`Blackhole`] answers a request.
+pub type Answer = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
+
+/// Accepts connections and answers the hello from a list (one reply per connection in order, the last one repeating; a refusal closes that connection), then either swallows every request forever (recording when the client gives up on a stream) or answers each with what `answer` makes of it.
 pub struct Blackhole {
     pub addr: SocketAddr,
     pub fingerprint: [u8; 32],
@@ -190,6 +193,13 @@ impl Blackhole {
 
     pub async fn start_with(canned: Option<Response>) -> Blackhole {
         Blackhole::start_full(canned, vec![Blackhole::ack()]).await
+    }
+
+    /// A server that answers every request as `answer` says: a script of a filesystem, for what the real server cannot be made to produce.
+    pub async fn start_answering(
+        answer: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) -> Blackhole {
+        Blackhole::start_answer(Some(Arc::new(answer)), vec![Blackhole::ack()]).await
     }
 
     pub async fn start_handshaking(hellos: Vec<HelloReply>) -> Blackhole {
@@ -213,6 +223,11 @@ impl Blackhole {
 
     /// Answer the hellos in turn (the last repeating) and every request with `canned`.
     pub async fn start_full(canned: Option<Response>, hellos: Vec<HelloReply>) -> Blackhole {
+        let answer = canned.map(|reply| -> Answer { Arc::new(move |_: &Request| reply.clone()) });
+        Blackhole::start_answer(answer, hellos).await
+    }
+
+    async fn start_answer(answer: Option<Answer>, hellos: Vec<HelloReply>) -> Blackhole {
         let identity = Identity::generate().unwrap();
         let fingerprint = jackalopefs_proto::fingerprint_bytes(identity.cert.as_ref());
         let config = tls::server_config(identity, jackalopefs_server::transport_config()).unwrap();
@@ -230,7 +245,7 @@ impl Blackhole {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let seen = seen.clone();
                 let seen_stops = seen_stops.clone();
-                let canned = canned.clone();
+                let answer = answer.clone();
                 let reply = hellos[count.min(hellos.len() - 1)].clone();
                 count += 1;
                 let accepted = accepted.clone();
@@ -256,12 +271,23 @@ impl Blackhole {
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let seen = seen.clone();
                         let seen_stops = seen_stops.clone();
-                        let canned = canned.clone();
+                        let answer = answer.clone();
                         tokio::spawn(async move {
-                            if let Ok(req) = read_frame::<_, Request>(&mut recv).await {
+                            let req = match read_frame::<_, Request>(&mut recv).await {
+                                Ok(req) => Some(req),
+                                Err(e) => {
+                                    eprintln!("blackhole: unreadable request, not answered: {e}");
+                                    None
+                                }
+                            };
+                            let reply = answer
+                                .as_ref()
+                                .zip(req.as_ref())
+                                .map(|(answer, req)| answer(req));
+                            if let Some(req) = req {
                                 seen.lock().push(req);
                             }
-                            match canned {
+                            match reply {
                                 Some(reply) => {
                                     write_frame(&mut send, &reply).await.unwrap();
                                     send.finish().unwrap();
