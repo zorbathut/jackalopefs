@@ -687,17 +687,8 @@ impl Shared {
         let nodes = self.nodes.lock();
         while let Some((cookie, item)) = entries.next() {
             let entry = entry_of(&item);
-            let entry_ino = match entry.name.as_slice() {
-                b"." => ino,
-                b".." => parent,
-                // A name the table knows goes by its node's number, which is what `stat` will say; one it does not know yet goes by the file's own inode number, which is what its node will have unless it turns out to need a substitute.
-                name => Name::new(name)
-                    .ok()
-                    .and_then(|name| nodes.child(ino, &name))
-                    .unwrap_or(entry.ino),
-            };
             if reply.add(
-                INodeNo(entry_ino),
+                INodeNo(plain_number(&nodes, ino, parent, entry)),
                 entry.next_offset,
                 file_type(entry.kind),
                 OsStr::from_bytes(&entry.name),
@@ -709,6 +700,19 @@ impl Shared {
             added += 1;
         }
         (added, VecDeque::new())
+    }
+}
+
+/// The number a plain page lists an entry of directory `dir` (whose parent is `parent`) under.
+fn plain_number(nodes: &NodeTable, dir: u64, parent: u64, entry: &DirEntry) -> u64 {
+    match entry.name.as_slice() {
+        b"." => dir,
+        b".." => parent,
+        // A name the table knows goes by its node's number, which is what `stat` will say; one it does not know yet goes by the file's own inode number, which is what its node will have unless it turns out to need a substitute.
+        name => Name::new(name)
+            .ok()
+            .and_then(|name| nodes.child(dir, &name))
+            .unwrap_or(entry.ino),
     }
 }
 
