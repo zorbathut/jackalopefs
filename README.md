@@ -69,7 +69,7 @@ Be aware that this was mostly Claude-coded. I've been thinking about this genera
 ## When the server goes away
 
 - A filesystem call on a live connection waits for its reply as long as that connection lives (or up to `--op-timeout`, if set): a server that is slow is not an error. A call that was in flight when the connection dropped fails with `EIO` unless it is safe to retry, in which case it is retried once on the next connection; a call that has no connection waits up to `--offline-timeout` for one and then fails with `ETIMEDOUT`.
-- A process blocked in a call can be interrupted: any signal it receives makes the call fail with `EINTR` and abandons the request on the wire, whether or not the server had applied it (the same as libfuse's `intr` option, so a program with a signal handler blocked in a slow call can see `EINTR` where a local filesystem would not show it).
+- A process blocked in a call can be interrupted: any signal it receives makes the call fail with `EINTR` and abandons the request on the wire, whether or not the server had applied it (the same as libfuse's `intr` option, so a program with a signal handler blocked in a slow call can see `EINTR` where a local filesystem would not show it). Only a real signal does: an io_uring completion, which the kernel also reports as an interrupt, lets the call go on (`docs/design.md`, "Timeouts").
 - The client reconnects with exponential backoff for as long as it is mounted. If the server kept the session (up to 60 s), open files continue exactly where they were; otherwise each open file is reopened by path and verified to be the same inode, and a handle whose file changed underneath it fails with `ESTALE`.
 - A server and client built from different protocol revisions refuse each other before any authentication, and both log the two revisions (`jackalopefs-client` exits with them when it is the first connection). While mounted, the client keeps retrying so that a server rollback recovers the mount, but calls fail with `ETIMEDOUT` by the offline deadline until one side is rebuilt or the mount is given up as below.
 - A write that the kernel had cached when the server went away fails at the next `fsync(2)` or `close(2)` with `EIO` unless it was safe to retry and the reconnect delivered it. Against a server that is alive but never answers, cached writes stay pending: the kernel's writeback is not interruptible, so they are pinned until the mount is given up, and a system-wide `sync(2)` (a shutdown, say) blocks on them until then.
@@ -88,7 +88,7 @@ cargo build --release
 cargo test --workspace
 ```
 
-The test suite runs real servers on loopback and, where `/dev/fuse` and `fusermount3` are available, real FUSE mounts (the interrupt tests also need `python3`); the mount tests skip themselves otherwise.
+The test suite runs real servers on loopback and, where `/dev/fuse` and `fusermount3` are available, real FUSE mounts (the interrupt tests also need `python3`, and the io_uring ones skip themselves where the kernel refuses io_uring); the mount tests skip themselves otherwise.
 
 `scripts/validate/all.sh` runs the external validation suites (pjdfstest, fsx, fsstress, fio) plus resilience and cache-coherence checks of our own against a fresh server and mount; `docs/validation.md` describes them, their prerequisites, and what the results mean.
 

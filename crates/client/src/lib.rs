@@ -9,6 +9,7 @@ pub mod inodes;
 pub mod invalidate;
 pub mod mount;
 pub mod perf;
+pub mod signals;
 pub mod transport;
 
 pub use client::{Client, Config, Error, RequestKernel};

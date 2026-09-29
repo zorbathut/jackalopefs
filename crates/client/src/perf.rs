@@ -139,6 +139,10 @@ pub struct Snapshot {
     pub inflight: u32,
     /// Most kernel requests being answered at once during the window.
     pub peak: u32,
+    /// `FUSE_INTERRUPT`s received during the window for requests still being answered.
+    pub interrupts: u64,
+    /// Of those, the ones that stood for no signal (`crate::signals`) and were not honoured; a real signal may still have ended the call later.
+    pub interrupts_ignored: u64,
     pub fuse: BTreeMap<&'static str, Row>,
     pub call: BTreeMap<&'static str, RowCall>,
 }
@@ -147,6 +151,8 @@ struct Inner {
     since: Instant,
     inflight: u32,
     peak: u32,
+    interrupts: u64,
+    interrupts_ignored: u64,
     fuse: BTreeMap<&'static str, Row>,
     call: BTreeMap<&'static str, RowCall>,
 }
@@ -162,6 +168,8 @@ impl Default for Perf {
                 since: Instant::now(),
                 inflight: 0,
                 peak: 0,
+                interrupts: 0,
+                interrupts_ignored: 0,
                 fuse: BTreeMap::new(),
                 call: BTreeMap::new(),
             }),
@@ -192,6 +200,13 @@ impl Perf {
     /// Kernel requests being answered right now.
     pub fn inflight(&self) -> u32 {
         self.inner.lock().inflight
+    }
+
+    /// A `FUSE_INTERRUPT` arrived; `ignored` when it stood for no signal.
+    pub fn record_interrupt(&self, ignored: bool) {
+        let mut inner = self.inner.lock();
+        inner.interrupts += 1;
+        inner.interrupts_ignored += u64::from(ignored);
     }
 
     pub fn record_fuse(&self, op: &'static str, outcome: &Outcome, total: Duration) {
@@ -227,6 +242,8 @@ impl Perf {
                 window: now.duration_since(inner.since),
                 inflight: inner.inflight,
                 peak: inner.peak,
+                interrupts: std::mem::take(&mut inner.interrupts),
+                interrupts_ignored: std::mem::take(&mut inner.interrupts_ignored),
                 fuse: std::mem::take(&mut inner.fuse),
                 call: std::mem::take(&mut inner.call),
             };
@@ -236,10 +253,12 @@ impl Perf {
         };
         tracing::info!(
             target: TRACE_TARGET,
-            "perf window {} inflight={} peak={}",
+            "perf window {} inflight={} peak={} interrupts={} ignored={}",
             fmt_duration(snapshot.window),
             snapshot.inflight,
-            snapshot.peak
+            snapshot.peak,
+            snapshot.interrupts,
+            snapshot.interrupts_ignored
         );
         for (op, row) in &snapshot.fuse {
             tracing::info!(

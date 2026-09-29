@@ -1726,6 +1726,189 @@ async fn a_signal_interrupts_a_call_blocked_on_a_live_connection() {
     m.abort_and_finish().await;
 }
 
+/// Interrupts received and not honoured, summed until `until` holds or `patience` runs out; a report resets the counts, so the sums are the test's own.
+async fn interrupts_until(
+    mount: &Mount,
+    patience: Duration,
+    until: impl Fn(u64, u64) -> bool,
+) -> (u64, u64) {
+    let deadline = Instant::now() + patience;
+    let (mut received, mut ignored) = (0, 0);
+    loop {
+        let snapshot = mount.perf().report();
+        received += snapshot.interrupts;
+        ignored += snapshot.interrupts_ignored;
+        if until(received, ignored) || Instant::now() > deadline {
+            return (received, ignored);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+extern "C" fn ignore_signal(_: libc::c_int) {}
+
+/// A handled SIGUSR2, so a signal to a thread blocked in a call is a real, harmless one. Nothing else in this test binary catches a signal process-wide; one that did could leave a signal in the process's shared pending set and make these tests see a signal where there is none.
+fn handle_sigusr2() {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = ignore_signal as extern "C" fn(libc::c_int) as usize;
+    assert_eq!(
+        unsafe { libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut()) },
+        0
+    );
+}
+
+/// Only a pending signal interrupts a call. io_uring hands a completion to the thread that submitted it as task work, which the kernel counts as a pending signal and answers with `FUSE_INTERRUPT`; the call the thread is blocked in must go on. A real signal that comes later still ends it, although the kernel sends no second interrupt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_io_uring_completion_does_not_interrupt_a_call_but_a_signal_still_does() {
+    let Some(m) = Mounted::start_stalled().await else {
+        return;
+    };
+    handle_sigusr2();
+    let (pipe_read, mut pipe_write) = std::io::pipe().unwrap();
+    let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+    let dir = m.mnt().join("d");
+    let caller = std::thread::spawn(move || {
+        use std::os::fd::AsRawFd;
+        let mut ring = match io_uring::IoUring::new(4) {
+            Ok(ring) => ring,
+            Err(e) => {
+                tid_tx.send(Err(e)).unwrap();
+                return None;
+            }
+        };
+        let mut buf = [0u8; 1];
+        let read = io_uring::opcode::Read::new(
+            io_uring::types::Fd(pipe_read.as_raw_fd()),
+            buf.as_mut_ptr(),
+            1,
+        )
+        .build();
+        // SAFETY: the buffer and the pipe outlive the ring, which is dropped at the end of this closure.
+        unsafe { ring.submission().push(&read).unwrap() };
+        ring.submit().unwrap();
+        tid_tx
+            .send(Ok(nix::unistd::gettid().as_raw() as u32))
+            .unwrap();
+        let made = fs::create_dir(&dir);
+        drop(ring);
+        Some(made)
+    });
+    let tid = match tid_rx.recv().unwrap() {
+        Ok(tid) => tid,
+        Err(e) => {
+            eprintln!("skipping: io_uring is not available here: {e}");
+            caller.join().unwrap();
+            return m.abort_and_finish().await;
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !blocked_in_fuse(tid) {
+        assert!(
+            Instant::now() < deadline,
+            "the caller never blocked in the mount"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mount = m.mount.as_ref().unwrap();
+    // The completion lands on a thread known to be blocked in the call.
+    pipe_write.write_all(b"x").unwrap();
+    let (received, ignored) =
+        interrupts_until(mount, Duration::from_secs(3), |received, _| received > 0).await;
+    assert!(
+        received > 0,
+        "the completion did not interrupt the request, so this tests nothing"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        blocked_in_fuse(tid),
+        "the call ended on a completion that was no signal"
+    );
+    let (more, more_ignored) = interrupts_until(mount, Duration::ZERO, |_, _| true).await;
+    assert_eq!(
+        ignored + more_ignored,
+        received + more,
+        "every interrupt so far stood for no signal"
+    );
+    assert_eq!(interrupted_calls(mount), 0, "a call was abandoned");
+
+    use std::os::unix::thread::JoinHandleExt;
+    assert_eq!(
+        unsafe { libc::pthread_kill(caller.as_pthread_t(), libc::SIGUSR2) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !caller.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "a real signal after the completion did not end the call"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let made = caller.join().unwrap().unwrap();
+    assert_eq!(made.unwrap_err().raw_os_error(), Some(libc::EINTR));
+    m.abort_and_finish().await;
+}
+
+/// io_uring stops its own worker threads (a cancellation, a linked timeout, the ring's teardown) with the same notification that is no signal elsewhere, and there it does mean stop: an open the server never answers, linked to a timeout, is cancelled instead of waiting for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_io_uring_timeout_still_cancels_its_worker() {
+    let Some(m) = Mounted::start_stalled().await else {
+        return;
+    };
+    let path = CString::new(m.mnt().join("never").as_os_str().as_bytes()).unwrap();
+    let caller = std::thread::spawn(move || -> std::io::Result<Vec<i32>> {
+        let mut ring = io_uring::IoUring::new(4)?;
+        let timeout = io_uring::types::Timespec::new().nsec(200_000_000);
+        let open =
+            io_uring::opcode::OpenAt::new(io_uring::types::Fd(libc::AT_FDCWD), path.as_ptr())
+                .flags(libc::O_RDONLY)
+                .build()
+                .flags(io_uring::squeue::Flags::IO_LINK)
+                .user_data(1);
+        let link = io_uring::opcode::LinkTimeout::new(&timeout)
+            .build()
+            .user_data(2);
+        // SAFETY: the path and the timespec outlive the ring, which is dropped at the end of this closure.
+        unsafe {
+            ring.submission().push(&open).unwrap();
+            ring.submission().push(&link).unwrap();
+        }
+        ring.submit_and_wait(2)?;
+        let mut results: Vec<(u64, i32)> = ring
+            .completion()
+            .map(|c| (c.user_data(), c.result()))
+            .collect();
+        results.sort();
+        Ok(results.into_iter().map(|(_, r)| r).collect())
+    });
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !caller.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "the timeout did not cancel the open its worker was blocked in"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    match caller.join().unwrap() {
+        Ok(results) => {
+            assert!(
+                results[0] == -libc::ECANCELED || results[0] == -libc::EINTR,
+                "{results:?}"
+            );
+            // Cancelled from its queue before a worker took it, the open would prove nothing here.
+            let (received, ignored) =
+                interrupts_until(m.mount.as_ref().unwrap(), Duration::ZERO, |_, _| true).await;
+            assert!(
+                received > 0,
+                "the timeout cancelled the open before it reached the mount, so this tests nothing"
+            );
+            assert_eq!(ignored, 0, "the worker's interrupt was not honoured");
+        }
+        Err(e) => eprintln!("skipping: io_uring is not available here: {e}"),
+    }
+    m.abort_and_finish().await;
+}
+
 /// Aborting the mount's FUSE connection fails every pending request and lets an unmount complete however stuck the server is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_abort_fails_pending_requests_and_frees_the_unmount() {

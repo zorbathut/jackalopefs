@@ -4,6 +4,7 @@ use crate::client::{Client, Error, RequestKernel};
 use crate::inodes::{KeyNode, NodeTable, ROOT};
 use crate::invalidate::Work;
 use crate::perf::{Outcome, TRACE_TARGET};
+use crate::signals;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
     KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
@@ -40,7 +41,9 @@ pub struct Shared {
     /// Where to queue such invalidations; set while the invalidator runs.
     invalidations: Mutex<Option<std::sync::mpsc::SyncSender<Work>>>,
     /// The kernel requests being answered right now, by id, so an interrupt reaches the task answering one. Bounded by what the kernel keeps in flight. A request is registered on the session thread before its task is spawned, and the session has one thread, so the interrupt for a request is always read after the request was registered.
-    inflight: Mutex<HashMap<u64, Arc<RequestKernel>>>,
+    inflight: Mutex<HashMap<u64, Answering>>,
+    /// Whether an interrupt stands for a signal (`crate::signals`).
+    judge: signals::Judge,
     pub entry_ttl: Duration,
     pub attr_ttl: Duration,
 }
@@ -115,6 +118,12 @@ impl KeyPerf {
     }
 }
 
+/// A kernel request being answered: the task's handle on it, and the thread blocked in it, which an interrupt for it is judged by (the FUSE header's pid is the kernel's task pid, a thread id).
+struct Answering {
+    request: Arc<RequestKernel>,
+    tid: u32,
+}
+
 /// Takes a request out of the in-flight table when the task answering it ends, however it ends.
 struct Registered {
     shared: Arc<Shared>,
@@ -142,6 +151,7 @@ impl Backend {
             reported: Mutex::new(HashMap::new()),
             invalidations: Mutex::new(None),
             inflight: Mutex::new(HashMap::new()),
+            judge: signals::Judge::for_this_process(),
             entry_ttl,
             attr_ttl,
         });
@@ -163,10 +173,13 @@ impl Backend {
             shared: self.shared.clone(),
             unique: key.unique,
         };
-        self.shared
-            .inflight
-            .lock()
-            .insert(key.unique, request.clone());
+        self.shared.inflight.lock().insert(
+            key.unique,
+            Answering {
+                request: request.clone(),
+                tid: key.pid,
+            },
+        );
         self.runtime.spawn(async move {
             let inflight = perf.start();
             let outcome = request.scope(f).await;
@@ -752,15 +765,43 @@ impl Filesystem for Backend {
         Ok(())
     }
 
-    /// A process blocked in the request got a signal. The task answering it abandons its call and replies `EINTR`; a request already answered is ignored, as the kernel does.
+    /// The kernel interrupts a request whenever the thread blocked in it has a signal pending by its reckoning, which counts task work (an io_uring completion, a freezer, a tracer's stop) as well as signals. Only a real signal abandons the call, with `EINTR` (`signals::Judge`). Otherwise the call goes on, and since the kernel sends no second interrupt for a request, a watcher looks for a real signal until the request is answered. A request already answered is ignored, as the kernel does.
     fn interrupt(&self, _req: &Request, unique: RequestId) {
-        match self.shared.inflight.lock().get(&unique.0) {
-            Some(request) => request.interrupt(),
-            None => tracing::trace!(
+        let Some((request, tid)) = self
+            .shared
+            .inflight
+            .lock()
+            .get(&unique.0)
+            .map(|a| (a.request.clone(), a.tid))
+        else {
+            tracing::trace!(
                 unique = unique.0,
                 "interrupt for a request already answered"
-            ),
+            );
+            return;
+        };
+        let stands = self.shared.judge.stands(tid);
+        self.shared.client.perf().record_interrupt(!stands);
+        if stands {
+            request.interrupt();
+            return;
         }
+        tracing::debug!(unique = unique.0, tid, "interrupt without a pending signal (task work such as an io_uring completion); the call goes on");
+        // The in-flight table and the task answering the request hold it; once both let go it is answered, and the watcher stops.
+        let request = Arc::downgrade(&request);
+        let shared = self.shared.clone();
+        self.runtime.spawn(async move {
+            loop {
+                tokio::time::sleep(signals::RECHECK).await;
+                let Some(request) = request.upgrade() else {
+                    return;
+                };
+                if shared.judge.signal_came(tid) {
+                    request.interrupt();
+                    return;
+                }
+            }
+        });
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
