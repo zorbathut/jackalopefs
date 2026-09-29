@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
+use jackalopefs_client::ids::ModeIds;
 use jackalopefs_client::mount::{Mount, MountOptions};
 use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::Auth;
@@ -48,6 +49,9 @@ struct Args {
     /// Unmount automatically if this process dies; requires --allow-other.
     #[arg(long, requires = "allow_other")]
     auto_unmount: bool,
+    /// How file owners are shown. `owned`: the uid and gid the server runs as show as this user's own, every other owner as nobody, and a chown or POSIX ACL naming anyone else fails with EINVAL. `direct`: owners as the server sends them, and ids sent as given.
+    #[arg(long, value_enum, default_value_t = ModeIds::Owned)]
+    ids: ModeIds,
     /// Have the kernel enforce mode bits against the attributes the server reports. Without it every request is forwarded and only the server's own access rights apply, so a mount shared through --allow-other enforces nothing.
     #[arg(long)]
     default_permissions: bool,
@@ -150,6 +154,7 @@ fn main() -> anyhow::Result<()> {
             connect_timeout: args.connect_timeout,
             op_timeout: args.op_timeout,
             offline_timeout: args.offline_timeout,
+            ids: args.ids,
         };
         tracing::info!(
             "protocol revision {:016x}",

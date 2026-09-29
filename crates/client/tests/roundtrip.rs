@@ -1,12 +1,15 @@
 mod common;
 
 use common::*;
+use jackalopefs_client::ids::{IdMap, ModeIds as ModeIdsClient};
 use jackalopefs_client::{
     ConnState, Error, ErrorConnect, ErrorConnectKind, RequestKernel, ServerTrust,
 };
+use jackalopefs_proto::owners::NOBODY;
 use jackalopefs_proto::{
     Auth, Hello, HelloReply, Path, Request, SetAttr, TimeOrNow, TimeSpec, PROTO_REVISION,
 };
+use jackalopefs_server::ids::ModeIds as ModeIdsServer;
 use std::collections::BTreeSet;
 use std::fs;
 use std::net::SocketAddr;
@@ -553,6 +556,348 @@ async fn timeout_against_a_blackhole_resets_and_releases() {
     })
     .await;
     assert!(fh > 0);
+    client.shutdown().await;
+}
+
+fn owned_by(uid: u32, gid: u32) -> jackalopefs_proto::Attr {
+    let t = TimeSpec { sec: 0, nsec: 0 };
+    jackalopefs_proto::Attr {
+        ino: 5,
+        size: 0,
+        blocks: 0,
+        atime: t,
+        mtime: t,
+        ctime: t,
+        kind: jackalopefs_proto::FileKind::Regular,
+        perm: 0o644,
+        nlink: 1,
+        uid,
+        gid,
+        rdev: 0,
+        blksize: 4096,
+        xattr_names: None,
+        identity: jackalopefs_proto::Identity {
+            handle_type: 1,
+            handle: vec![5],
+        },
+        foreign: false,
+    }
+}
+
+fn local_ids() -> (u32, u32) {
+    (
+        nix::unistd::geteuid().as_raw(),
+        nix::unistd::getegid().as_raw(),
+    )
+}
+
+/// An ACL in the kernel's xattr form naming one user and one group besides the owner, group and others.
+fn acl_naming(uid: u32, gid: u32) -> Vec<u8> {
+    let mut blob = 2u32.to_le_bytes().to_vec();
+    for (tag, id) in [
+        (0x01u16, u32::MAX),
+        (0x02, uid),
+        (0x04, u32::MAX),
+        (0x08, gid),
+        (0x10, u32::MAX),
+        (0x20, u32::MAX),
+    ] {
+        blob.extend(tag.to_le_bytes());
+        blob.extend(6u16.to_le_bytes());
+        blob.extend(id.to_le_bytes());
+    }
+    blob
+}
+
+/// A client that shows the server's user as its own, the mapping these tests are about.
+async fn owned_client(hole: &Blackhole) -> jackalopefs_client::Client {
+    jackalopefs_client::Client::connect(jackalopefs_client::Config {
+        ids: ModeIdsClient::Owned,
+        ..hole.config(Duration::from_secs(5))
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn the_server_user_shows_as_the_local_user_and_everyone_else_as_nobody() {
+    let (uid, gid) = local_ids();
+    for (owner, seen) in [
+        ((SERVER_UID, SERVER_GID), (uid, gid)),
+        ((uid, gid), (NOBODY, NOBODY)),
+        ((0, 0), (NOBODY, NOBODY)),
+    ] {
+        let hole = Blackhole::start_with(Some(jackalopefs_proto::Response::Attr(owned_by(
+            owner.0, owner.1,
+        ))))
+        .await;
+        let client = owned_client(&hole).await;
+        let attr = client.getattr(Some(Path::root()), None).await.unwrap();
+        assert_eq!((attr.uid, attr.gid), seen, "owner {owner:?}");
+        client.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn a_chown_to_the_local_user_reaches_the_server_as_its_own_user() {
+    let (uid, gid) = local_ids();
+    let hole = Blackhole::start_with(Some(jackalopefs_proto::Response::Attr(owned_by(
+        SERVER_UID, SERVER_GID,
+    ))))
+    .await;
+    let client = owned_client(&hole).await;
+    let chown = |uid, gid| SetAttr {
+        uid,
+        gid,
+        ..SetAttr::default()
+    };
+    client
+        .setattr(Some(Path::root()), None, chown(Some(uid), Some(gid)))
+        .await
+        .unwrap();
+    for (uid, gid) in [
+        (Some(0), None),
+        (None, Some(0)),
+        (Some(SERVER_UID), None),
+        (Some(NOBODY), None),
+    ] {
+        let err = client
+            .setattr(Some(Path::root()), None, chown(uid, gid))
+            .await
+            .unwrap_err();
+        assert_eq!(err.errno(), libc::EINVAL, "{uid:?} {gid:?}");
+    }
+    let sent: Vec<_> = hole
+        .requests
+        .lock()
+        .iter()
+        .filter_map(|r| match r {
+            Request::Setattr { set, .. } => Some((set.uid, set.gid)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sent,
+        vec![(Some(SERVER_UID), Some(SERVER_GID))],
+        "only the mappable chown is sent"
+    );
+    client.shutdown().await;
+}
+
+#[tokio::test]
+async fn acl_entries_are_mapped_both_ways() {
+    let (uid, gid) = local_ids();
+    let hole = Blackhole::start_with(Some(jackalopefs_proto::Response::Xattr(acl_naming(
+        SERVER_UID, SERVER_GID,
+    ))))
+    .await;
+    let client = owned_client(&hole).await;
+    let got = client
+        .getxattr(Path::root(), b"system.posix_acl_access".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(got, acl_naming(uid, gid));
+    // The canned reply is not what a setxattr expects; what matters is what was sent.
+    let err = client
+        .setxattr(
+            Path::root(),
+            b"system.posix_acl_default".to_vec(),
+            acl_naming(uid, gid),
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Protocol(_)), "{err}");
+    let err = client
+        .setxattr(
+            Path::root(),
+            b"system.posix_acl_access".to_vec(),
+            acl_naming(0, gid),
+            0,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.errno(), libc::EINVAL);
+    let sent: Vec<_> = hole
+        .requests
+        .lock()
+        .iter()
+        .filter_map(|r| match r {
+            Request::Setxattr { value, .. } => Some(value.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, vec![acl_naming(SERVER_UID, SERVER_GID)]);
+    client.shutdown().await;
+}
+
+async fn client_with(server: &TestServer, ids: ModeIdsClient) -> jackalopefs_client::Client {
+    jackalopefs_client::Client::connect(jackalopefs_client::Config {
+        ids,
+        ..server.config(Duration::from_secs(5))
+    })
+    .await
+    .unwrap()
+}
+
+const ACL_ACCESS: &[u8] = b"system.posix_acl_access";
+
+/// The same ACL naming another user, read through a server that passes owners through and one that flattens them, and what an owned client can then do. In-process the server's user is the local user, so the owned mapping is the identity here; the fake server's tests are the ones that show it translating.
+#[tokio::test]
+async fn a_flattening_server_hides_other_owners_and_an_owned_client_keeps_its_own() {
+    let export = tempfile::tempdir().unwrap();
+    fs::write(export.path().join("f"), b"").unwrap();
+    let (uid, gid) = local_ids();
+
+    let server = TestServer::start_ids(export.path(), ModeIdsServer::Direct).await;
+    let client = client_with(&server, ModeIdsClient::Direct).await;
+    match client
+        .setxattr(path("f"), ACL_ACCESS.to_vec(), acl_naming(4242, 4343), 0)
+        .await
+    {
+        Err(e) if e.errno() == libc::EOPNOTSUPP => {
+            eprintln!("skipping: the export's filesystem does not support POSIX ACLs");
+            return;
+        }
+        other => other.unwrap(),
+    }
+    assert_eq!(
+        client
+            .getxattr(path("f"), ACL_ACCESS.to_vec())
+            .await
+            .unwrap(),
+        acl_naming(4242, 4343),
+        "direct and direct pass owners through"
+    );
+    client.shutdown().await;
+    server.stop().await;
+
+    let server = TestServer::start_ids(export.path(), ModeIdsServer::Flatten).await;
+    let client = client_with(&server, ModeIdsClient::Owned).await;
+    assert_eq!(
+        client
+            .getxattr(path("f"), ACL_ACCESS.to_vec())
+            .await
+            .unwrap(),
+        acl_naming(NOBODY, NOBODY)
+    );
+    let attr = client.getattr(Some(path("f")), None).await.unwrap();
+    assert_eq!((attr.uid, attr.gid), (uid, gid));
+    // What the user may do still gets through both.
+    let chown = SetAttr {
+        uid: Some(uid),
+        gid: Some(gid),
+        ..SetAttr::default()
+    };
+    client.setattr(Some(path("f")), None, chown).await.unwrap();
+    client
+        .setxattr(path("f"), ACL_ACCESS.to_vec(), acl_naming(uid, gid), 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .getxattr(path("f"), ACL_ACCESS.to_vec())
+            .await
+            .unwrap(),
+        acl_naming(uid, gid)
+    );
+    // Anyone else is refused by the client before the server sees it.
+    let err = client
+        .setxattr(path("f"), ACL_ACCESS.to_vec(), acl_naming(4242, gid), 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err.errno(), libc::EINVAL);
+    client.shutdown().await;
+
+    // A direct client asks the flattening server itself, which refuses.
+    let client = client_with(&server, ModeIdsClient::Direct).await;
+    let err = client
+        .setxattr(path("f"), ACL_ACCESS.to_vec(), acl_naming(4242, gid), 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err.errno(), libc::EPERM);
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// The hello says whom the server runs as, which an owned client maps to its own user.
+#[tokio::test]
+async fn the_hello_says_whom_the_server_runs_as() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = client_with(&server, ModeIdsClient::Owned).await;
+    let (uid, gid) = local_ids();
+    match &*client.state().borrow() {
+        ConnState::Connected(attached) => match attached.ids {
+            IdMap::Owned(owned) => assert_eq!((owned.server_uid, owned.server_gid), (uid, gid)),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    }
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// Owners are mapped against the connection that carries them: a server back as another user is described by its own ids.
+#[tokio::test]
+async fn a_server_back_as_another_user_is_mapped_by_its_new_ids() {
+    let (uid, gid) = local_ids();
+    let ack_as = |uid, gid| match Blackhole::ack() {
+        HelloReply::Ack {
+            session_id,
+            resume_token,
+            resumed,
+            root_ino,
+            root_identity,
+            ..
+        } => HelloReply::Ack {
+            session_id,
+            resume_token,
+            resumed,
+            root_ino,
+            root_identity,
+            uid,
+            gid,
+        },
+        other => panic!("{other:?}"),
+    };
+    let hole = Blackhole::start_full(
+        Some(jackalopefs_proto::Response::Attr(owned_by(5252, 5353))),
+        vec![ack_as(SERVER_UID, SERVER_GID), ack_as(5252, 5353)],
+    )
+    .await;
+    let client = owned_client(&hole).await;
+    let attr = client.getattr(Some(Path::root()), None).await.unwrap();
+    assert_eq!(
+        (attr.uid, attr.gid),
+        (NOBODY, NOBODY),
+        "another user's file to the first server"
+    );
+    hole.connections.lock()[0].close(0u32.into(), b"restarted");
+    let attr = client.getattr(Some(Path::root()), None).await.unwrap();
+    assert_eq!(
+        (attr.uid, attr.gid),
+        (uid, gid),
+        "the second server's own file"
+    );
+    let chown = SetAttr {
+        uid: Some(uid),
+        ..SetAttr::default()
+    };
+    client
+        .setattr(Some(Path::root()), None, chown)
+        .await
+        .unwrap();
+    let sent: Vec<_> = hole
+        .requests
+        .lock()
+        .iter()
+        .filter_map(|r| match r {
+            Request::Setattr { set, .. } => Some(set.uid),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent, vec![Some(5252)]);
     client.shutdown().await;
 }
 

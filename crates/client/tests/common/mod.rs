@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use jackalopefs_client::ids::ModeIds as ModeIdsClient;
 use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::{read_frame, write_frame, Auth, Hello, HelloReply, Request, Response};
 use jackalopefs_server::export::Export;
@@ -46,6 +47,19 @@ impl TestServer {
             Identity::generate().unwrap(),
             false,
             ModeIds::Direct,
+        )
+        .await
+    }
+
+    /// A server with the given owner policy; every other constructor passes owners through (`direct`), so tests about something else see the export's own.
+    pub async fn start_ids(export: &Path, ids: ModeIds) -> TestServer {
+        TestServer::start_full(
+            export,
+            None,
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            Identity::generate().unwrap(),
+            true,
+            ids,
         )
         .await
     }
@@ -148,8 +162,14 @@ pub fn config_for(
         connect_timeout: Duration::from_secs(5),
         op_timeout: None,
         offline_timeout,
+        // Owners as the server has them, so tests about something else see the export's own.
+        ids: ModeIdsClient::Direct,
     }
 }
+
+/// The ids a [`Blackhole`] says it runs as: not the test's own, so what a client maps is visible.
+pub const SERVER_UID: u32 = 4242;
+pub const SERVER_GID: u32 = 4343;
 
 /// Accepts connections and answers the hello from a list (one reply per connection in order, the last one repeating; a refusal closes that connection), then either swallows every request forever (recording when the client gives up on a stream) or answers every one with the same canned reply.
 pub struct Blackhole {
@@ -186,12 +206,13 @@ impl Blackhole {
                 handle_type: 1,
                 handle: vec![2, 0, 0, 0, 0, 0, 0, 0],
             },
-            uid: 4242,
-            gid: 4343,
+            uid: SERVER_UID,
+            gid: SERVER_GID,
         }
     }
 
-    async fn start_full(canned: Option<Response>, hellos: Vec<HelloReply>) -> Blackhole {
+    /// Answer the hellos in turn (the last repeating) and every request with `canned`.
+    pub async fn start_full(canned: Option<Response>, hellos: Vec<HelloReply>) -> Blackhole {
         let identity = Identity::generate().unwrap();
         let fingerprint = jackalopefs_proto::fingerprint_bytes(identity.cert.as_ref());
         let config = tls::server_config(identity, jackalopefs_server::transport_config()).unwrap();

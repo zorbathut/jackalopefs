@@ -585,6 +585,7 @@ dependencies = [
  "jackalopefs-proto",
  "jackalopefs-server",
  "libc",
+ "nix",
  "parking_lot",
  "quinn",
  "rustls",

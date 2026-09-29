@@ -12,6 +12,7 @@
 | `recycle.sh` | a recycled inode number: a cached file deleted on the export and another created with the same number shows as the new file through the mount | filesystems that do not recycle numbers (it skips); snapshots and subvolumes, which need btrfs or bcachefs |
 | `resilience.sh` | a server that stops answering, dies and restarts under load: deadlines, recovery, open files across a restart, lazy detach | multi-client behaviour |
 | `coherence.sh` | two mounts of one export with 60 s cache TTLs: changes pushed within 2 s, fsstress on one while the other reads | conflicting writers |
+| `ids.sh` | the default owner modes (`--ids flatten` on the server, `--ids owned` on the client) through a real kernel: own owners pass, another user's ACL entry reads as nobody, a chown or ACL naming another id is refused by the client, and by the server itself for a mount that passes owners through | the owned mapping translating (harness server and mount run as one user, so it is the identity here; the client's tests show it) |
 | `permissions.sh` | root only: the kernel enforcing modes and sticky bits against the server's attributes for another uid, setuid stripping | anything else |
 
 Not used, and why: the rest of xfstests needs `TEST_DEV`/`SCRATCH_DEV` block devices; LTP's filesystem tests need root and target kernels; pynfs is NFS-only. None of the runs exercises `--fingerprint` or `--token`: the mounts use `--insecure` on loopback, and the Rust suite covers the trust path.
@@ -22,8 +23,9 @@ Not used, and why: the rest of xfstests needs `TEST_DEV`/`SCRATCH_DEV` block dev
 - The external tools, built once at pinned revisions by `scripts/validate/tools.sh validation/tools`: pjdfstest at commit `85a8aea9` and xfstests `v2026.09.02` (for `fsx` and `fsstress`), both tarballs checked against a pinned SHA-256. The script names the Arch packages it needs when something is missing (`base-devel perl fuse3 fio xfsprogs acl attr libaio liburing gdbm libcap`; other distributions map the names).
 - `fio`, `fusermount3`, `prove` (package `perl`), GNU coreutils and `util-linux`.
 - For the root-only parts: rootless `podman` (see "Deep mode").
+- For `ids.sh`: `setfacl`/`getfacl` (package `acl`) and a results filesystem that takes POSIX ACLs; it skips otherwise.
 
-Every suite runs the server with `--ids direct` (`JFS_SERVER_IDS` in `lib.sh`): the conformance suites need owners as the filesystem has them and chown to other users, which the default hides and refuses by design (`docs/design.md`, "Ownership").
+Every suite but `ids.sh` runs both sides with `--ids direct` (`JFS_SERVER_IDS`, `JFS_CLIENT_IDS` in `lib.sh`): the conformance suites need owners as the filesystem has them and chown to other users, which the default modes hide and refuse by design (`docs/design.md`, "Ownership").
 
 `validation/` is ignored by git; it holds the tools and the results.
 

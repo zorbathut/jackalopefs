@@ -13,8 +13,9 @@ ATTR_TTL=1
 # Deadline on every external tool run (fs_run); all.sh derives its per-suite budget from it.
 TOOL_TIMEOUT=${JFS_TOOL_TIMEOUT:-600}
 export JFS_OFFLINE_TIMEOUT=${JFS_OFFLINE_TIMEOUT:-15s}
-# The server's owner mode (--ids) for server_start. The suites check conformance, which needs real owners and chown to other users, so the server passes owners through unless a suite says otherwise.
+# Owner modes (--ids) for server_start and client_start. The suites check conformance, which needs real owners and chown to other users, so both sides pass owners through unless a suite (ids.sh) says otherwise.
 JFS_SERVER_IDS=${JFS_SERVER_IDS:-direct}
+JFS_CLIENT_IDS=${JFS_CLIENT_IDS:-direct}
 
 SERVER_PID=
 PORT=
@@ -105,7 +106,7 @@ client_start() {
     local mnt=$1
     shift
     mkdir -p "$mnt"
-    RUST_LOG=${RUST_LOG:-info} "$BIN/jackalopefs-client" "127.0.0.1:$PORT" "$mnt" --insecure --offline-timeout "$JFS_OFFLINE_TIMEOUT" "$@" >> "$RESULTS/client-$(basename "$mnt").log" 2>&1 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&- &
+    RUST_LOG=${RUST_LOG:-info} "$BIN/jackalopefs-client" "127.0.0.1:$PORT" "$mnt" --insecure --offline-timeout "$JFS_OFFLINE_TIMEOUT" --ids "$JFS_CLIENT_IDS" "$@" >> "$RESULTS/client-$(basename "$mnt").log" 2>&1 3<&- 4<&- 5<&- 6<&- 7<&- 8<&- 9<&- &
     CLIENT_PIDS+=("$! $mnt")
     wait_for 15 mountpoint -q "$mnt" || fail "mount did not appear at $mnt: $(tail -5 "$RESULTS/client-$(basename "$mnt").log")"
 }

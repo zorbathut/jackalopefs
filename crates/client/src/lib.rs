@@ -4,6 +4,7 @@ pub mod client;
 pub mod conn;
 pub mod fuse;
 pub mod handles;
+pub mod ids;
 pub mod inodes;
 pub mod invalidate;
 pub mod mount;

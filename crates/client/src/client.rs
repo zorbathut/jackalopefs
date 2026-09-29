@@ -2,6 +2,7 @@
 
 use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::{HandleKind, HandleTable};
+use crate::ids::{IdMap, ModeIds};
 use crate::inodes::KeyNode;
 use crate::perf::{AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
 use crate::transport::ServerTrust;
@@ -33,6 +34,8 @@ pub enum Error {
     Protocol(String),
     #[error("client is shut down")]
     Closed,
+    #[error("owner has no counterpart on the server")]
+    Unmapped,
 }
 
 impl Error {
@@ -47,6 +50,8 @@ impl Error {
             Error::Remote(_) => libc::EIO,
             Error::Protocol(_) => libc::EIO,
             Error::Closed => libc::ENOTCONN,
+            // What chown(2) says of an id with no mapping in the caller's user namespace.
+            Error::Unmapped => libc::EINVAL,
         }
     }
 }
@@ -212,6 +217,7 @@ impl KeyRoot {
 pub(crate) async fn exchange(
     conn: &Connection,
     root: &KeyRoot,
+    ids: &IdMap,
     req: &Request,
     timing: &mut Timing,
 ) -> Result<Response, ErrorExchange> {
@@ -236,6 +242,7 @@ pub(crate) async fn exchange(
     timing.replied = Some(Instant::now());
     streams.done = true;
     root.as_node_one(&mut resp);
+    ids.incoming(req, &mut resp);
     Ok(resp)
 }
 
@@ -390,13 +397,22 @@ impl Caller {
             .await;
             account.phases.wait += waiting.elapsed();
             let attached = attached?;
+            // Owners are put in server terms against the connection that carries the request, so a retry on the next one uses that one's.
+            let mapped = attached.ids.outgoing(req)?;
+            let sent = mapped.as_ref().unwrap_or(req);
             let mut timing = Timing::default();
             let attempt = Instant::now();
             let exchanged = interruptible(
                 kernel,
                 within(
                     self.op_timeout,
-                    exchange(&attached.conn, &attached.root, req, &mut timing),
+                    exchange(
+                        &attached.conn,
+                        &attached.root,
+                        &attached.ids,
+                        sent,
+                        &mut timing,
+                    ),
                 ),
             )
             .await;
@@ -450,6 +466,8 @@ pub struct Config {
     pub op_timeout: Option<Duration>,
     /// Longest a call waits for a connection before failing with `ETIMEDOUT`.
     pub offline_timeout: Duration,
+    /// How file owners are shown (`crate::ids`).
+    pub ids: ModeIds,
 }
 
 pub struct Client {
@@ -470,6 +488,7 @@ impl Client {
                 auth: cfg.auth,
                 connect_timeout: cfg.connect_timeout,
                 offline_timeout: cfg.offline_timeout,
+                ids: cfg.ids,
             },
             handles.clone(),
         )
@@ -935,6 +954,7 @@ mod tests {
         assert_eq!(Error::Interrupted.errno(), libc::EINTR);
         assert_eq!(Error::Disconnected.errno(), libc::EIO);
         assert_eq!(Error::Stale.errno(), libc::ESTALE);
+        assert_eq!(Error::Unmapped.errno(), libc::EINVAL);
         assert_eq!(Error::Remote(libc::ENOENT).errno(), libc::ENOENT);
         assert_eq!(Error::Remote(0).errno(), libc::EIO);
         assert_eq!(Error::Remote(-5).errno(), libc::EIO);

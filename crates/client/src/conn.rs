@@ -2,6 +2,7 @@
 
 use crate::client::{exchange, Error, KeyRoot, Timing};
 use crate::handles::{HandleKind, HandleTable};
+use crate::ids::{IdMap, ModeIds};
 use crate::transport::{client_config, ServerTrust};
 use jackalopefs_proto::{
     read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Resume, PROTO_REVISION,
@@ -36,6 +37,7 @@ pub struct ConfigConn {
     pub connect_timeout: Duration,
     /// Bounds each step of reopening the handles after a new session.
     pub offline_timeout: Duration,
+    pub ids: ModeIds,
 }
 
 /// A live, handshaken connection.
@@ -47,6 +49,7 @@ pub struct Attached {
     /// Increments with every successful connection; callers that lost a reply wait for a strictly newer generation before retrying.
     pub generation: u64,
     pub root: KeyRoot,
+    pub ids: IdMap,
 }
 
 #[derive(Clone, Debug)]
@@ -226,14 +229,19 @@ async fn run(
         });
         // Try the address that answered first from now on, so a dead candidate ahead of it costs its deadline once instead of on every reconnect.
         candidates.rotate_left(winner);
-        let (conn, resumed, root) = (attached.conn, attached.resumed, attached.root);
+        let (conn, resumed, root, ids) =
+            (attached.conn, attached.resumed, attached.root, attached.ids);
         tracing::info!(
             session = attached.session_id,
             resumed,
             generation,
+            ids = ids.describe(),
             "connected to {}",
             attached.addr
         );
+        if let Some(caveat) = ids.caveat() {
+            tracing::warn!("{caveat}");
+        }
 
         // The mount is of one directory. If the server now serves another one here (the export replaced or restored, a filesystem whose handles did not survive a remount), every name may lead to another file: nothing open can be reopened by its path, and what the kernel caches is swept as after any reconnect.
         if root_mounted
@@ -246,7 +254,7 @@ async fn run(
         root_mounted = Some(root.clone());
         if !resumed {
             tokio::select! {
-                _ = reopen_handles(&conn, &root, &handles, cfg.offline_timeout) => {}
+                _ = reopen_handles(&conn, &root, ids, &handles, cfg.offline_timeout) => {}
                 _ = stop.changed() => {
                     conn.close(close_code::UNMOUNT.into(), b"unmount");
                     break;
@@ -259,6 +267,7 @@ async fn run(
             resumed,
             generation,
             root,
+            ids,
         });
         if state.send(ConnState::Connected(attached)).is_err() {
             break;
@@ -293,6 +302,7 @@ struct Handshaken {
     resume_token: [u8; 16],
     resumed: bool,
     root: KeyRoot,
+    ids: IdMap,
 }
 
 /// A resolved server address and the socket that can reach it.
@@ -417,7 +427,8 @@ async fn connect_once(
             resumed,
             root_ino,
             root_identity,
-            ..
+            uid,
+            gid,
         } => Ok(Handshaken {
             conn,
             addr,
@@ -428,6 +439,7 @@ async fn connect_once(
                 ino: root_ino,
                 identity: root_identity,
             },
+            ids: IdMap::new(cfg.ids, uid, gid),
         }),
         HelloReply::Reject { reason } => {
             conn.close(close_code::UNMOUNT.into(), b"rejected");
@@ -447,6 +459,7 @@ async fn connect_once(
 async fn reopen_handles(
     conn: &Connection,
     root: &KeyRoot,
+    ids: IdMap,
     handles: &HandleTable,
     offline_timeout: Duration,
 ) {
@@ -464,6 +477,7 @@ async fn reopen_handles(
                 exchange(
                     &conn,
                     &root,
+                    &ids,
                     &rec.reopen_request(fh),
                     &mut Timing::default(),
                 ),
@@ -490,7 +504,7 @@ async fn reopen_handles(
                     releases.spawn(async move {
                         match timeout(
                             offline_timeout,
-                            exchange(&conn, &root, &release, &mut Timing::default()),
+                            exchange(&conn, &root, &ids, &release, &mut Timing::default()),
                         )
                         .await
                         {
