@@ -12,12 +12,17 @@
 #
 # Evolution contract (checked against capnp 1.5): union discriminant values
 # follow ordinal order, not declaration order, so reordering declarations keeps
-# the wire format (though it is still a new revision, see above) and renumbering
-# ordinals breaks every peer; a group's position in a union
-# is its lowest member ordinal, so new fields and new union members are always
-# appended with fresh, higher ordinals, never inserted, and a field grows into
-# a group by keeping its own ordinal as the group's lowest member; out-of-order
-# ordinals compile without complaint, so the compiler will not catch a renumber.
+# the wire format (though it is still a new revision, see above); a group's
+# position in a union is its lowest member ordinal; out-of-order ordinals
+# compile without complaint, so the compiler will not catch a renumber.
+# Hello, HelloReply and every struct they reach (Resume, Identity) are frozen
+# for ever: peers of different revisions must still decode them to refuse each
+# other and say why, and a server decodes the whole Hello before it compares
+# revisions. Every other struct is decoded only between peers of one revision,
+# so a new revision may renumber it (ordinals must stay contiguous, which
+# removing a field requires); a field added without removing any is appended
+# with a fresh, higher ordinal, and a field grows into a group by keeping its
+# own ordinal as the group's lowest member.
 #
 # Rules the schema cannot express (docs/design.md, "Wire format", is normative):
 #
@@ -112,17 +117,11 @@ struct Statfs {
   frsize @7 :UInt32;
 }
 
+# One entry of a listing. attr is absent only for "." and "..", which are directories and which a client numbers itself; every other entry is described, or left out.
 struct DirEntry {
-  ino @0 :UInt64;
-  nextOffset @1 :UInt64;
-  kind @2 :FileKind;
-  name @3 :Data;
-}
-
-struct DirEntryPlus {
-  entry @0 :DirEntry;
-  # Absent only for "." and "..", which the kernel never links.
-  attr :union { none @1 :Void; some @2 :Attr; }
+  nextOffset @0 :UInt64;
+  name @1 :Data;
+  attr :union { none @2 :Void; some @3 :Attr; }
 }
 
 struct TimeOrNow {
@@ -207,17 +206,17 @@ struct Request {
     release :group { fh @48 :UInt64; }
     fsync :group { fh @49 :UInt64; datasync @50 :Bool; }
     opendir :group { fh @51 :UInt64; path @52 :Path; }
-    readdir :group { fh @53 :UInt64; offset @54 :UInt64; maxBytes @55 :UInt32; plus @56 :Bool; }
-    releasedir :group { fh @57 :UInt64; }
-    statfs :group { path @58 :Path; }
-    setxattr :group { path @59 :Path; name @60 :Data; value @61 :Data; flags @62 :Int32; }
-    getxattr :group { path @63 :Path; name @64 :Data; }
-    listxattr :group { path @65 :Path; }
-    removexattr :group { path @66 :Path; name @67 :Data; }
-    access :group { path @68 :Path; mask @69 :Int32; }
-    copyFileRange :group { fhIn @70 :UInt64; offsetIn @71 :UInt64; fhOut @72 :UInt64; offsetOut @73 :UInt64; len @74 :UInt64; }
-    fallocate :group { fh @75 :UInt64; offset @76 :UInt64; len @77 :UInt64; mode @78 :Int32; }
-    lseek :group { fh @79 :UInt64; offset @80 :UInt64; whence @81 :Whence; }
+    readdir :group { fh @53 :UInt64; offset @54 :UInt64; maxBytes @55 :UInt32; }
+    releasedir :group { fh @56 :UInt64; }
+    statfs :group { path @57 :Path; }
+    setxattr :group { path @58 :Path; name @59 :Data; value @60 :Data; flags @61 :Int32; }
+    getxattr :group { path @62 :Path; name @63 :Data; }
+    listxattr :group { path @64 :Path; }
+    removexattr :group { path @65 :Path; name @66 :Data; }
+    access :group { path @67 :Path; mask @68 :Int32; }
+    copyFileRange :group { fhIn @69 :UInt64; offsetIn @70 :UInt64; fhOut @71 :UInt64; offsetOut @72 :UInt64; len @73 :UInt64; }
+    fallocate :group { fh @74 :UInt64; offset @75 :UInt64; len @76 :UInt64; mode @77 :Int32; }
+    lseek :group { fh @78 :UInt64; offset @79 :UInt64; whence @80 :Whence; }
   }
 }
 
@@ -235,12 +234,11 @@ struct Response {
     # end: no entry follows the last one in entries, so a client may answer a
     # further read at that entry's nextOffset itself; says nothing when
     # entries is empty.
-    readdir :group { entries @8 :List(DirEntry); end @12 :Bool; }
-    readdirPlus :group { entries @9 :List(DirEntryPlus); end @13 :Bool; }
-    statfs @10 :Statfs;
-    xattr @11 :Data;
-    copied @14 :UInt32;
-    seeked @15 :UInt64;
+    readdir :group { entries @8 :List(DirEntry); end @11 :Bool; }
+    statfs @9 :Statfs;
+    xattr @10 :Data;
+    copied @12 :UInt32;
+    seeked @13 :UInt64;
   }
 }
 

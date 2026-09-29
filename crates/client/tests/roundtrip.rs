@@ -372,6 +372,13 @@ async fn directory_listing_in_pages_and_concurrently() {
         ended = end;
         pages += 1;
         offset = page.last().unwrap().next_offset;
+        for entry in &page {
+            assert_eq!(
+                entry.attr.is_none(),
+                entry.is_dot_or_dotdot(),
+                "only the dots come without attributes"
+            );
+        }
         seen.extend(page.into_iter().map(|e| e.name));
     }
     assert!(pages > 10, "expected many pages, got {pages}");
@@ -379,21 +386,6 @@ async fn directory_listing_in_pages_and_concurrently() {
     let unique: BTreeSet<_> = seen.iter().cloned().collect();
     assert_eq!(unique.len(), 5002, "no duplicates across pages");
     assert!(unique.contains(b".".as_slice()) && unique.contains(b"..".as_slice()));
-
-    let mut plus_seen = 0;
-    let mut offset = 0;
-    loop {
-        let (page, _) = client.readdirplus(fh, offset, 1 << 20).await.unwrap();
-        if page.is_empty() {
-            break;
-        }
-        for entry in &page {
-            assert_eq!(entry.attr.is_none(), entry.entry.is_dot_or_dotdot());
-        }
-        plus_seen += page.len();
-        offset = page.last().unwrap().entry.next_offset;
-    }
-    assert_eq!(plus_seen, 5002);
 
     let (a, b) = tokio::join!(
         client.readdir(fh, 0, 1 << 20),

@@ -518,7 +518,7 @@ async fn an_old_buffer_serves_plain_pages_but_not_readdirplus() {
             stream.read_names();
         })
         .await;
-        let fetches = perf.report().call.get("readdirplus").map_or(0, |r| r.row.n);
+        let fetches = perf.report().call.get("readdir").map_or(0, |r| r.row.n);
         assert_eq!(fetches, if stat { 2 } else { 1 }, "stat={stat}");
     }
     m.finish().await;
@@ -559,11 +559,7 @@ async fn a_listing_longer_than_one_kernel_page_is_fetched_once() {
         })
         .await;
         let snap = perf.report();
-        let fetched: u64 = ["readdir", "readdirplus"]
-            .iter()
-            .filter_map(|op| snap.call.get(op))
-            .map(|r| r.row.items)
-            .sum();
+        let fetched = snap.call.get("readdir").map_or(0, |r| r.row.items);
         assert_eq!(
             fetched, 402,
             "stat={stat}: every entry, `.` and `..` included, crosses the network once: {:?}",
@@ -608,11 +604,7 @@ async fn a_complete_listing_does_not_read_past_its_end() {
         })
         .await;
         let snap = perf.report();
-        let calls: u64 = ["readdir", "readdirplus"]
-            .iter()
-            .filter_map(|op| snap.call.get(op))
-            .map(|r| r.row.n)
-            .sum();
+        let calls = snap.call.get("readdir").map_or(0, |r| r.row.n);
         assert_eq!(
             calls, 1,
             "stat={stat}: one fetch, no empty tail: {:?}",
@@ -688,13 +680,13 @@ async fn a_handle_parked_at_the_end_reads_like_one_on_the_export() {
             "after this client's own addition"
         );
         assert!(
-            probes.report().call.contains_key("readdirplus"),
+            probes.report().call.contains_key("readdir"),
             "the parked handle asked the server again"
         );
         fs::write(export.join("d/on-the-export"), b"").unwrap();
         // The server's event for the new name arrives within its debounce window; after it the parked handle must go to the server again.
         let started = Instant::now();
-        while !probes.report().call.contains_key("readdirplus") {
+        while !probes.report().call.contains_key("readdir") {
             assert!(
                 started.elapsed() < Duration::from_secs(5),
                 "the server's event did not reach the parked handle"
@@ -1390,7 +1382,7 @@ async fn a_file_replaced_on_the_export_is_another_file_by_name_and_the_same_by_d
 
 /// A scripted export: the root (inode 2, the fake server's root), a directory `d` in it, and in `d` the files `f-0000`, `f-0001`… in another subvolume, as a snapshot's are: each goes by a substitute, never by its own inode number, which the scripted numbers make plain by starting at 100.
 fn script_foreign_files(files: usize) -> impl Fn(&Request) -> Response + Send + Sync {
-    use jackalopefs_proto::{Attr, DirEntry, DirEntryPlus, FileKind, Identity, TimeSpec};
+    use jackalopefs_proto::{Attr, DirEntry, FileKind, Identity, TimeSpec};
     let attr = |ino: u64, kind: FileKind, foreign: bool, handle: Vec<u8>| Attr {
         ino,
         size: 0,
@@ -1463,17 +1455,13 @@ fn script_foreign_files(files: usize) -> impl Fn(&Request) -> Response + Send + 
             let first = *offset as usize;
             let last = (first + 500).min(files);
             let entries = (first..last)
-                .map(|i| DirEntryPlus {
-                    entry: DirEntry {
-                        ino: 100 + i as u64,
-                        next_offset: i as u64 + 1,
-                        kind: FileKind::Regular,
-                        name: format!("f-{i:04}").into_bytes(),
-                    },
+                .map(|i| DirEntry {
+                    next_offset: i as u64 + 1,
+                    name: format!("f-{i:04}").into_bytes(),
                     attr: Some(file(i)),
                 })
                 .collect();
-            Response::ReaddirPlus {
+            Response::Readdir {
                 entries,
                 end: last == files,
             }

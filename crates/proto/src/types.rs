@@ -210,26 +210,18 @@ pub struct Statfs {
     pub frsize: u32,
 }
 
-/// One `getdents64` record. `name` is raw because `.` and `..` travel with their real `d_off` cookies; `next_offset` is the cookie to request the entries after this one.
+/// One entry of a listing. `name` is raw because `.` and `..` travel with their real `d_off` cookies; `next_offset` is the cookie to request the entries after this one. `attr` is `None` only for `.` and `..`, which are directories and which a client numbers itself; the entry's own inode number is its attributes' (a file's number on the mount is the client's to give, `crate::Attr`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DirEntry {
-    pub ino: u64,
     pub next_offset: u64,
-    pub kind: FileKind,
     pub name: Vec<u8>,
+    pub attr: Option<Attr>,
 }
 
 impl DirEntry {
     pub fn is_dot_or_dotdot(&self) -> bool {
         self.name.as_slice() == b"." || self.name.as_slice() == b".."
     }
-}
-
-/// A readdirplus record; `attr` is `None` only for `.` and `..`, which the kernel never links.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct DirEntryPlus {
-    pub entry: DirEntry,
-    pub attr: Option<Attr>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

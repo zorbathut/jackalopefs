@@ -3,8 +3,8 @@
 use crate::jackalopefs_capnp as schema;
 use crate::msg::{Auth, Event, EventItem, Hello, HelloReply, Request, Response, Resume};
 use crate::types::{
-    Attr, DirEntry, DirEntryPlus, ErrorName, ErrorPathTooLong, FileKind, Identity, Name, Path,
-    SetAttr, Statfs, TimeOrNow, TimeSpec, Whence, HANDLE_MAX, PATH_MAX,
+    Attr, DirEntry, ErrorName, ErrorPathTooLong, FileKind, Identity, Name, Path, SetAttr, Statfs,
+    TimeOrNow, TimeSpec, Whence, HANDLE_MAX, PATH_MAX,
 };
 use capnp::message::{self, HeapAllocator, ReaderSegments};
 
@@ -73,19 +73,19 @@ fn checked_len(declared: u32, message_words: usize) -> Result<usize, ErrorDecode
     Ok(declared as usize)
 }
 
-/// Wire size of one directory entry in a `readdir`/`readdirPlus` reply: four words of `DirEntry` plus the name rounded up to a word; with an `Attr`, the fixed part of `DirEntryPlus`, `Attr` and `Identity` ([`ENTRY_PLUS_BYTES`]), the file handle rounded up to a word and, when the `Attr` carries xattr names, a pointer word per name plus each name rounded up to a word. The server budgets listings with this. Changing it is a protocol change: edit the schema so the revision moves.
-pub fn dir_entry_bytes(name_len: usize, plus: Option<&Attr>) -> usize {
-    let attr = plus.map_or(0, |attr| {
+/// Wire size of one directory entry in a `readdir` reply: four words of `DirEntry` plus the name rounded up to a word; with an `Attr`, the fixed part of `Attr` and `Identity` ([`ENTRY_ATTR_BYTES`]), the file handle rounded up to a word and, when the `Attr` carries xattr names, a pointer word per name plus each name rounded up to a word. The server budgets listings with this. Changing it is a protocol change: edit the schema so the revision moves.
+pub fn dir_entry_bytes(name_len: usize, attr: Option<&Attr>) -> usize {
+    let attr = attr.map_or(0, |attr| {
         let names: usize = attr.xattr_names.as_ref().map_or(0, |names| {
             names.iter().map(|n| 8 + n.len().next_multiple_of(8)).sum()
         });
-        ENTRY_PLUS_BYTES + attr.identity.handle.len().next_multiple_of(8) + names
+        ENTRY_ATTR_BYTES + attr.identity.handle.len().next_multiple_of(8) + names
     });
     32 + name_len.next_multiple_of(8) + attr
 }
 
-/// What an entry's attributes add to it before anything of variable length: three words of `DirEntryPlus`, fourteen of `Attr`, two of `Identity`.
-const ENTRY_PLUS_BYTES: usize = 152;
+/// What an entry's attributes add to it before anything of variable length: fourteen words of `Attr`, two of `Identity`.
+const ENTRY_ATTR_BYTES: usize = 128;
 
 /// Words an `Attr`'s variable parts add to it: its file handle rounded up to a word, and for the names it carries a pointer word per name and the name rounded up to a word.
 fn words_for_attr(attr: &Attr) -> u32 {
@@ -286,18 +286,22 @@ fn parse_statfs(r: schema::statfs::Reader<'_>) -> Statfs {
 }
 
 fn build_dir_entry(mut b: schema::dir_entry::Builder<'_>, e: &DirEntry) {
-    b.set_ino(e.ino);
     b.set_next_offset(e.next_offset);
-    b.set_kind(kind_to_wire(e.kind));
     b.set_name(&e.name);
+    match &e.attr {
+        Some(attr) => build_attr(b.get_attr().init_some(), attr),
+        None => b.get_attr().set_none(()),
+    }
 }
 
 fn parse_dir_entry(r: schema::dir_entry::Reader<'_>) -> Result<DirEntry, ErrorDecode> {
     Ok(DirEntry {
-        ino: r.get_ino(),
         next_offset: r.get_next_offset(),
-        kind: kind_from_wire(r.get_kind()?),
         name: r.get_name()?.to_vec(),
+        attr: match r.get_attr().which()? {
+            schema::dir_entry::attr::Which::None(()) => None,
+            schema::dir_entry::attr::Which::Some(attr) => Some(parse_attr(attr?)?),
+        },
     })
 }
 
@@ -688,13 +692,11 @@ impl Message for Request {
                 fh,
                 offset,
                 max_bytes,
-                plus,
             } => {
                 let mut g = b.init_readdir();
                 g.set_fh(*fh);
                 g.set_offset(*offset);
                 g.set_max_bytes(*max_bytes);
-                g.set_plus(*plus);
             }
             Request::Releasedir { fh } => b.init_releasedir().set_fh(*fh),
             Request::Statfs { path } => {
@@ -869,7 +871,6 @@ impl Message for Request {
                 fh: g.get_fh(),
                 offset: g.get_offset(),
                 max_bytes: g.get_max_bytes(),
-                plus: g.get_plus(),
             },
             rq::Which::Releasedir(g) => Request::Releasedir { fh: g.get_fh() },
             rq::Which::Statfs(g) => Request::Statfs {
@@ -986,9 +987,9 @@ impl Message for Request {
 
 // ---------- Response ----------
 
-/// Words per directory entry in a composite list, excluding the name data; a `DirEntryPlus` adds its own three words and a thirteen-word `Attr`, whose names are added per name.
+/// Words per directory entry in a composite list, excluding the name data, and what its attributes add: fourteen words of `Attr` and two of `Identity`, plus one spare (an under-estimate costs a canonicalizing copy), and the `Attr`'s variable parts ([`words_for_attr`]).
 const DIR_ENTRY_WORDS: u32 = 4;
-const DIR_ENTRY_PLUS_WORDS: u32 = 24;
+const ENTRY_ATTR_WORDS: u32 = 17;
 /// An `Attr` in a reply, with the reply's own words; a word or two over, on purpose, since an under-estimate costs a canonicalizing copy.
 const ATTR_WORDS: u32 = 22;
 
@@ -1016,19 +1017,6 @@ impl Message for Response {
                 let mut list = g.init_entries(entries.len() as u32);
                 for (i, e) in entries.iter().enumerate() {
                     build_dir_entry(list.reborrow().get(i as u32), e);
-                }
-            }
-            Response::ReaddirPlus { entries, end } => {
-                let mut g = b.init_readdir_plus();
-                g.set_end(*end);
-                let mut list = g.init_entries(entries.len() as u32);
-                for (i, e) in entries.iter().enumerate() {
-                    let mut item = list.reborrow().get(i as u32);
-                    build_dir_entry(item.reborrow().init_entry(), &e.entry);
-                    match &e.attr {
-                        Some(attr) => build_attr(item.get_attr().init_some(), attr),
-                        None => item.get_attr().set_none(()),
-                    }
                 }
             }
             Response::Statfs(s) => build_statfs(b.init_statfs(), s),
@@ -1064,25 +1052,6 @@ impl Message for Response {
                     end: g.get_end(),
                 }
             }
-            rs::Which::ReaddirPlus(g) => {
-                let list = g.get_entries()?;
-                let mut entries =
-                    Vec::with_capacity(checked_len(list.len(), message.size_in_words())?);
-                for item in list.iter() {
-                    let attr = match item.get_attr().which()? {
-                        schema::dir_entry_plus::attr::Which::None(()) => None,
-                        schema::dir_entry_plus::attr::Which::Some(attr) => Some(parse_attr(attr?)?),
-                    };
-                    entries.push(DirEntryPlus {
-                        entry: parse_dir_entry(item.get_entry()?)?,
-                        attr,
-                    });
-                }
-                Response::ReaddirPlus {
-                    entries,
-                    end: g.get_end(),
-                }
-            }
             rs::Which::Statfs(s) => Response::Statfs(parse_statfs(s?)),
             rs::Which::Xattr(value) => Response::Xattr(value?.to_vec()),
         })
@@ -1101,14 +1070,12 @@ impl Message for Response {
             Response::Readlink(b) | Response::Read(b) | Response::Xattr(b) => words_for(b.len()),
             Response::Readdir { entries, .. } => entries
                 .iter()
-                .map(|e| DIR_ENTRY_WORDS + e.name.len().div_ceil(8) as u32)
-                .sum(),
-            Response::ReaddirPlus { entries, .. } => entries
-                .iter()
                 .map(|e| {
-                    DIR_ENTRY_PLUS_WORDS
-                        + e.entry.name.len().div_ceil(8) as u32
-                        + e.attr.as_ref().map_or(0, words_for_attr)
+                    DIR_ENTRY_WORDS
+                        + e.name.len().div_ceil(8) as u32
+                        + e.attr
+                            .as_ref()
+                            .map_or(0, |attr| ENTRY_ATTR_WORDS + words_for_attr(attr))
                 })
                 .sum(),
             Response::Statfs(_) => 8,

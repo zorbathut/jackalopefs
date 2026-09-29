@@ -75,7 +75,7 @@ pub fn map_reply(resp: &mut Response, posix_acl_read: bool, map: impl Fn(KindOwn
     };
     match resp {
         Response::Entry(a) | Response::Attr(a) | Response::Opened { attr: a } => attr(a),
-        Response::ReaddirPlus { entries, .. } => entries
+        Response::Readdir { entries, .. } => entries
             .iter_mut()
             .filter_map(|e| e.attr.as_mut())
             .for_each(attr),
@@ -91,7 +91,6 @@ pub fn map_reply(resp: &mut Response, posix_acl_read: bool, map: impl Fn(KindOwn
         | Response::Written(_)
         | Response::Copied(_)
         | Response::Seeked(_)
-        | Response::Readdir { .. }
         | Response::Statfs(_) => {}
     }
 }
@@ -104,7 +103,7 @@ pub fn reads_posix_acl(req: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DirEntry, DirEntryPlus, FileKind, Identity, Path, Statfs, TimeSpec};
+    use crate::{DirEntry, FileKind, Identity, Path, Statfs, TimeSpec};
 
     /// An ACL in the kernel's xattr form, every entry `rw-`.
     fn acl(entries: &[(u16, u32)]) -> Vec<u8> {
@@ -199,14 +198,10 @@ mod tests {
         }
     }
 
-    fn entry(name: &[u8], attr: Option<Attr>) -> DirEntryPlus {
-        DirEntryPlus {
-            entry: DirEntry {
-                ino: 5,
-                next_offset: 1,
-                kind: FileKind::Regular,
-                name: name.to_vec(),
-            },
+    fn entry(name: &[u8], attr: Option<Attr>) -> DirEntry {
+        DirEntry {
+            next_offset: 1,
+            name: name.to_vec(),
             attr,
         }
     }
@@ -222,7 +217,7 @@ mod tests {
             Response::Entry(attr(1, 2)),
             Response::Attr(attr(1, 2)),
             Response::Opened { attr: attr(1, 2) },
-            Response::ReaddirPlus {
+            Response::Readdir {
                 entries: vec![entry(b"a", Some(attr(1, 2))), entry(b"b", None)],
                 end: true,
             },
@@ -238,7 +233,7 @@ mod tests {
                 Response::Opened {
                     attr: attr(101, 102)
                 },
-                Response::ReaddirPlus {
+                Response::Readdir {
                     entries: vec![entry(b"a", Some(attr(101, 102))), entry(b"b", None)],
                     end: true
                 },
@@ -259,10 +254,6 @@ mod tests {
             Response::Written(1),
             Response::Copied(1),
             Response::Seeked(1),
-            Response::Readdir {
-                entries: Vec::new(),
-                end: true,
-            },
             Response::Statfs(Statfs {
                 blocks: 1,
                 bfree: 1,

@@ -140,11 +140,11 @@ pub enum Request {
         fh: u64,
         path: Path,
     },
+    /// Every entry but `.` and `..` comes with its attributes.
     Readdir {
         fh: u64,
         offset: u64,
         max_bytes: u32,
-        plus: bool,
     },
     Releasedir {
         fh: u64,
@@ -279,8 +279,7 @@ impl Request {
             Request::Release { .. } => "release",
             Request::Fsync { .. } => "fsync",
             Request::Opendir { .. } => "opendir",
-            Request::Readdir { plus: false, .. } => "readdir",
-            Request::Readdir { plus: true, .. } => "readdirplus",
+            Request::Readdir { .. } => "readdir",
             Request::Releasedir { .. } => "releasedir",
             Request::Statfs { .. } => "statfs",
             Request::Setxattr { .. } => "setxattr",
@@ -316,14 +315,9 @@ pub enum Response {
     Copied(u32),
     /// lseek: the offset found
     Seeked(u64),
-    /// `end`: no entry follows the last one, so the client may answer a read at its `next_offset` itself; meaningless with no entries.
+    /// readdir. `end`: no entry follows the last one, so the client may answer a read at its `next_offset` itself; meaningless with no entries.
     Readdir {
         entries: Vec<DirEntry>,
-        end: bool,
-    },
-    /// `end` as for `Readdir`.
-    ReaddirPlus {
-        entries: Vec<DirEntryPlus>,
         end: bool,
     },
     Statfs(Statfs),

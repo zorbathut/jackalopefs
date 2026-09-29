@@ -1,20 +1,16 @@
 //! Directory reading with real `getdents64` cookies, so a client `readdir(offset)` is a genuine `seekdir` and stays correct while the directory changes underneath it.
 
-use crate::export::{kind_from_mode, Export};
-use jackalopefs_proto::{DirEntry, DirEntryPlus, FileKind, Name};
+use crate::export::Export;
+use jackalopefs_proto::{DirEntry, Name};
 use nix::errno::Errno;
-use nix::fcntl::AtFlags;
-use nix::sys::stat::fstatat;
 use nix::unistd::{lseek, Whence};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
-/// One `linux_dirent64` record.
+/// What the server takes from a `linux_dirent64` record: the name and its cookie. The record's inode number and type are not used; an entry is described by its attributes, and the number a file goes by on the mount is the client's to give.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RawDirent {
-    pub ino: u64,
     /// Cookie for the entry *after* this one.
     pub off: u64,
-    pub d_type: u8,
     pub name: Vec<u8>,
 }
 
@@ -26,10 +22,8 @@ pub fn parse(buf: &[u8]) -> Vec<RawDirent> {
     let mut pos = 0;
     while pos + HEADER_LEN <= buf.len() {
         let rec = &buf[pos..];
-        let ino = u64::from_ne_bytes(rec[0..8].try_into().unwrap());
         let off = u64::from_ne_bytes(rec[8..16].try_into().unwrap());
         let reclen = u16::from_ne_bytes(rec[16..18].try_into().unwrap()) as usize;
-        let d_type = rec[18];
         if reclen < HEADER_LEN || pos + reclen > buf.len() {
             tracing::error!(pos, reclen, "malformed dirent record from the kernel");
             break;
@@ -40,27 +34,12 @@ pub fn parse(buf: &[u8]) -> Vec<RawDirent> {
             .position(|&b| b == 0)
             .unwrap_or(name_area.len());
         out.push(RawDirent {
-            ino,
             off,
-            d_type,
             name: name_area[..name_len].to_vec(),
         });
         pos += reclen;
     }
     out
-}
-
-fn kind_from_dtype(d_type: u8) -> Option<FileKind> {
-    Some(match d_type {
-        libc::DT_REG => FileKind::Regular,
-        libc::DT_DIR => FileKind::Directory,
-        libc::DT_LNK => FileKind::Symlink,
-        libc::DT_FIFO => FileKind::Fifo,
-        libc::DT_SOCK => FileKind::Socket,
-        libc::DT_CHR => FileKind::CharDevice,
-        libc::DT_BLK => FileKind::BlockDevice,
-        _ => return None,
-    })
 }
 
 fn getdents64(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
@@ -82,13 +61,8 @@ fn getdents64(fd: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize, Errno> {
 
 /// One page of a directory. `end` says the directory ended with the last entry returned, which stays true across the entries this page skipped after it (a vanished entry, a mount point): a seek to that entry's cookie re-reads and re-skips them and finds nothing.
 pub struct Listing {
-    pub entries: Entries,
+    pub entries: Vec<DirEntry>,
     pub end: bool,
-}
-
-pub enum Entries {
-    Plain(Vec<DirEntry>),
-    Plus(Vec<DirEntryPlus>),
 }
 
 /// Log a failure to describe `name`. `Ok` means the listing goes on without the entry: it vanished between `getdents64` and its stat, it is a mount point (not exported), or the server cannot describe it (no search permission on the directory, an I/O error), in which case a lookup of it would fail the same way. `Err` ends the listing: the server ran out of a resource, and a page missing the entries it could not afford would read as a shorter directory.
@@ -114,18 +88,16 @@ fn entry_failure(name: &[u8], e: Errno) -> Result<(), Errno> {
     }
 }
 
-/// Read entries starting at cookie `offset` until roughly `max_bytes` of them are collected or the directory ends. With `plus`, every entry except `.`/`..` carries its attributes, described from the directory's own fd so a page costs no file descriptors. An entry that vanished or cannot be described is skipped, as is a mount point and an entry whose inode does not map; a resource failure ends the listing with its errno ([`entry_failure`]). An entry's `kind` comes from its attributes when it has them, so the two cannot disagree when the name is replaced mid-listing.
+/// Read entries starting at cookie `offset` until roughly `max_bytes` of them are collected or the directory ends. Every entry except `.`/`..` carries its attributes, described from the directory's own fd so a page costs no file descriptors. An entry that vanished or cannot be described is skipped, as is a mount point; a resource failure ends the listing with its errno ([`entry_failure`]).
 pub fn read_dir(
     export: &Export,
     dir: BorrowedFd<'_>,
     offset: u64,
     max_bytes: usize,
-    plus: bool,
 ) -> Result<Listing, Errno> {
     lseek(dir, offset as i64, Whence::SeekSet)?;
     let mut buf = vec![0u8; 64 * 1024];
-    let mut plain = Vec::new();
-    let mut with_attr = Vec::new();
+    let mut entries = Vec::new();
     let mut used = 0;
     let mut end = false;
     'outer: loop {
@@ -136,8 +108,10 @@ pub fn read_dir(
         }
         for raw in parse(&buf[..n]) {
             let name = raw.name;
-            let is_dot = name == b"." || name == b"..";
-            let attr = if plus && !is_dot {
+            // The dots go without attributes; the client numbers them after its own nodes for the two directories.
+            let attr = if name == b"." || name == b".." {
+                None
+            } else {
                 let Ok(component) = Name::new(name.as_slice()) else {
                     tracing::warn!(name = %String::from_utf8_lossy(&name), "skipping entry whose name the protocol cannot carry");
                     continue;
@@ -149,54 +123,20 @@ pub fn read_dir(
                         continue;
                     }
                 }
-            } else {
-                None
             };
-            let kind = match attr
-                .as_ref()
-                .map(|a| a.kind)
-                .or_else(|| kind_from_dtype(raw.d_type))
-            {
-                Some(kind) => kind,
-                None => match fstatat(dir, name.as_slice(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-                    Ok(st) => match kind_from_mode(st.st_mode) {
-                        Some(kind) => kind,
-                        None => continue,
-                    },
-                    Err(e) => {
-                        entry_failure(&name, e)?;
-                        continue;
-                    }
-                },
-            };
-            // The dots included, whose numbers the client replaces with those of its own nodes for the two directories.
-            let ino = raw.ino;
             // `max_bytes` is clamped to `MAX_IO`, half of `MAX_FRAME`, so a budget that overshoots by one entry still fits a frame.
             used += jackalopefs_proto::dir_entry_bytes(name.len(), attr.as_ref());
-            let entry = DirEntry {
-                ino,
+            entries.push(DirEntry {
                 next_offset: raw.off,
-                kind,
                 name,
-            };
-            if plus {
-                with_attr.push(DirEntryPlus { entry, attr });
-            } else {
-                plain.push(entry);
-            }
+                attr,
+            });
             if used >= max_bytes {
                 break 'outer;
             }
         }
     }
-    Ok(Listing {
-        entries: if plus {
-            Entries::Plus(with_attr)
-        } else {
-            Entries::Plain(plain)
-        },
-        end,
-    })
+    Ok(Listing { entries, end })
 }
 
 /// Convenience for callers holding an `OwnedFd`.
@@ -205,9 +145,8 @@ pub fn read_dir_fd<F: AsFd>(
     dir: &F,
     offset: u64,
     max_bytes: usize,
-    plus: bool,
 ) -> Result<Listing, Errno> {
-    read_dir(export, dir.as_fd(), offset, max_bytes, plus)
+    read_dir(export, dir.as_fd(), offset, max_bytes)
 }
 
 #[cfg(test)]
@@ -241,21 +180,15 @@ mod tests {
             parsed,
             vec![
                 RawDirent {
-                    ino: 10,
                     off: 100,
-                    d_type: libc::DT_REG,
                     name: b"a".to_vec()
                 },
                 RawDirent {
-                    ino: 11,
                     off: 200,
-                    d_type: libc::DT_DIR,
                     name: b"longer-name".to_vec()
                 },
                 RawDirent {
-                    ino: 12,
                     off: 300,
-                    d_type: libc::DT_UNKNOWN,
                     name: b"\xff\xfe".to_vec()
                 },
             ]
@@ -267,44 +200,17 @@ mod tests {
     }
 
     fn names(listing: &Listing) -> Vec<Vec<u8>> {
-        match &listing.entries {
-            Entries::Plain(v) => v.iter().map(|e| e.name.to_vec()).collect(),
-            Entries::Plus(v) => v.iter().map(|e| e.entry.name.to_vec()).collect(),
-        }
+        listing.entries.iter().map(|e| e.name.to_vec()).collect()
     }
 
     fn last_offset(listing: &Listing) -> Option<u64> {
-        match &listing.entries {
-            Entries::Plain(v) => v.last().map(|e| e.next_offset),
-            Entries::Plus(v) => v.last().map(|e| e.entry.next_offset),
-        }
+        listing.entries.last().map(|e| e.next_offset)
     }
 
     /// `read_dir` fills up to `max_bytes` using `dir_entry_bytes`; the reply for a full `MAX_IO` budget must still fit in a frame, in one segment.
     #[test]
     fn a_full_page_of_entries_fits_in_a_frame() {
-        use jackalopefs_proto::{
-            encode, Attr, DirEntryPlus, Response, TimeSpec, MAX_FRAME, MAX_IO,
-        };
-        let entry = || DirEntry {
-            ino: 1,
-            next_offset: 1,
-            kind: FileKind::Regular,
-            name: b"a".to_vec(),
-        };
-        let mut plain = Vec::new();
-        let mut used = 0;
-        while used < MAX_IO {
-            plain.push(entry());
-            used += jackalopefs_proto::dir_entry_bytes(1, None);
-        }
-        let frame = encode(&Response::Readdir {
-            entries: plain,
-            end: false,
-        })
-        .unwrap();
-        assert!(frame.len() - 4 <= MAX_FRAME, "{} bytes", frame.len());
-
+        use jackalopefs_proto::{encode, Attr, FileKind, Response, TimeSpec, MAX_FRAME, MAX_IO};
         let t = TimeSpec { sec: 0, nsec: 0 };
         let attr = Attr {
             ino: 1,
@@ -329,17 +235,18 @@ mod tests {
             },
             foreign: false,
         };
-        let mut plus = Vec::new();
+        let mut described = Vec::new();
         let mut used = 0;
         while used < MAX_IO {
-            plus.push(DirEntryPlus {
-                entry: entry(),
+            described.push(DirEntry {
+                next_offset: 1,
+                name: b"a".to_vec(),
                 attr: Some(attr.clone()),
             });
             used += jackalopefs_proto::dir_entry_bytes(1, Some(&attr));
         }
-        let frame = encode(&Response::ReaddirPlus {
-            entries: plus,
+        let frame = encode(&Response::Readdir {
+            entries: described,
             end: false,
         })
         .unwrap();
@@ -367,7 +274,7 @@ mod tests {
             )
             .unwrap();
 
-        let all = read_dir_fd(&export, &fd, 0, usize::MAX, false).unwrap();
+        let all = read_dir_fd(&export, &fd, 0, usize::MAX).unwrap();
         let all_names: BTreeSet<Vec<u8>> = names(&all).into_iter().collect();
         assert_eq!(all_names.len(), 203);
         assert!(all.end, "an unbudgeted read reaches the end");
@@ -377,7 +284,7 @@ mod tests {
         let mut offset = 0;
         let mut ended = false;
         loop {
-            let page = read_dir_fd(&export, &fd, offset, 1000, true).unwrap();
+            let page = read_dir_fd(&export, &fd, offset, 1000).unwrap();
             let page_names = names(&page);
             if page_names.is_empty() {
                 break;
@@ -385,12 +292,13 @@ mod tests {
             // Which page says `end` depends on whether the budget ran out exactly at the last entry, so only this direction is asserted.
             assert!(!ended, "no page follows one that said the directory ended");
             ended = page.end;
-            if let Entries::Plus(entries) = &page.entries {
-                for e in entries {
-                    assert_eq!(e.attr.is_none(), e.entry.is_dot_or_dotdot());
-                    if e.entry.name.as_slice() == b"subdir" {
-                        assert_eq!(e.attr.as_ref().unwrap().kind, FileKind::Directory);
-                    }
+            for e in &page.entries {
+                assert_eq!(e.attr.is_none(), e.is_dot_or_dotdot());
+                if e.name.as_slice() == b"subdir" {
+                    assert_eq!(
+                        e.attr.as_ref().unwrap().kind,
+                        jackalopefs_proto::FileKind::Directory
+                    );
                 }
             }
             paged.extend(page_names);
@@ -400,7 +308,7 @@ mod tests {
         assert_eq!(paged.into_iter().collect::<BTreeSet<_>>(), all_names);
     }
 
-    /// An entry the server has no search permission to stat is left out of a readdirplus page, which a lookup of it would refuse the same way; a plain page, which needs no stat, still names it.
+    /// An entry the server has no search permission to stat is left out of a listing, which a lookup of it would refuse the same way.
     #[test]
     fn an_entry_that_cannot_be_described_is_left_out() {
         if nix::unistd::geteuid().is_root() {
@@ -420,24 +328,22 @@ mod tests {
             )
             .unwrap();
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o644)).unwrap();
-        let plain = read_dir_fd(&export, &fd, 0, usize::MAX, false);
-        let plus = read_dir_fd(&export, &fd, 0, usize::MAX, true);
+        let listing = read_dir_fd(&export, &fd, 0, usize::MAX);
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(names(&plain.unwrap()).contains(&b"file".to_vec()));
-        let plus = plus.unwrap();
-        assert_eq!(names(&plus), vec![b".".to_vec(), b"..".to_vec()]);
-        assert!(plus.end);
+        let listing = listing.unwrap();
+        assert_eq!(names(&listing), vec![b".".to_vec(), b"..".to_vec()]);
+        assert!(listing.end);
     }
 
-    /// The regression test for a server whose descriptors a client's open files have used up: a readdirplus page is described without opening anything, so it still comes back. The check runs in a child process (this same test, re-executed with the marker set), since exhausting the descriptors of the test process would fail every other test running beside it.
+    /// The regression test for a server whose descriptors a client's open files have used up: a listing is described without opening anything, so it still comes back. The check runs in a child process (this same test, re-executed with the marker set), since exhausting the descriptors of the test process would fail every other test running beside it.
     #[test]
-    fn a_readdirplus_page_needs_no_file_descriptors() {
+    fn a_listing_needs_no_file_descriptors() {
         const MARKER: &str = "JACKALOPEFS_TEST_FD_EXHAUSTED_CHILD";
         if std::env::var_os(MARKER).is_none() {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "dirents::tests::a_readdirplus_page_needs_no_file_descriptors",
+                    "dirents::tests::a_listing_needs_no_file_descriptors",
                     "--nocapture",
                 ])
                 .env(MARKER, "1")
@@ -478,19 +384,17 @@ mod tests {
             fs::File::open("/dev/null").is_err(),
             "no descriptor is left"
         );
-        let listing = read_dir_fd(&export, &fd, 0, usize::MAX, true);
+        let listing = read_dir_fd(&export, &fd, 0, usize::MAX);
         drop(hoard);
-        let listing = listing.expect("a readdirplus page opens nothing");
+        let listing = listing.expect("a listing opens nothing");
         assert_eq!(names(&listing).len(), 52);
-        let Entries::Plus(entries) = listing.entries else {
-            panic!("a readdirplus page carries attributes");
-        };
-        assert!(entries
+        assert!(listing
+            .entries
             .iter()
-            .all(|e| e.attr.is_some() || e.entry.is_dot_or_dotdot()));
+            .all(|e| e.attr.is_some() || e.is_dot_or_dotdot()));
     }
 
-    /// A mount point inside the export is left out of a readdirplus page, as the resolver refuses to cross into it.
+    /// A mount point inside the export is left out of a listing, as the resolver refuses to cross into it.
     #[test]
     fn a_mount_point_is_left_out() {
         if !fs::read_to_string("/proc/self/mounts")
@@ -508,12 +412,12 @@ mod tests {
                 OFlag::O_RDONLY | OFlag::O_DIRECTORY,
             )
             .unwrap();
-        let listed = names(&read_dir_fd(&export, &fd, 0, usize::MAX, true).unwrap());
+        let listed = names(&read_dir_fd(&export, &fd, 0, usize::MAX).unwrap());
         assert!(!listed.contains(&b"proc".to_vec()), "{listed:?}");
         assert!(listed.contains(&b"etc".to_vec()), "{listed:?}");
     }
 
-    /// A readdirplus entry is described from the directory's fd alone: a symlink describes itself, and a file's xattr names come along.
+    /// A listed entry is described from the directory's fd alone: a symlink describes itself, and a file's xattr names come along.
     #[test]
     fn describes_entries_from_the_directory_fd() {
         let dir = tempfile::tempdir().unwrap();
@@ -542,21 +446,19 @@ mod tests {
                 OFlag::O_RDONLY | OFlag::O_DIRECTORY,
             )
             .unwrap();
-        let listing = read_dir_fd(&export, &fd, 0, usize::MAX, true).unwrap();
-        let Entries::Plus(entries) = listing.entries else {
-            panic!("a readdirplus page carries attributes");
-        };
+        let listing = read_dir_fd(&export, &fd, 0, usize::MAX).unwrap();
         let attr = |name: &[u8]| {
-            entries
+            listing
+                .entries
                 .iter()
-                .find(|e| e.entry.name.as_slice() == name)
+                .find(|e| e.name.as_slice() == name)
                 .unwrap_or_else(|| panic!("{} listed", String::from_utf8_lossy(name)))
                 .attr
                 .clone()
                 .unwrap()
         };
-        assert_eq!(attr(b"link").kind, FileKind::Symlink);
-        assert_eq!(attr(b"file").kind, FileKind::Regular);
+        assert_eq!(attr(b"link").kind, jackalopefs_proto::FileKind::Symlink);
+        assert_eq!(attr(b"file").kind, jackalopefs_proto::FileKind::Regular);
         assert_eq!(attr(b"file").size, 1);
         if xattrs {
             assert_eq!(attr(b"file").xattr_names, Some(vec![b"user.k".to_vec()]));

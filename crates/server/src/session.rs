@@ -603,7 +603,6 @@ fn outcome_of(resp: &Response) -> Outcome {
         // No payload, but bytes this server moved all the same.
         Response::Copied(n) => Outcome::bytes(*n as usize),
         Response::Readdir { entries, .. } => Outcome::items(entries.len()),
-        Response::ReaddirPlus { entries, .. } => Outcome::items(entries.len()),
         _ => Outcome::default(),
     }
 }

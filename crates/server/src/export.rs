@@ -300,7 +300,7 @@ fn statx(
     Ok(unsafe { st.assume_init() })
 }
 
-/// Most names a node may carry in an `Attr`; beyond this the client asks. Bounds the readdirplus page and the memory a name list can take.
+/// Most names a node may carry in an `Attr`; beyond this the client asks. Bounds a listing page and the memory a name list can take.
 const XATTR_NAMES_MAX: usize = 1024;
 
 /// The node's extended attribute names for its `Attr`, through the pinned fd's `/proc` path (which follows the magic link to the node itself; `llistxattr` would describe the link). `None` when the client has to ask instead: more than [`XATTR_NAMES_MAX`] bytes of names, or a filesystem without xattr support, whose errno a `getxattr` must return rather than the ENODATA an empty list would imply.

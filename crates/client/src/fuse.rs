@@ -12,7 +12,7 @@ use fuser::{
     Request, RequestId,
 };
 use jackalopefs_proto::{
-    Attr, DirEntryPlus, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, Whence, MAX_IO,
+    Attr, DirEntry, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, Whence, MAX_IO,
 };
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -60,7 +60,7 @@ struct AttrReported {
 }
 
 /// Entries fetched from the server but not yet handed to the kernel, each tagged with the cookie that yields it. Every fetch carries attributes, so one buffer serves either kind of page.
-type DirBuffer = VecDeque<(u64, DirEntryPlus)>;
+type DirBuffer = VecDeque<(u64, DirEntry)>;
 
 /// What a directory handle holds between kernel requests.
 struct DirState {
@@ -618,12 +618,12 @@ impl Shared {
         } else {
             READDIR_FETCH
         };
-        let (entries, end) = self.client.readdirplus(fh, offset, fetch).await?;
+        let (entries, end) = self.client.readdir(fh, offset, fetch).await?;
         if let Some(state) = self.dirs.lock().get_mut(&fh) {
             state.fetched = Instant::now();
         }
-        self.note_end(fh, entries.last().map(|e| e.entry.next_offset), end);
-        Ok(tag_with_cookies(entries, offset, |e| e.entry.next_offset).into())
+        self.note_end(fh, entries.last().map(|e| e.next_offset), end);
+        Ok(tag_with_cookies(entries, offset, |e| e.next_offset).into())
     }
 
     /// Keep what the kernel's buffer did not take for its next request on the handle.
@@ -663,7 +663,7 @@ impl Shared {
         let nodes = self.nodes.lock();
         while let Some((cookie, entry)) = entries.next() {
             let Some(number) = plain_number(&nodes, ino, parent, &entry) else {
-                tracing::warn!(dir = ino, name = %String::from_utf8_lossy(&entry.entry.name), "directory entry without attributes; skipped");
+                tracing::warn!(dir = ino, name = %String::from_utf8_lossy(&entry.name), "directory entry without attributes; skipped");
                 continue;
             };
             // The dots are directories, and every other entry numbered has attributes.
@@ -673,9 +673,9 @@ impl Shared {
                 .map_or(FileKind::Directory, |attr| attr.kind);
             if reply.add(
                 INodeNo(number),
-                entry.entry.next_offset,
+                entry.next_offset,
                 file_type(kind),
-                OsStr::from_bytes(&entry.entry.name),
+                OsStr::from_bytes(&entry.name),
             ) {
                 let mut rest = VecDeque::from([(cookie, entry)]);
                 rest.extend(entries);
@@ -688,8 +688,8 @@ impl Shared {
 }
 
 /// The number a plain page lists an entry of directory `dir` (whose parent is `parent`) under: the one the node table gives the file, which is what a lookup of it registers and `stat` then reports, substitute included, without registering anything, since a plain page takes no lookup count. `None` for an entry without attributes, which cannot be numbered.
-fn plain_number(nodes: &NodeTable, dir: u64, parent: u64, entry: &DirEntryPlus) -> Option<u64> {
-    match entry.entry.name.as_slice() {
+fn plain_number(nodes: &NodeTable, dir: u64, parent: u64, entry: &DirEntry) -> Option<u64> {
+    match entry.name.as_slice() {
         b"." => Some(dir),
         b".." => Some(parent),
         _ => entry.attr.as_ref().map(|attr| nodes.id_for(attr.into())),
@@ -1585,11 +1585,11 @@ impl Filesystem for Backend {
             };
             let mut added = 0;
             for (cookie, entry) in entries.by_ref() {
-                let name = OsStr::from_bytes(&entry.entry.name);
-                let full = match (entry.entry.name.as_slice(), &entry.attr) {
+                let name = OsStr::from_bytes(&entry.name);
+                let full = match (entry.name.as_slice(), &entry.attr) {
                     (b".", _) => reply.add(
                         INodeNo(ino.0),
-                        entry.entry.next_offset,
+                        entry.next_offset,
                         name,
                         &shared.entry_ttl,
                         &dir_placeholder(ino.0),
@@ -1599,7 +1599,7 @@ impl Filesystem for Backend {
                         let parent = shared.parent_of(ino.0);
                         reply.add(
                             INodeNo(parent),
-                            entry.entry.next_offset,
+                            entry.next_offset,
                             name,
                             &shared.entry_ttl,
                             &dir_placeholder(parent),
@@ -1607,8 +1607,8 @@ impl Filesystem for Backend {
                         )
                     }
                     (_, Some(attr)) => {
-                        let Ok(entry_name) = Name::new(entry.entry.name.as_slice()) else {
-                            tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.entry.name), "readdirplus entry with an invalid name; skipped");
+                        let Ok(entry_name) = Name::new(entry.name.as_slice()) else {
+                            tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.name), "readdirplus entry with an invalid name; skipped");
                             continue;
                         };
                         // The kernel may refuse the entry for want of room, and one it refused must leave no node behind, so the node is asked for first and registered once the entry is in; the table stays locked between the two, or another request could be given the number meanwhile.
@@ -1617,7 +1617,7 @@ impl Filesystem for Backend {
                             let id = nodes.id_for(attr.into());
                             let full = reply.add(
                                 INodeNo(id),
-                                entry.entry.next_offset,
+                                entry.next_offset,
                                 name,
                                 &shared.entry_ttl,
                                 &file_attr(id, attr),
@@ -1635,7 +1635,7 @@ impl Filesystem for Backend {
                         full
                     }
                     (_, None) => {
-                        tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.entry.name), "readdirplus entry without attributes; skipped");
+                        tracing::warn!(dir = ino.0, name = %String::from_utf8_lossy(&entry.name), "readdirplus entry without attributes; skipped");
                         continue;
                     }
                 };
@@ -1888,7 +1888,7 @@ fn reply_xattr(reply: ReplyXattr, size: u32, value: &[u8]) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jackalopefs_proto::{DirEntry, Identity};
+    use jackalopefs_proto::Identity;
 
     /// The file with inode number `ino` in its `generation`th life, as ext4 would put it in a handle.
     fn identity(ino: u64, generation: u32) -> Identity {
@@ -1898,15 +1898,11 @@ mod tests {
         }
     }
 
-    fn listed(name: &str, ino: u64, generation: u32, foreign: bool) -> DirEntryPlus {
+    fn listed(name: &str, ino: u64, generation: u32, foreign: bool) -> DirEntry {
         let t = TimeSpec { sec: 0, nsec: 0 };
-        DirEntryPlus {
-            entry: DirEntry {
-                ino,
-                next_offset: 1,
-                kind: FileKind::Regular,
-                name: name.as_bytes().to_vec(),
-            },
+        DirEntry {
+            next_offset: 1,
+            name: name.as_bytes().to_vec(),
             attr: Some(Attr {
                 ino,
                 size: 0,
@@ -1929,10 +1925,10 @@ mod tests {
     }
 
     /// What a lookup of the listed name registers, which is what `stat` then reports.
-    fn looked_up(nodes: &mut NodeTable, dir: u64, item: &DirEntryPlus) -> Option<u64> {
+    fn looked_up(nodes: &mut NodeTable, dir: u64, item: &DirEntry) -> Option<u64> {
         nodes.insert_lookup(
             dir,
-            Name::new(item.entry.name.as_slice()).unwrap(),
+            Name::new(item.name.as_slice()).unwrap(),
             item.attr.as_ref().unwrap().into(),
         )
     }
@@ -2048,16 +2044,14 @@ mod tests {
     fn cookies_tag_each_entry_with_what_yields_it() {
         let entries = vec![
             DirEntry {
-                ino: 1,
                 next_offset: 10,
-                kind: FileKind::Regular,
                 name: b"a".to_vec(),
+                attr: None,
             },
             DirEntry {
-                ino: 2,
                 next_offset: 20,
-                kind: FileKind::Regular,
                 name: b"b".to_vec(),
+                attr: None,
             },
         ];
         let tagged = tag_with_cookies(entries, 5, |e| e.next_offset);

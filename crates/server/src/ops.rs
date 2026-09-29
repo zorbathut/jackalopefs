@@ -1,6 +1,6 @@
 //! One synchronous function per request, run on the blocking pool. Every path goes through [`Export`]; every open file goes through [`Handles`].
 
-use crate::dirents::{read_dir_fd, Entries};
+use crate::dirents::read_dir_fd;
 use crate::export::{kind_from_mode, proc_path, Export};
 use crate::handles::{Handle, Handles};
 use crate::ids::IdMap;
@@ -450,7 +450,6 @@ impl Ops {
                 fh,
                 offset,
                 max_bytes,
-                plus,
             } => {
                 let dir = self.handles.dir(fh)?;
                 let guard = dir.lock();
@@ -459,12 +458,10 @@ impl Ops {
                     &*guard,
                     offset,
                     (max_bytes as usize).min(MAX_IO),
-                    plus,
                 )?;
-                let end = listing.end;
-                Ok(match listing.entries {
-                    Entries::Plain(entries) => Response::Readdir { entries, end },
-                    Entries::Plus(entries) => Response::ReaddirPlus { entries, end },
+                Ok(Response::Readdir {
+                    entries: listing.entries,
+                    end: listing.end,
                 })
             }
             Request::Statfs { path } => {
@@ -1494,7 +1491,6 @@ mod tests {
                 fh: 2,
                 offset: 0,
                 max_bytes: 1 << 20,
-                plus: false,
             },
         ) {
             Response::Readdir { entries, end } => {
@@ -1505,14 +1501,10 @@ mod tests {
                         && names.contains(&b"..".as_slice())
                         && names.contains(&b"x".as_slice())
                 );
-                assert_eq!(
-                    entries
-                        .iter()
-                        .find(|e| e.name.as_slice() == b".")
-                        .unwrap()
-                        .ino,
-                    root_ino
-                );
+                // The dots go without attributes; the client numbers them itself.
+                assert!(entries
+                    .iter()
+                    .all(|e| e.attr.is_none() == e.is_dot_or_dotdot()));
             }
             other => panic!("{other:?}"),
         }

@@ -19,7 +19,7 @@ const READ_CHUNK: usize = 64 * 1024;
 /// Words a decoder may traverse per frame. Four times the largest frame: pointer aliasing stays bounded, but a legitimately maximal message never trips it even though the reader charges every getter call and double-counts re-reads. Changing it is a protocol change: edit the schema so the revision moves.
 const TRAVERSAL_LIMIT_WORDS: usize = 4 * MAX_FRAME / 8;
 
-/// The deepest real message is six pointer levels (Response → List(DirEntryPlus) → DirEntryPlus → Attr → List(Data) → Data); sixteen leaves room without inviting recursion abuse. Changing it is a protocol change: edit the schema so the revision moves.
+/// The deepest real message is six pointer levels (Response → List(DirEntry) → DirEntry → Attr → List(Data) → Data); sixteen leaves room without inviting recursion abuse. Changing it is a protocol change: edit the schema so the revision moves.
 const NESTING_LIMIT: i32 = 16;
 
 #[derive(Debug, thiserror::Error)]
@@ -301,7 +301,6 @@ mod tests {
                 fh: 3,
                 offset: 0,
                 max_bytes: 65536,
-                plus: true,
             },
             Request::Releasedir { fh: 3 },
             Request::Statfs { path: Path::root() },
@@ -381,7 +380,7 @@ mod tests {
         }
     }
 
-    const RESPONSE_VARIANTS: usize = 14;
+    const RESPONSE_VARIANTS: usize = 13;
 
     fn response_index(resp: &Response) -> usize {
         match resp {
@@ -394,20 +393,18 @@ mod tests {
             Response::Read(_) => 6,
             Response::Written(_) => 7,
             Response::Readdir { .. } => 8,
-            Response::ReaddirPlus { .. } => 9,
-            Response::Statfs(_) => 10,
-            Response::Xattr(_) => 11,
-            Response::Copied(_) => 12,
-            Response::Seeked(_) => 13,
+            Response::Statfs(_) => 9,
+            Response::Xattr(_) => 10,
+            Response::Copied(_) => 11,
+            Response::Seeked(_) => 12,
         }
     }
 
     fn all_responses() -> Vec<Response> {
-        let entry = DirEntry {
-            ino: 5,
+        let dots = DirEntry {
             next_offset: 77,
-            kind: FileKind::Directory,
             name: b"..".to_vec(),
+            attr: None,
         };
         vec![
             Response::Err(2),
@@ -425,19 +422,11 @@ mod tests {
             Response::Read(vec![0u8; 100]),
             Response::Written(100),
             Response::Readdir {
-                entries: vec![entry.clone()],
-                end: true,
-            },
-            Response::ReaddirPlus {
                 entries: vec![
-                    DirEntryPlus { entry, attr: None },
-                    DirEntryPlus {
-                        entry: DirEntry {
-                            ino: 6,
-                            next_offset: 78,
-                            kind: FileKind::Symlink,
-                            name: b"x".to_vec(),
-                        },
+                    dots,
+                    DirEntry {
+                        next_offset: 78,
+                        name: b"x".to_vec(),
                         attr: Some(sample_attr(6)),
                     },
                 ],
@@ -785,18 +774,28 @@ mod tests {
             Err(ErrorCodec::Decode(ErrorDecode::NotInSchema(n))) if n == unknown
         ));
 
-        // A readdir reply: root struct (16 data + 8 pointer), list tag word (8), then the first DirEntry whose kind is at bits 128..144.
-        let entry = DirEntry {
-            ino: 1,
-            next_offset: 2,
-            kind: FileKind::BlockDevice,
-            name: b"n".to_vec(),
+        // An entry's kind, in its attributes: found where two listings that differ only in it differ.
+        let listing = |kind| {
+            frame_body(&Response::Readdir {
+                entries: vec![DirEntry {
+                    next_offset: 2,
+                    name: b"n".to_vec(),
+                    attr: Some(Attr {
+                        kind,
+                        ..sample_attr(1)
+                    }),
+                }],
+                end: false,
+            })
         };
-        let mut body = frame_body(&Response::Readdir {
-            entries: vec![entry],
-            end: false,
-        });
-        let kind_at = ROOT_DATA + 24 + 8 + 16;
+        let (mut body, other) = (listing(FileKind::BlockDevice), listing(FileKind::Regular));
+        let differ: Vec<usize> = (0..body.len()).filter(|&i| body[i] != other[i]).collect();
+        assert_eq!(
+            differ.len(),
+            1,
+            "layout assumption: the kind is one byte apart"
+        );
+        let kind_at = differ[0] & !1;
         assert_eq!(
             &body[kind_at..kind_at + 2],
             &6u16.to_le_bytes(),
@@ -1025,13 +1024,6 @@ b"(ack = (sessionId = 9, resumeToken = \"0123456789abcdef\", resumed = true, roo
     /// `dir_entry_bytes` is what the server budgets a page with, so it must be the true marginal cost of an entry.
     #[test]
     fn dir_entry_bytes_is_the_marginal_cost_of_an_entry() {
-        let entry = |n: usize| DirEntry {
-            ino: n as u64,
-            next_offset: n as u64,
-            kind: FileKind::Regular,
-            name: format!("name{n}").into_bytes(),
-        };
-        let plain: Vec<DirEntry> = (0..8).map(entry).collect();
         let cost = |entries: &[DirEntry]| {
             encode(&Response::Readdir {
                 entries: entries.to_vec(),
@@ -1040,8 +1032,16 @@ b"(ack = (sessionId = 9, resumeToken = \"0123456789abcdef\", resumed = true, roo
             .unwrap()
             .len()
         };
+        // Entries without attributes, as the dots are.
+        let bare: Vec<DirEntry> = (0..8)
+            .map(|n| DirEntry {
+                next_offset: n as u64,
+                name: format!("name{n}").into_bytes(),
+                attr: None,
+            })
+            .collect();
         assert_eq!(
-            cost(&plain[..8]) - cost(&plain[..7]),
+            cost(&bare[..8]) - cost(&bare[..7]),
             dir_entry_bytes(5, None)
         );
         let cases = [
@@ -1064,22 +1064,15 @@ b"(ack = (sessionId = 9, resumeToken = \"0123456789abcdef\", resumed = true, roo
                 },
                 ..sample_attr(n)
             };
-            let plus: Vec<DirEntryPlus> = (0..8)
-                .map(|n| DirEntryPlus {
-                    entry: entry(n),
+            let described: Vec<DirEntry> = (0..8)
+                .map(|n| DirEntry {
+                    next_offset: n as u64,
+                    name: format!("name{n}").into_bytes(),
                     attr: Some(attr(n as u64)),
                 })
                 .collect();
-            let cost = |entries: &[DirEntryPlus]| {
-                encode(&Response::ReaddirPlus {
-                    entries: entries.to_vec(),
-                    end: false,
-                })
-                .unwrap()
-                .len()
-            };
             assert_eq!(
-                cost(&plus[..8]) - cost(&plus[..7]),
+                cost(&described[..8]) - cost(&described[..7]),
                 dir_entry_bytes(5, Some(&attr(7))),
                 "{names:?} with a handle of {handle_len} bytes"
             );
@@ -1090,16 +1083,22 @@ b"(ack = (sessionId = 9, resumeToken = \"0123456789abcdef\", resumed = true, roo
     fn golden_bytes() {
         let (hellos, replies, event) = control_messages();
         let readdir = Response::Readdir {
-            entries: vec![DirEntry {
-                ino: 3,
-                next_offset: 4,
-                kind: FileKind::Directory,
-                name: b"n".to_vec(),
-            }],
+            entries: vec![
+                DirEntry {
+                    next_offset: 4,
+                    name: b".".to_vec(),
+                    attr: None,
+                },
+                DirEntry {
+                    next_offset: 5,
+                    name: b"n".to_vec(),
+                    attr: Some(sample_attr(3)),
+                },
+            ],
             end: true,
         };
         let cases: [(&str, Vec<u8>, &str); 6] = [
-            ("readdir", frame_body(&readdir), "000000000a00000000000000020001000100000008000000000000000000000001000000270000000400000003000100030000000000000004000000000000000100000000000000010000000a0000006e00000000000000"),
+            ("readdir", frame_body(&readdir), "00000000250000000000000002000100010000000800000000000000000000000100000047000000080000000200020004000000000000000000000000000000150000000a000000000000000000000005000000000000000100000000000000090000000a000000080000000c0002002e000000000000006e0000000000000003000000000000002a000000000000000100000000000000010000000000000002000000040000000300000000000000fbffffffffffffff060000000000a40101000000e8030000e803000000100000000000000000000001000000000000000500000016000000140000000100010005000000320000000500000082000000757365722e6b000073656375726974792e73656c696e75780100000000000000010000004200000003000000efbeedfe"),
             ("hello", frame_body(&hellos[1]), "000000000a0000000000000002000200080706050403020101000100000000000500000032000000040000000100010073656372657400000300000000000000010000008200000007070707070707070707070707070707"),
             ("reply", frame_body(&replies[0]), "000000000c0000000000000004000200010000000000000001000000ed0300000200000000000000e80300000000000005000000820000000800000001000100010101010101010101010101010101010100000000000000010000004200000002000000efbeedfe"),
             ("request", frame_body(&Request::Rename { parent: path("a"), name: name("b"), newparent: path("c"), newname: name("d"), flags: 1 }), "000000001100000000000000060004000900000000000000010000000000000000000000000000000000000000000000000000000000000000000000000000000d0000000e000000110000000a000000110000000e000000150000000a000000010000000a00000061000000000000006200000000000000010000000a00000063000000000000006400000000000000"),

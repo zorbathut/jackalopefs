@@ -7,8 +7,8 @@ use crate::inodes::KeyNode;
 use crate::perf::{AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_proto::{
-    read_frame, write_frame, Attr, Auth, DirEntry, DirEntryPlus, ErrorCodec, Event, Identity, Name,
-    Path, Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
+    read_frame, write_frame, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name, Path,
+    Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
 };
 use quinn::{Connection, RecvStream, SendStream};
 use std::future::Future;
@@ -204,7 +204,7 @@ impl KeyRoot {
             Response::Entry(attr) | Response::Attr(attr) | Response::Opened { attr } => {
                 rewrite(attr)
             }
-            Response::ReaddirPlus { entries, .. } => entries
+            Response::Readdir { entries, .. } => entries
                 .iter_mut()
                 .filter_map(|e| e.attr.as_mut())
                 .for_each(rewrite),
@@ -254,7 +254,6 @@ fn outcome_of(result: &Result<Response, Error>) -> Outcome {
         // A copy moves no payload; what the server copied is counted by the kernel-level row.
         Ok(Response::Copied(_)) => Outcome::default(),
         Ok(Response::Readdir { entries, .. }) => Outcome::items(entries.len()),
-        Ok(Response::ReaddirPlus { entries, .. }) => Outcome::items(entries.len()),
         Ok(_) => Outcome::default(),
         Err(e) => Outcome::errno(e.errno()),
     }
@@ -826,7 +825,7 @@ impl Client {
         .await
     }
 
-    /// A page of entries and whether the directory ended with its last one.
+    /// A page of entries, every one but the dots with its attributes, and whether the directory ended with its last one.
     pub async fn readdir(
         &self,
         fh: u64,
@@ -838,32 +837,10 @@ impl Client {
                 fh,
                 offset,
                 max_bytes,
-                plus: false,
             })
             .await?
         {
             Response::Readdir { entries, end } => Ok((entries, end)),
-            other => Err(unexpected(other)),
-        }
-    }
-
-    /// A page of entries with attributes and whether the directory ended with its last one.
-    pub async fn readdirplus(
-        &self,
-        fh: u64,
-        offset: u64,
-        max_bytes: u32,
-    ) -> Result<(Vec<DirEntryPlus>, bool), Error> {
-        match self
-            .call(Request::Readdir {
-                fh,
-                offset,
-                max_bytes,
-                plus: true,
-            })
-            .await?
-        {
-            Response::ReaddirPlus { entries, end } => Ok((entries, end)),
             other => Err(unexpected(other)),
         }
     }
@@ -935,7 +912,6 @@ fn response_name(resp: &Response) -> &'static str {
         Response::Read(_) => "Read",
         Response::Written(_) => "Written",
         Response::Readdir { .. } => "Readdir",
-        Response::ReaddirPlus { .. } => "ReaddirPlus",
         Response::Statfs(_) => "Statfs",
         Response::Xattr(_) => "Xattr",
         Response::Copied(_) => "Copied",
