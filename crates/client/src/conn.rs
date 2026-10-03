@@ -12,7 +12,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
 const BACKOFF_MIN: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
@@ -35,7 +35,7 @@ pub struct ConfigConn {
     pub trust: ServerTrust,
     pub auth: Auth,
     pub connect_timeout: Duration,
-    /// Bounds each step of reopening the handles after a new session.
+    /// Bounds each step of reopening the handles after a new session, and how long an outage lasts before it is logged as failing calls at once.
     pub offline_timeout: Duration,
     pub ids: ModeIds,
 }
@@ -54,7 +54,10 @@ pub struct Attached {
 
 #[derive(Clone, Debug)]
 pub enum ConnState {
-    Connecting,
+    /// No connection since `since`: when the last one was lost, or when the manager started.
+    Connecting {
+        since: Instant,
+    },
     Connected(Arc<Attached>),
     /// The manager has stopped for good (unmount, or the first connection attempt failed).
     Closed,
@@ -108,21 +111,27 @@ impl ConnManager {
         );
         let (endpoints, candidates) =
             bind_candidates(&cfg.server_addrs, client_config(cfg.trust.clone())?)?;
-        let (state_tx, state_rx) = watch::channel(ConnState::Connecting);
+        let (state_tx, state_rx) = watch::channel(ConnState::Connecting {
+            since: Instant::now(),
+        });
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
         let (stop_tx, stop_rx) = watch::channel(false);
         let (first_tx, first_rx) = oneshot::channel();
+        let offline_timeout = cfg.offline_timeout;
         let task = tokio::spawn(run(
             cfg, candidates, handles, state_tx, events_tx, stop_rx, first_tx,
         ));
         match first_rx.await {
-            Ok(Ok(())) => Ok(ConnManager {
-                state: state_rx,
-                events: Some(events_rx),
-                stop: stop_tx,
-                task: parking_lot::Mutex::new(Some(task)),
-                endpoints,
-            }),
+            Ok(Ok(())) => {
+                tokio::spawn(announce_outages(state_rx.clone(), offline_timeout));
+                Ok(ConnManager {
+                    state: state_rx,
+                    events: Some(events_rx),
+                    stop: stop_tx,
+                    task: parking_lot::Mutex::new(Some(task)),
+                    endpoints,
+                })
+            }
             Ok(Err(e)) => {
                 close_all(&endpoints, b"connect failed");
                 Err(anyhow::anyhow!(e))
@@ -185,11 +194,17 @@ async fn run(
     let mut root_mounted: Option<KeyRoot> = None;
     let mut backoff = BACKOFF_MIN;
     let mut failures = 0u32;
+    let mut offline_since = Instant::now();
     loop {
         if *stop.borrow() {
             break;
         }
-        if state.send(ConnState::Connecting).is_err() {
+        if state
+            .send(ConnState::Connecting {
+                since: offline_since,
+            })
+            .is_err()
+        {
             break;
         }
         let attempt = tokio::select! {
@@ -235,6 +250,8 @@ async fn run(
             session = attached.session_id,
             resumed,
             generation,
+            offline = (generation > 1)
+                .then(|| tracing::field::display(format!("{:.1?}", offline_since.elapsed()))),
             ids = ids.describe(),
             "connected to {}",
             attached.addr
@@ -295,6 +312,7 @@ async fn run(
         let reader = tokio::spawn(read_events(conn.clone(), events.clone()));
         tokio::select! {
             reason = conn.closed() => {
+                offline_since = Instant::now();
                 tracing::warn!(generation, "connection lost: {reason}");
             }
             _ = stop.changed() => {
@@ -307,6 +325,31 @@ async fn run(
     }
     if state.send(ConnState::Closed).is_err() {
         tracing::debug!("connection state has no subscribers at shutdown");
+    }
+}
+
+/// Log each outage once it has lasted the offline timeout, the moment calls start failing at once; started after the first connection, so a slow mount is not reported as an outage, and ends with the manager.
+async fn announce_outages(mut state: watch::Receiver<ConnState>, offline_timeout: Duration) {
+    let mut announced = None;
+    loop {
+        let since = match *state.borrow_and_update() {
+            ConnState::Connecting { since } if announced != Some(since) => Some(since),
+            _ => None,
+        };
+        let changed = match since {
+            Some(since) => tokio::select! {
+                _ = tokio::time::sleep_until(since + offline_timeout) => {
+                    tracing::warn!("connection lost {:.1?} ago: calls fail with ETIMEDOUT at once until it is back", since.elapsed());
+                    announced = Some(since);
+                    continue;
+                }
+                changed = state.changed() => changed,
+            },
+            None => state.changed().await,
+        };
+        if changed.is_err() {
+            return;
+        }
     }
 }
 
@@ -510,7 +553,8 @@ async fn reopen_handles(
         match joined {
             Ok((fh, rec, outcome)) => {
                 handles.apply_reopen(fh, &rec, outcome);
-                if rec.is_dead() {
+                // A handle closed while it was being reopened had its release fail for want of a connection, and only a resumed session is sent what is owed.
+                if rec.is_dead() || handles.get(fh).is_none() {
                     stale.push(match rec.kind {
                         HandleKind::File => jackalopefs_proto::Request::Release { fh },
                         HandleKind::Dir => jackalopefs_proto::Request::Releasedir { fh },

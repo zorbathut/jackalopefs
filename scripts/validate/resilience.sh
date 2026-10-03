@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# What no external suite tests: a server that stops answering, dies, and comes back, under load through a real mount. Operations must fail with ETIMEDOUT once the connection is gone and the offline deadline has passed instead of hanging, resume when the server does, survive a server restart with contents and open files intact, and a lazy detach must free the mount at once. A request on a live connection has no deadline, so the writer's and reader's `timeout 10` is what bounds them while the server is stopped, and its SIGTERM frees a blocked shell only because the client honours FUSE_INTERRUPT: a client without that shows up here as a hung suite.
+# What no external suite tests: a server that stops answering, dies, and comes back, under load through a real mount. Operations must fail with ETIMEDOUT once the connection is gone and the offline deadline has passed instead of hanging, and at once after that, resume when the server does, survive a server restart with contents and open files intact, and a lazy detach must free the mount at once. A request on a live connection has no deadline, so the writer's and reader's `timeout 10` is what bounds them while the server is stopped, and its SIGTERM frees a blocked shell only because the client honours FUSE_INTERRUPT: a client without that shows up here as a hung suite.
 set -euo pipefail
 export JFS_OFFLINE_TIMEOUT=3s
 source "$(dirname "$0")/lib.sh"
@@ -34,25 +34,25 @@ stop_load() {
 }
 sleep 1
 
-# probe_timeout <what> cmd…: must fail with ETIMEDOUT. The first probe is sent on the still-live connection and fails at its 10 s idle timeout plus the 3 s offline deadline; the later probes find no connection and fail within one or two 3 s offline deadlines, one per request the kernel makes for them. The create must not be the first: it is not safe to resend, so caught by the connection loss it would fail with EIO instead.
+# probe_timeout <what> <max ms> cmd…: must fail with ETIMEDOUT within <max ms>. The first probe is sent on the still-live connection and fails at its 10 s idle timeout plus the 3 s offline deadline; by then the outage is past its own 3 s deadline, so the later probes fail at once. The create must not be the first: it is not safe to resend, so caught by the connection loss it would fail with EIO instead.
 probe_timeout() {
-    local what=$1 t0 t1 ms out
-    shift
+    local what=$1 max=$2 t0 t1 ms out
+    shift 2
     t0=$(date +%s%N)
     if out=$(LC_ALL=C "$@" 2>&1); then fail "$what succeeded while the server was stopped"; fi
     t1=$(date +%s%N)
     ms=$(( (t1 - t0) / 1000000 ))
     log "$what: ${ms} ms, $out"
     case "$out" in *"timed out"*) ;; *) fail "$what did not fail with ETIMEDOUT" ;; esac
-    [ "$ms" -le 20000 ] || fail "$what took ${ms} ms against a 10 s idle timeout and a 3 s offline deadline"
+    [ "$ms" -le "$max" ] || fail "$what took ${ms} ms, more than ${max} ms"
 }
 
 log "server stopped: operations must time out"
 exec 3< "$MNT/fixed"
 kill -STOP "$SERVER_PID"
-probe_timeout "lookup" stat "$MNT/never-$RANDOM"
-probe_timeout "create" sh -c "echo x > '$MNT/new-$RANDOM'"
-probe_timeout "lookup again" stat "$MNT/never-$RANDOM"
+probe_timeout "lookup" 20000 stat "$MNT/never-$RANDOM"
+probe_timeout "create" 2000 sh -c "echo x > '$MNT/new-$RANDOM'"
+probe_timeout "lookup again" 2000 stat "$MNT/never-$RANDOM"
 
 log "server continued: operations must resume"
 kill -CONT "$SERVER_PID"

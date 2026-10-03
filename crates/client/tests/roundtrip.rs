@@ -1210,7 +1210,7 @@ async fn unmount_interrupts_a_connect_attempt() {
     })
     .await;
     wait_for(Duration::from_secs(5), "a reconnect attempt", || {
-        matches!(*client.state().borrow(), ConnState::Connecting).then_some(())
+        matches!(*client.state().borrow(), ConnState::Connecting { .. }).then_some(())
     })
     .await;
     // `Connecting` is published just before the attempt begins; unmounting in that gap would pass whatever the manager does with the signal afterwards.
@@ -1437,7 +1437,7 @@ async fn client_refuses_a_foreign_revision() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // A mounted client whose server changes revision underneath it: the reconnect is refused every time, the state stays Connecting, and calls fail by the offline deadline rather than at once, so a rollback can still recover the mount.
+    // A mounted client whose server changes revision underneath it: the reconnect is refused every time, the state stays Connecting, and a call made as the connection goes fails by the offline deadline rather than at once, so a rollback can still recover the mount.
     let hole = Blackhole::start_handshaking(vec![
         Blackhole::ack(),
         HelloReply::RevisionMismatch {
@@ -1451,7 +1451,10 @@ async fn client_refuses_a_foreign_revision() {
     hole.connections.lock()[0].close(0u32.into(), b"upgraded");
     let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
     assert!(matches!(err, Error::Timeout), "{err}");
-    assert!(matches!(*client.state().borrow(), ConnState::Connecting));
+    assert!(matches!(
+        *client.state().borrow(),
+        ConnState::Connecting { .. }
+    ));
     assert!(
         hole.connections.lock().len() >= 2,
         "the client did not retry"
@@ -1673,6 +1676,51 @@ async fn a_pending_call_fails_when_its_connection_is_lost() {
     client.shutdown().await;
 }
 
+/// Once the connection has been gone for the offline deadline, a call fails at once rather than waiting out a deadline of its own, so a program making call after call through an outage is not held for each one.
+#[tokio::test]
+async fn an_outage_past_the_offline_deadline_fails_calls_at_once() {
+    let hole = Blackhole::start_handshaking(vec![
+        Blackhole::ack(),
+        HelloReply::RevisionMismatch {
+            revision: PROTO_REVISION ^ 1,
+        },
+    ])
+    .await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(hole.config(Duration::from_secs(1)))
+            .await
+            .unwrap(),
+    );
+    hole.connections.lock()[0].close(9u32.into(), b"simulated outage");
+    wait_for(Duration::from_secs(3), "the loss to be seen", || {
+        matches!(*client.state().borrow(), ConnState::Connecting { .. }).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        hole.connections.lock().len() >= 3,
+        "the outage did not span several refused attempts"
+    );
+
+    let started = Instant::now();
+    let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "a call late in the outage waited a deadline of its own: {:?}",
+        started.elapsed()
+    );
+    let started = Instant::now();
+    let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a call after the outage's deadline waited: {:?}",
+        started.elapsed()
+    );
+    client.shutdown().await;
+}
+
 /// A release that fails for want of a connection is owed to the session: the server would otherwise hold that descriptor for as long as the session lives, so it is sent once the session resumes.
 #[tokio::test]
 async fn a_release_failed_in_an_outage_is_sent_when_the_session_resumes() {
@@ -1701,14 +1749,14 @@ async fn a_release_failed_in_an_outage_is_sent_when_the_session_resumes() {
         .unwrap();
     hole.connections.lock()[0].close(9u32.into(), b"simulated outage");
     wait_for(Duration::from_secs(3), "the loss to be seen", || {
-        matches!(*client.state().borrow(), ConnState::Connecting).then_some(())
+        matches!(*client.state().borrow(), ConnState::Connecting { .. }).then_some(())
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     let err = client.release(7).await.unwrap_err();
     assert!(matches!(err, Error::Timeout), "{err}");
     assert!(
-        matches!(*client.state().borrow(), ConnState::Connecting),
+        matches!(*client.state().borrow(), ConnState::Connecting { .. }),
         "the session resumed before the release failed; the test proves nothing"
     );
     wait_for_generation(&client, 2).await;
@@ -1720,6 +1768,63 @@ async fn a_release_failed_in_an_outage_is_sent_when_the_session_resumes() {
             .then_some(())
     })
     .await;
+    client.shutdown().await;
+}
+
+/// The outage's deadline belongs to that outage: once the connection is back calls succeed, and the next loss gives them a full wait again.
+#[tokio::test]
+async fn calls_wait_again_once_the_connection_is_back() {
+    let export = tempfile::tempdir().unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let identity = jackalopefs_server::tls::Identity::generate().unwrap();
+    let first = TestServer::start_with(export.path(), None, socket, identity.clone()).await;
+    let client = jackalopefs_client::Client::connect(first.config(Duration::from_secs(2)))
+        .await
+        .unwrap();
+    let connecting = |client: &jackalopefs_client::Client| {
+        matches!(*client.state().borrow(), ConnState::Connecting { .. }).then_some(())
+    };
+
+    first.stop().await;
+    // Held until the restart, so the port cannot be handed to a concurrent test meanwhile.
+    let held = wait_for(Duration::from_secs(5), "the port to be free again", || {
+        std::net::UdpSocket::bind(("127.0.0.1", port)).ok()
+    })
+    .await;
+    wait_for(Duration::from_secs(5), "the loss to be seen", || {
+        connecting(&client)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let started = Instant::now();
+    let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "a call after the outage's deadline waited: {:?}",
+        started.elapsed()
+    );
+
+    let second = TestServer::start_with(export.path(), None, held, identity).await;
+    wait_for_generation(&client, 2).await;
+    client.getattr(Some(Path::root()), None).await.unwrap();
+
+    // Stopped in the background: the stop drains the endpoint, and the client has seen the close long before that ends.
+    let stopping = tokio::spawn(second.stop());
+    wait_for(Duration::from_secs(5), "the second loss to be seen", || {
+        connecting(&client)
+    })
+    .await;
+    let started = Instant::now();
+    let err = client.getattr(Some(Path::root()), None).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1200),
+        "a call at the start of a new outage did not wait for it: {:?}",
+        started.elapsed()
+    );
+    stopping.await.unwrap();
     client.shutdown().await;
 }
 

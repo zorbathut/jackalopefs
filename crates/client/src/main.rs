@@ -31,8 +31,8 @@ struct Args {
     /// Longest to wait for the server's reply once a request is on a live connection, failing with ETIMEDOUT. Unset, a request waits as long as its connection lives; a blocked process can still be interrupted with a signal.
     #[arg(long, value_parser = humantime::parse_duration)]
     op_timeout: Option<Duration>,
-    /// Longest a filesystem operation waits for the connection to come back before failing with ETIMEDOUT.
-    #[arg(long, default_value = "30s", value_parser = humantime::parse_duration)]
+    /// Longest a filesystem operation waits for the connection to come back before failing with ETIMEDOUT. Once the connection has been gone this long (counted from when its loss is detected, up to 10 s after the network goes), operations fail at once until it is back.
+    #[arg(long, default_value = "15s", value_parser = humantime::parse_duration)]
     offline_timeout: Duration,
     /// Longest one connection attempt may take. Each address the server name resolves to gets its own attempt.
     #[arg(long, default_value = "10s", value_parser = humantime::parse_duration)]

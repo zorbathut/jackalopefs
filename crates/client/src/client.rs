@@ -312,11 +312,12 @@ struct Caller {
     perf: Arc<Perf>,
     /// Longest one exchange on a live connection may take; `None` waits as long as the connection lives.
     op_timeout: Option<Duration>,
-    /// Longest a call waits for a connection.
+    /// Longest a call waits for a connection, and longest an outage holds calls before they fail at once.
     offline_timeout: Duration,
 }
 
 impl Caller {
+    /// Wait for a connection of at least `min_generation` until `deadline`, or until the current outage has lasted the offline timeout if that comes first.
     async fn wait_connected(
         &self,
         deadline: Instant,
@@ -324,18 +325,19 @@ impl Caller {
     ) -> Result<Arc<Attached>, Error> {
         let mut state = self.state.clone();
         loop {
-            if Instant::now() >= deadline {
-                return Err(Error::Timeout);
-            }
             let current = state.borrow_and_update().clone();
-            match current {
+            let limit = match current {
                 ConnState::Connected(attached) if attached.generation >= min_generation => {
                     return Ok(attached)
                 }
                 ConnState::Closed => return Err(Error::Closed),
-                _ => {}
+                ConnState::Connecting { since } => deadline.min(since + self.offline_timeout),
+                _ => deadline,
+            };
+            if Instant::now() >= limit {
+                return Err(Error::Timeout);
             }
-            match timeout_at(deadline, state.changed()).await {
+            match timeout_at(limit, state.changed()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Err(Error::Closed),
                 Err(_) => return Err(Error::Timeout),
@@ -376,7 +378,7 @@ impl Caller {
         result
     }
 
-    /// The exchange and its retries; every attempt's phases are added to `account`. The two waits have different clocks. The wait for a connection is bounded by the offline deadline, set once and renewed only for the one resend a lost reply gets, so a server that keeps accepting connections and failing streams cannot hold a call forever. The exchange itself is bounded only by the optional operation deadline: a server slow to answer on a live connection is not an error, and the connection's own idle timeout fails the exchange if the server dies. Either wait ends early when the kernel interrupts the request the call is made for.
+    /// The exchange and its retries; every attempt's phases are added to `account`. The two waits have different clocks. The wait for a connection is bounded by the offline deadline, set once and renewed only for the one resend a lost reply gets, so a server that keeps accepting connections and failing streams cannot hold a call forever; it also ends when the outage itself has lasted the offline timeout, so through a long outage calls fail at once instead of each waiting out a deadline of its own. The exchange itself is bounded only by the optional operation deadline: a server slow to answer on a live connection is not an error, and the connection's own idle timeout fails the exchange if the server dies. Either wait ends early when the kernel interrupts the request the call is made for.
     async fn attempt(&self, req: &Request, account: &mut AccountCall) -> Result<Response, Error> {
         let kernel = current_request();
         let kernel = kernel.as_deref();
@@ -476,7 +478,7 @@ pub struct Config {
     pub connect_timeout: Duration,
     /// Longest to wait for the server's reply once a request is on a live connection; `None` waits as long as the connection lives.
     pub op_timeout: Option<Duration>,
-    /// Longest a call waits for a connection before failing with `ETIMEDOUT`.
+    /// Longest a call waits for a connection before failing with `ETIMEDOUT`; once the connection has been gone this long, calls fail at once until it is back.
     pub offline_timeout: Duration,
     /// How file owners are shown (`crate::ids`).
     pub ids: ModeIds,
