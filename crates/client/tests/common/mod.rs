@@ -202,6 +202,14 @@ impl Blackhole {
         Blackhole::start_answer(Some(Arc::new(answer)), vec![Blackhole::ack()]).await
     }
 
+    /// Answers every request as `answer` says, and each connection's hello from `hellos` as [`Self::start_handshaking`] does.
+    pub async fn start_answering_handshaking(
+        answer: impl Fn(&Request) -> Response + Send + Sync + 'static,
+        hellos: Vec<HelloReply>,
+    ) -> Blackhole {
+        Blackhole::start_answer(Some(Arc::new(answer)), hellos).await
+    }
+
     pub async fn start_handshaking(hellos: Vec<HelloReply>) -> Blackhole {
         Blackhole::start_full(None, hellos).await
     }

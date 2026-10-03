@@ -446,10 +446,23 @@ impl Caller {
         let mut caller = self.clone();
         caller.op_timeout = self.op_timeout.or(Some(self.offline_timeout));
         tokio::spawn(async move {
-            if let Err(e) = caller.call(req).await {
+            if let Err(e) = caller.release(req).await {
                 tracing::debug!("orphan handle release failed: {e}");
             }
         });
+    }
+
+    /// Release a handle on the server. One that fails for want of a connection is owed: without it the server would hold the descriptor for as long as the session lives, so it is sent again if the session resumes.
+    async fn release(&self, req: Request) -> Result<(), Error> {
+        match self.call(req.clone()).await {
+            Ok(Response::Ok) => Ok(()),
+            Ok(other) => Err(unexpected(other)),
+            Err(e @ (Error::Timeout | Error::Disconnected)) => {
+                self.handles.owe_release(req);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -801,7 +814,7 @@ impl Client {
     /// Forget the handle locally first so a reconnect never reopens it, then tell the server.
     pub async fn release(&self, fh: u64) -> Result<(), Error> {
         self.caller.handles.remove(fh);
-        self.call_ok(Request::Release { fh }).await
+        self.caller.release(Request::Release { fh }).await
     }
 
     pub async fn fsync(&self, fh: u64, datasync: bool) -> Result<(), Error> {
@@ -847,7 +860,7 @@ impl Client {
 
     pub async fn releasedir(&self, fh: u64) -> Result<(), Error> {
         self.caller.handles.remove(fh);
-        self.call_ok(Request::Releasedir { fh }).await
+        self.caller.release(Request::Releasedir { fh }).await
     }
 
     pub async fn statfs(&self, path: Path) -> Result<Statfs, Error> {

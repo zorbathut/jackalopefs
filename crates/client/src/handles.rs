@@ -55,6 +55,8 @@ impl HandleRec {
 pub struct HandleTable {
     next: AtomicU64,
     map: Mutex<HashMap<u64, Arc<HandleRec>>>,
+    /// Releases that failed for want of a connection; the session that holds their ids gets them if it resumes.
+    owed: Mutex<Vec<Request>>,
 }
 
 impl HandleTable {
@@ -92,6 +94,14 @@ impl HandleTable {
 
     pub fn remove(&self, fh: u64) -> Option<Arc<HandleRec>> {
         self.map.lock().remove(&fh)
+    }
+
+    pub fn owe_release(&self, release: Request) {
+        self.owed.lock().push(release);
+    }
+
+    pub fn take_owed(&self) -> Vec<Request> {
+        std::mem::take(&mut *self.owed.lock())
     }
 
     pub fn len(&self) -> usize {

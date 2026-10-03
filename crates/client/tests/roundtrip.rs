@@ -1673,6 +1673,56 @@ async fn a_pending_call_fails_when_its_connection_is_lost() {
     client.shutdown().await;
 }
 
+/// A release that fails for want of a connection is owed to the session: the server would otherwise hold that descriptor for as long as the session lives, so it is sent once the session resumes.
+#[tokio::test]
+async fn a_release_failed_in_an_outage_is_sent_when_the_session_resumes() {
+    let refused = HelloReply::RevisionMismatch {
+        revision: PROTO_REVISION ^ 1,
+    };
+    let mut resumed = Blackhole::ack();
+    if let HelloReply::Ack { resumed, .. } = &mut resumed {
+        *resumed = true;
+    }
+    // Four refusals hold the outage for the backoff's 100 + 200 + 400 + 800 ms before the session resumes.
+    let hole = Blackhole::start_answering_handshaking(
+        |_| jackalopefs_proto::Response::Ok,
+        vec![
+            Blackhole::ack(),
+            refused.clone(),
+            refused.clone(),
+            refused.clone(),
+            refused,
+            resumed,
+        ],
+    )
+    .await;
+    let client = jackalopefs_client::Client::connect(hole.config(Duration::from_millis(200)))
+        .await
+        .unwrap();
+    hole.connections.lock()[0].close(9u32.into(), b"simulated outage");
+    wait_for(Duration::from_secs(3), "the loss to be seen", || {
+        matches!(*client.state().borrow(), ConnState::Connecting).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let err = client.release(7).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    assert!(
+        matches!(*client.state().borrow(), ConnState::Connecting),
+        "the session resumed before the release failed; the test proves nothing"
+    );
+    wait_for_generation(&client, 2).await;
+    wait_for(Duration::from_secs(3), "the owed release", || {
+        hole.requests
+            .lock()
+            .iter()
+            .any(|req| matches!(req, Request::Release { fh: 7 }))
+            .then_some(())
+    })
+    .await;
+    client.shutdown().await;
+}
+
 /// An interrupt from the kernel abandons the call it was made for, cancels it on the wire, and latches: a later call for the same kernel request fails at once.
 #[tokio::test]
 async fn an_interrupt_abandons_a_pending_call() {

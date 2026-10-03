@@ -252,13 +252,28 @@ async fn run(
             handles.kill_all();
         }
         root_mounted = Some(root.clone());
-        if !resumed {
-            tokio::select! {
-                _ = reopen_handles(&conn, &root, ids, &handles, cfg.offline_timeout) => {}
-                _ = stop.changed() => {
-                    conn.close(close_code::UNMOUNT.into(), b"unmount");
-                    break;
-                }
+        let restore = async {
+            if resumed {
+                send_releases(
+                    &conn,
+                    &root,
+                    ids,
+                    &handles,
+                    handles.take_owed(),
+                    cfg.offline_timeout,
+                )
+                .await;
+            } else {
+                // A new session holds none of the old one's handles, so the releases owed to that one are moot.
+                handles.take_owed();
+                reopen_handles(&conn, &root, ids, &handles, cfg.offline_timeout).await;
+            }
+        };
+        tokio::select! {
+            _ = restore => {}
+            _ = stop.changed() => {
+                conn.close(close_code::UNMOUNT.into(), b"unmount");
+                break;
             }
         }
         let attached = Arc::new(Attached {
@@ -490,39 +505,61 @@ async fn reopen_handles(
             (fh, rec, outcome)
         });
     }
-    let mut releases = tokio::task::JoinSet::new();
+    let mut stale = Vec::new();
     while let Some(joined) = reopens.join_next().await {
         match joined {
             Ok((fh, rec, outcome)) => {
                 handles.apply_reopen(fh, &rec, outcome);
                 if rec.is_dead() {
-                    let (conn, root) = (conn.clone(), root.clone());
-                    let release = match rec.kind {
+                    stale.push(match rec.kind {
                         HandleKind::File => jackalopefs_proto::Request::Release { fh },
                         HandleKind::Dir => jackalopefs_proto::Request::Releasedir { fh },
-                    };
-                    releases.spawn(async move {
-                        match timeout(
-                            offline_timeout,
-                            exchange(&conn, &root, &ids, &release, &mut Timing::default()),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) => {
-                                tracing::debug!(fh, "releasing a stale handle failed: {e:?}")
-                            }
-                            Err(_) => tracing::debug!(fh, "releasing a stale handle timed out"),
-                        }
                     });
                 }
             }
             Err(e) => tracing::error!("reopen task failed: {e}"),
         }
     }
-    while let Some(joined) = releases.join_next().await {
-        if let Err(e) = joined {
-            tracing::error!("release task failed: {e}");
+    send_releases(conn, root, ids, handles, stale, offline_timeout).await;
+}
+
+/// Send releases concurrently, each on the offline deadline; one the server never answered is owed again, for the next resume of this session.
+async fn send_releases(
+    conn: &Connection,
+    root: &KeyRoot,
+    ids: IdMap,
+    handles: &HandleTable,
+    releases: Vec<jackalopefs_proto::Request>,
+    offline_timeout: Duration,
+) {
+    if releases.is_empty() {
+        return;
+    }
+    tracing::debug!(count = releases.len(), "sending releases");
+    let mut sends = tokio::task::JoinSet::new();
+    for release in releases {
+        let (conn, root) = (conn.clone(), root.clone());
+        sends.spawn(async move {
+            let sent = timeout(
+                offline_timeout,
+                exchange(&conn, &root, &ids, &release, &mut Timing::default()),
+            )
+            .await;
+            (release, sent)
+        });
+    }
+    while let Some(joined) = sends.join_next().await {
+        match joined {
+            Ok((_, Ok(Ok(_)))) => {}
+            Ok((release, Ok(Err(e)))) => {
+                tracing::debug!(?release, "release failed: {e:?}");
+                handles.owe_release(release);
+            }
+            Ok((release, Err(_))) => {
+                tracing::debug!(?release, "release timed out");
+                handles.owe_release(release);
+            }
+            Err(e) => tracing::error!("release task failed: {e}"),
         }
     }
 }
