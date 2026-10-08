@@ -8,15 +8,15 @@ use crate::perf::{Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch, Watches};
 use crate::{Limits, SESSION_GRACE};
 use jackalopefs_perf::event;
-use jackalopefs_perf::hub::IdsEvent;
+use jackalopefs_perf::hub::{elided, Hub, IdsEvent, Side};
 use jackalopefs_perf::{
     fmt_duration, line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, SampleLink,
     TrackerQuic,
 };
 use jackalopefs_proto::control::Summary;
 use jackalopefs_proto::{
-    read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Request, Response,
-    PROTO_REVISION,
+    encode, read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply,
+    Request, Response, PROTO_REVISION,
 };
 use parking_lot::Mutex;
 use quinn::{Connection, RecvStream, SendStream};
@@ -411,6 +411,8 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         conn.clone(),
         server.events.subscribe(),
         session.id,
+        conn_key,
+        server.perf.hub.clone(),
     ));
     let ops = Arc::new(Ops {
         export: server.export.clone(),
@@ -561,6 +563,8 @@ async fn forward_events(
     conn: Connection,
     mut events: broadcast::Receiver<Arc<EventBatch>>,
     session_id: u64,
+    conn_key: Option<u64>,
+    hub: Arc<Hub>,
 ) {
     let mut send = match conn.open_uni().await {
         Ok(send) => send,
@@ -569,6 +573,15 @@ async fn forward_events(
             return;
         }
     };
+    let tap_ids = IdsEvent {
+        session: Some(session_id),
+        conn: conn_key,
+        stream: Some(u64::from(send.id())),
+        op: Some("event"),
+        ..IdsEvent::default()
+    };
+    // Batches written so far; the client counts the ones it reads, so the two agree on which `every`th is which.
+    let mut seq = 0u64;
     loop {
         let event = match events.recv().await {
             Ok(batch) => batch.for_session(session_id),
@@ -586,7 +599,15 @@ async fn forward_events(
         };
         let Some(event) = event else { continue };
         match timeout(EVENT_WRITE_TIMEOUT, write_frame(&mut send, &event)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                if hub.wants_frames() {
+                    // The batch encoded for the write just made, so it encodes again.
+                    hub.event_frame(Side::Server, &tap_ids, seq, || {
+                        encode(&event).ok().map(|frame| frame[4..].to_vec())
+                    });
+                }
+                seq += 1;
+            }
             Ok(Err(e @ jackalopefs_proto::ErrorCodec::TooLarge(_))) => {
                 tracing::warn!(
                     session_id,
@@ -641,8 +662,29 @@ async fn handle_request(
         stream: Some(stream),
         ..IdsEvent::default()
     };
-    let req: Request = match timeout(REQUEST_READ_TIMEOUT, read_frame(&mut recv)).await {
-        Ok(Ok(req)) => req,
+    let (body, req) = match timeout(
+        REQUEST_READ_TIMEOUT,
+        read_frame_body::<_, Request>(&mut recv),
+    )
+    .await
+    {
+        Ok(Ok((body, Ok(req)))) => (body, req),
+        Ok(Ok((body, Err(e)))) => {
+            if perf.hub.wants_frames() {
+                perf.hub
+                    .undecodable(Side::Server, &ids, &e.to_string(), &body);
+            }
+            match e {
+                jackalopefs_proto::ErrorCodec::Decode(
+                    jackalopefs_proto::ErrorDecode::NotInSchema(n),
+                ) => tracing::info!(
+                    discriminant = n,
+                    "request uses a schema variant this server does not know; the client may be newer"
+                ),
+                e => tracing::warn!("malformed request: {e}"),
+            }
+            return;
+        }
         // The client finishes a stream early or resets it when it gives up on a call.
         Ok(Err(e))
             if e.is_eof()
@@ -664,15 +706,6 @@ async fn handle_request(
                 Slowpath::RequestStreamFailed,
                 ids,
                 format!("the request stream failed: {e}")
-            );
-            return;
-        }
-        Ok(Err(jackalopefs_proto::ErrorCodec::Decode(
-            jackalopefs_proto::ErrorDecode::NotInSchema(n),
-        ))) => {
-            tracing::info!(
-                discriminant = n,
-                "request uses a schema variant this server does not know; the client may be newer"
             );
             return;
         }
@@ -701,6 +734,21 @@ async fn handle_request(
     let op = req.op_name();
     let (fh, offset, size) = req.perf_fields();
     inflight.decoded(op, req.subject());
+    let mut sampled = if perf.hub.wants_frames() {
+        perf.hub.sample(
+            Side::Server,
+            IdsEvent {
+                op: Some(op),
+                ..ids.clone()
+            },
+        )
+    } else {
+        None
+    };
+    if let Some(sampled) = sampled.as_mut() {
+        sampled.request(&body, || elided(req.with_data_elided()));
+    }
+    drop(body);
     let queued = Instant::now();
     let running = inflight.clone();
     let resp = match tokio::task::spawn_blocking(move || {
@@ -730,13 +778,27 @@ async fn handle_request(
     let outcome = outcome_of(&resp);
     inflight.sending();
     let sending = Instant::now();
-    match timeout(REPLY_WRITE_TIMEOUT, write_frame(&mut send, &resp)).await {
-        Ok(Ok(())) => {
+    let written = match encode(&resp) {
+        Ok(frame) => match timeout(REPLY_WRITE_TIMEOUT, send.write_all(&frame)).await {
+            Ok(Ok(())) => Ok(Ok(frame)),
+            Ok(Err(e)) => Ok(Err(e.to_string())),
+            Err(stalled) => Err(stalled),
+        },
+        Err(e) => Ok(Err(e.to_string())),
+    };
+    match written {
+        Ok(Ok(frame)) => {
             if let Err(e) = send.finish() {
                 tracing::debug!(op, "reply stream already closed: {e}");
             }
+            if let Some(sampled) = sampled.take() {
+                sampled.reply(&frame[4..], || elided(resp.with_data_elided()));
+            }
         }
         Ok(Err(e)) => {
+            if let Some(sampled) = sampled.as_mut() {
+                sampled.outcome("undelivered");
+            }
             event!(
                 target: EVENT_TARGET,
                 perf.events,
@@ -752,6 +814,9 @@ async fn handle_request(
             );
         }
         Err(_) => {
+            if let Some(sampled) = sampled.as_mut() {
+                sampled.outcome("stalled");
+            }
             tracing::warn!(op, "client is not reading its reply; abandoning it");
             event!(
                 target: EVENT_TARGET,

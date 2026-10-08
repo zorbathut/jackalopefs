@@ -1,13 +1,12 @@
 //! The control socket: how `jackalopefs-ctl` reads a running process's counters and subscribes to its events and requests, without a restart. It is a Linux abstract Unix socket, `jackalopefs/{uid}/{side}-{pid}`, so there is no file to create, protect or clean up; only the process's own user (and root) may use it. It is served from a thread of its own, so it answers while the process's runtime is the thing that is stuck.
 
 use crate::hub::Hub;
-use jackalopefs_proto::control::{Ask, ControlReply, ControlRequest, Counters};
+use jackalopefs_proto::control::{Ask, ControlReply, ControlRequest, Counters, Record};
 use jackalopefs_proto::{read_frame, write_frame, CONTROL_REVISION};
 use std::io;
 use std::os::linux::net::SocketAddrExt;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Notify;
 
@@ -132,7 +131,7 @@ async fn serve(
     }
 }
 
-/// Answer one connection: counters as often as asked, or one subscription until the peer goes.
+/// Answer one connection: counters as often as asked, or one subscription until the peer goes or asks for its census.
 async fn answer(stream: UnixStream, source: Arc<dyn Source>) {
     let (mut rx, mut tx) = stream.into_split();
     loop {
@@ -168,23 +167,58 @@ async fn answer(stream: UnixStream, source: Arc<dyn Source>) {
                     return;
                 }
             }
+            Ask::Census => {
+                let why = "a census is asked for during a subscription".to_owned();
+                if let Err(e) = write_frame(&mut tx, &ControlReply::Refused(why)).await {
+                    tracing::debug!("control socket: cannot refuse: {e}");
+                }
+                return;
+            }
             Ask::Subscribe(selection) => {
-                let (_tap, mut records) = source.hub().subscribe(selection);
-                let mut probe = [0u8; 1];
+                let (tap, mut records) = source.hub().subscribe(selection);
                 loop {
                     tokio::select! {
                         record = records.recv() => {
                             let Some(record) = record else { return };
-                            if let Err(e) = write_frame(&mut tx, &ControlReply::Record(record)).await {
-                                tracing::debug!("control socket: subscriber gone: {e}");
+                            if !send_record(&mut tx, record).await {
                                 return;
                             }
                         }
-                        // A subscriber sends nothing more; a read that returns is the subscriber going, which ends the tap at once.
-                        _ = rx.read(&mut probe) => return,
+                        // A subscriber sends nothing more but a census request; anything else, or the connection closing, is the subscriber going, which ends the tap at once.
+                        asked = read_frame::<_, ControlRequest>(&mut rx) => {
+                            if !matches!(asked, Ok(ControlRequest { ask: Ask::Census, .. })) {
+                                return;
+                            }
+                            while let Some(record) = records.try_recv() {
+                                if !send_record(&mut tx, record).await {
+                                    return;
+                                }
+                            }
+                            let census = Record {
+                                at_ns: crate::hub::now_ns(),
+                                what: tap.census(),
+                            };
+                            send_record(&mut tx, census).await;
+                            return;
+                        }
                     }
                 }
             }
+        }
+    }
+}
+
+/// Write one record; false once the subscriber is gone. A record too large for a frame is left out and the subscription goes on.
+async fn send_record(tx: &mut tokio::net::unix::OwnedWriteHalf, record: Record) -> bool {
+    match write_frame(tx, &ControlReply::Record(record)).await {
+        Ok(()) => true,
+        Err(e @ jackalopefs_proto::ErrorCodec::TooLarge(_)) => {
+            tracing::warn!("control socket: a record left out: {e}");
+            true
+        }
+        Err(e) => {
+            tracing::debug!("control socket: subscriber gone: {e}");
+            false
         }
     }
 }
@@ -365,6 +399,85 @@ mod tests {
         while source.events.traced(Only) {
             assert!(Instant::now() < deadline, "the tap outlived its subscriber");
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_census_comes_after_whatever_was_still_queued() {
+        use crate::hub::{IdsEvent, Side};
+        let (source, control) = serving("census");
+        let mut stream = connect(&control).await;
+        write_frame(
+            &mut stream,
+            &ControlRequest {
+                revision: CONTROL_REVISION,
+                ask: Ask::Subscribe(Selection {
+                    frames: true,
+                    every: 1,
+                    ..Selection::default()
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !source.hub.wants_frames() {
+            assert!(Instant::now() < deadline, "the subscription did not arrive");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for stream_id in [0, 4, 8] {
+            let mut sampled = source
+                .hub
+                .sample(
+                    Side::Server,
+                    IdsEvent {
+                        conn: Some(1),
+                        stream: Some(stream_id),
+                        op: Some("read"),
+                        ..IdsEvent::default()
+                    },
+                )
+                .unwrap();
+            sampled.request(&[1, 2], || None);
+            sampled.reply(&[3], || None);
+        }
+        write_frame(
+            &mut stream,
+            &ControlRequest {
+                revision: CONTROL_REVISION,
+                ask: Ask::Census,
+            },
+        )
+        .await
+        .unwrap();
+        let mut exchanges = 0;
+        loop {
+            let reply: ControlReply =
+                tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream))
+                    .await
+                    .expect("no record")
+                    .unwrap();
+            match reply {
+                ControlReply::Record(Record {
+                    what: Happened::Exchange(_),
+                    ..
+                }) => exchanges += 1,
+                ControlReply::Record(Record {
+                    what: Happened::Census { ops, dropped },
+                    ..
+                }) => {
+                    assert_eq!(exchanges, 3, "the queued exchanges came first");
+                    assert_eq!(dropped, 0);
+                    assert_eq!(
+                        ops.iter()
+                            .map(|o| (o.op.as_str(), o.seen, o.sampled))
+                            .collect::<Vec<_>>(),
+                        vec![("read", 3, 3)]
+                    );
+                    break;
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 }

@@ -27,17 +27,22 @@ impl Names {
     }
 }
 
-/// What a subscriber wants: event details by event name, request summaries by operation name.
+/// What a subscriber wants: event details by event name, request summaries by operation name, and with `frames` the frames themselves, one exchange in `every` (of the operations `ops` names, when it names any) and one event frame in `every`; without `payloads`, the data of reads and writes is cut from them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     pub events: Names,
     pub ops: Names,
+    pub frames: bool,
+    pub every: u32,
+    pub payloads: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ask {
     Counters,
     Subscribe(Selection),
+    /// During a subscription: what is still queued, a census, and the end.
+    Census,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +103,45 @@ pub struct Summary {
     pub total_ns: u64,
 }
 
+/// One request and its reply as they crossed the wire.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Exchange {
+    /// `client` or `server`.
+    pub side: String,
+    pub ids: Ids,
+    pub every: u32,
+    /// The request's body as sent: the message without its length prefix.
+    pub request: Vec<u8>,
+    /// Bytes of data cut from the request; 0 when none were.
+    pub request_elided: u64,
+    /// The reply's body, empty when there was none.
+    pub reply: Vec<u8>,
+    pub reply_elided: u64,
+    /// `replied`, or why there is no reply.
+    pub outcome: String,
+    pub elapsed_ns: u64,
+}
+
+/// One operation in a capture: exchanges there were while it lasted, those chosen, and those of them dropped because the reader fell behind.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CensusOp {
+    pub op: String,
+    pub seen: u64,
+    pub sampled: u64,
+    pub dropped: u64,
+}
+
+/// The first record of a capture file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Header {
+    pub proto_revision: u64,
+    pub control_revision: u64,
+    pub side: String,
+    pub pid: u32,
+    pub describe: String,
+    pub selection: Selection,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Happened {
     Event {
@@ -108,6 +152,28 @@ pub enum Happened {
     Request(Summary),
     /// Records the process could not hold for this subscriber, since it last said.
     Dropped(u64),
+    Exchange(Exchange),
+    /// A frame that did not decode, as it was read.
+    Undecodable {
+        side: String,
+        ids: Ids,
+        error: String,
+        body: Vec<u8>,
+    },
+    /// A batch of change events, as it crossed the wire: the `seq`th the stream carried.
+    EventFrame {
+        side: String,
+        ids: Ids,
+        every: u32,
+        seq: u64,
+        body: Vec<u8>,
+    },
+    Header(Header),
+    /// The last record of a capture: per operation, requests seen and exchanges held, and the records lost.
+    Census {
+        ops: Vec<CensusOp>,
+        dropped: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +235,24 @@ fn parse_names(r: schema::names::Reader<'_>) -> Result<Names, ErrorDecode> {
     })
 }
 
+fn build_selection(mut b: schema::selection::Builder<'_>, selection: &Selection) {
+    build_names(b.reborrow().init_events(), &selection.events);
+    build_names(b.reborrow().init_ops(), &selection.ops);
+    b.set_frames(selection.frames);
+    b.set_every(selection.every);
+    b.set_payloads(selection.payloads);
+}
+
+fn parse_selection(r: schema::selection::Reader<'_>) -> Result<Selection, ErrorDecode> {
+    Ok(Selection {
+        events: parse_names(r.get_events()?)?,
+        ops: parse_names(r.get_ops()?)?,
+        frames: r.get_frames(),
+        every: r.get_every(),
+        payloads: r.get_payloads(),
+    })
+}
+
 fn build_ids(mut b: schema::ids::Builder<'_>, ids: &Ids) {
     b.set_present(present(&[ids.session, ids.conn, ids.stream, ids.unique]));
     b.set_session(ids.session.unwrap_or(0));
@@ -196,11 +280,8 @@ impl Message for ControlRequest {
         b.set_revision(self.revision);
         match &self.ask {
             Ask::Counters => b.set_counters(()),
-            Ask::Subscribe(selection) => {
-                let mut s = b.init_subscribe();
-                build_names(s.reborrow().init_events(), &selection.events);
-                build_names(s.init_ops(), &selection.ops);
-            }
+            Ask::Subscribe(selection) => build_selection(b.init_subscribe(), selection),
+            Ask::Census => b.set_census(()),
         }
     }
 
@@ -209,13 +290,8 @@ impl Message for ControlRequest {
         let r = message.get_root::<schema::control_request::Reader<'_>>()?;
         let ask = match r.which()? {
             Which::Counters(()) => Ask::Counters,
-            Which::Subscribe(s) => {
-                let s = s?;
-                Ask::Subscribe(Selection {
-                    events: parse_names(s.get_events()?)?,
-                    ops: parse_names(s.get_ops()?)?,
-                })
-            }
+            Which::Subscribe(s) => Ask::Subscribe(parse_selection(s?)?),
+            Which::Census(()) => Ask::Census,
         };
         Ok(ControlRequest {
             revision: r.get_revision(),
@@ -265,6 +341,65 @@ fn build_record(mut b: schema::record::Builder<'_>, record: &Record) {
             q.set_total_ns(s.total_ns);
         }
         Happened::Dropped(n) => b.set_dropped(*n),
+        Happened::Exchange(x) => {
+            let mut e = b.init_exchange();
+            e.set_side(x.side.as_str());
+            build_ids(e.reborrow().init_ids(), &x.ids);
+            e.set_every(x.every);
+            e.set_request(&x.request);
+            e.set_request_elided(x.request_elided);
+            e.set_reply(&x.reply);
+            e.set_reply_elided(x.reply_elided);
+            e.set_outcome(x.outcome.as_str());
+            e.set_elapsed_ns(x.elapsed_ns);
+        }
+        Happened::Undecodable {
+            side,
+            ids,
+            error,
+            body,
+        } => {
+            let mut u = b.init_undecodable();
+            u.set_side(side.as_str());
+            build_ids(u.reborrow().init_ids(), ids);
+            u.set_error(error.as_str());
+            u.set_body(body);
+        }
+        Happened::EventFrame {
+            side,
+            ids,
+            every,
+            seq,
+            body,
+        } => {
+            let mut f = b.init_event_frame();
+            f.set_side(side.as_str());
+            build_ids(f.reborrow().init_ids(), ids);
+            f.set_every(*every);
+            f.set_seq(*seq);
+            f.set_body(body);
+        }
+        Happened::Header(h) => {
+            let mut o = b.init_header();
+            o.set_proto_revision(h.proto_revision);
+            o.set_control_revision(h.control_revision);
+            o.set_side(h.side.as_str());
+            o.set_pid(h.pid);
+            o.set_describe(h.describe.as_str());
+            build_selection(o.init_selection(), &h.selection);
+        }
+        Happened::Census { ops, dropped } => {
+            let mut c = b.init_census();
+            c.set_dropped(*dropped);
+            let mut list = c.init_ops(ops.len() as u32);
+            for (i, op) in ops.iter().enumerate() {
+                let mut o = list.reborrow().get(i as u32);
+                o.set_op(op.op.as_str());
+                o.set_seen(op.seen);
+                o.set_sampled(op.sampled);
+                o.set_dropped(op.dropped);
+            }
+        }
     }
 }
 
@@ -298,6 +433,53 @@ fn parse_record(r: schema::record::Reader<'_>) -> Result<Record, ErrorDecode> {
             })
         }
         Which::Dropped(n) => Happened::Dropped(n),
+        Which::Exchange(e) => Happened::Exchange(Exchange {
+            side: text(e.get_side()?)?,
+            ids: parse_ids(e.get_ids()?)?,
+            every: e.get_every(),
+            request: e.get_request()?.to_vec(),
+            request_elided: e.get_request_elided(),
+            reply: e.get_reply()?.to_vec(),
+            reply_elided: e.get_reply_elided(),
+            outcome: text(e.get_outcome()?)?,
+            elapsed_ns: e.get_elapsed_ns(),
+        }),
+        Which::Undecodable(u) => Happened::Undecodable {
+            side: text(u.get_side()?)?,
+            ids: parse_ids(u.get_ids()?)?,
+            error: text(u.get_error()?)?,
+            body: u.get_body()?.to_vec(),
+        },
+        Which::EventFrame(f) => Happened::EventFrame {
+            side: text(f.get_side()?)?,
+            ids: parse_ids(f.get_ids()?)?,
+            every: f.get_every(),
+            seq: f.get_seq(),
+            body: f.get_body()?.to_vec(),
+        },
+        Which::Header(h) => Happened::Header(Header {
+            proto_revision: h.get_proto_revision(),
+            control_revision: h.get_control_revision(),
+            side: text(h.get_side()?)?,
+            pid: h.get_pid(),
+            describe: text(h.get_describe()?)?,
+            selection: parse_selection(h.get_selection()?)?,
+        }),
+        Which::Census(c) => Happened::Census {
+            ops: c
+                .get_ops()?
+                .iter()
+                .map(|o| {
+                    Ok(CensusOp {
+                        op: text(o.get_op()?)?,
+                        seen: o.get_seen(),
+                        sampled: o.get_sampled(),
+                        dropped: o.get_dropped(),
+                    })
+                })
+                .collect::<Result<_, ErrorDecode>>()?,
+            dropped: c.get_dropped(),
+        },
     };
     Ok(Record {
         at_ns: r.get_at_ns(),
@@ -385,6 +567,14 @@ impl Message for ControlReply {
                 what: Happened::Event { detail, .. },
                 ..
             }) => 32 + (detail.len() / 8) as u32,
+            ControlReply::Record(Record {
+                what: Happened::Exchange(x),
+                ..
+            }) => 48 + ((x.request.len() + x.reply.len()) / 8) as u32,
+            ControlReply::Record(Record {
+                what: Happened::Undecodable { body, .. } | Happened::EventFrame { body, .. },
+                ..
+            }) => 32 + (body.len() / 8) as u32,
             _ => 64,
         }
     }
@@ -408,9 +598,16 @@ mod tests {
         });
         round_trip(&ControlRequest {
             revision: 7,
+            ask: Ask::Census,
+        });
+        round_trip(&ControlRequest {
+            revision: 7,
             ask: Ask::Subscribe(Selection {
                 events: Names::Some(vec!["call_lost_retried".into()]),
                 ops: Names::All,
+                frames: true,
+                every: 4,
+                payloads: false,
             }),
         });
         round_trip(&ControlReply::Counters(Counters {
@@ -465,6 +662,91 @@ mod tests {
             at_ns: 13,
             what: Happened::Dropped(4),
         }));
+        round_trip(&ControlReply::Record(Record {
+            at_ns: 14,
+            what: Happened::Exchange(Exchange {
+                side: "client".into(),
+                ids: Ids {
+                    conn: Some(9),
+                    stream: Some(4),
+                    ..Ids::default()
+                },
+                every: 4,
+                request: vec![1, 2, 3],
+                request_elided: 0,
+                reply: vec![4, 5],
+                reply_elided: 4096,
+                outcome: "replied".into(),
+                elapsed_ns: 77,
+            }),
+        }));
+        round_trip(&ControlReply::Record(Record {
+            at_ns: 15,
+            what: Happened::Header(Header {
+                proto_revision: 1,
+                control_revision: 2,
+                side: "server".into(),
+                pid: 3,
+                describe: "/srv".into(),
+                selection: Selection {
+                    frames: true,
+                    every: 8,
+                    ..Selection::default()
+                },
+            }),
+        }));
+        round_trip(&ControlReply::Record(Record {
+            at_ns: 16,
+            what: Happened::Census {
+                ops: vec![CensusOp {
+                    op: "read".into(),
+                    seen: 100,
+                    sampled: 12,
+                    dropped: 2,
+                }],
+                dropped: 1,
+            },
+        }));
+        round_trip(&ControlReply::Record(Record {
+            at_ns: 17,
+            what: Happened::Undecodable {
+                side: "server".into(),
+                ids: Ids::default(),
+                error: "bad".into(),
+                body: vec![0; 9],
+            },
+        }));
         round_trip(&ControlReply::Refused("no".into()));
+    }
+
+    #[test]
+    fn the_largest_records_still_fit_a_frame() {
+        let write = crate::codec::encode(&crate::Request::Write {
+            fh: 1,
+            offset: 0,
+            data: vec![7; crate::MAX_IO],
+        })
+        .unwrap();
+        let exchange = ControlReply::Record(Record {
+            at_ns: 0,
+            what: Happened::Exchange(Exchange {
+                side: "client".into(),
+                request: write[4..].to_vec(),
+                reply: vec![0; 64],
+                outcome: "replied".into(),
+                ..Exchange::default()
+            }),
+        });
+        assert!(encode(&exchange).is_ok());
+        let undecodable = ControlReply::Record(Record {
+            at_ns: 0,
+            what: Happened::Undecodable {
+                side: "server".into(),
+                ids: Ids::default(),
+                error: "bad".into(),
+                body: vec![0; 1 << 20],
+            },
+        });
+        assert!(encode(&undecodable).is_ok());
     }
 }

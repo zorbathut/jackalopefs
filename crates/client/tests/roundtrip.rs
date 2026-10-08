@@ -140,6 +140,213 @@ async fn every_request_of_a_selected_operation_is_summarised_on_both_sides() {
     server.stop().await;
 }
 
+fn frames(every: u32, payloads: bool) -> jackalopefs_proto::control::Selection {
+    jackalopefs_proto::control::Selection {
+        frames: true,
+        every,
+        payloads,
+        ..Default::default()
+    }
+}
+
+/// Take every exchange a tap has, waiting up to 5 s for `at_least` of them: the server's are delivered after its replies go, so they may trail the client's.
+async fn exchanges(
+    rx: &mut jackalopefs_perf::hub::TapReceiver,
+    at_least: usize,
+) -> Vec<jackalopefs_proto::control::Exchange> {
+    use jackalopefs_proto::control::Happened;
+    let mut found = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        while let Some(record) = rx.try_recv() {
+            match record.what {
+                Happened::Exchange(x) => found.push(x),
+                other => panic!("{other:?}"),
+            }
+        }
+        if found.len() >= at_least {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} of {at_least} exchanges",
+            found.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Both ends choose the same exchanges to capture, with nothing said between them, and capture the same bytes, the reply as the server sent it though the client rewrites it after (the root's inode number, for the kernel).
+#[tokio::test]
+async fn both_ends_capture_the_same_exchanges() {
+    use jackalopefs_proto::control::Exchange;
+    let export = tempfile::tempdir().unwrap();
+    std::fs::write(export.path().join("f"), b"x").unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = std::sync::Arc::new(server.client().await);
+    let (_all_tap, mut all) = client.perf().hub.subscribe(frames(1, false));
+    let (_client_tap, mut on_client) = client.perf().hub.subscribe(frames(4, false));
+    let (_server_tap, mut on_server) = server.server.perf.hub.subscribe(frames(4, false));
+    let mut calls = tokio::task::JoinSet::new();
+    for i in 0..80 {
+        let client = client.clone();
+        calls.spawn(async move {
+            if i % 2 == 0 {
+                client.lookup(Path::root(), name("f")).await.map(drop)
+            } else {
+                client.getattr(Some(Path::root()), None).await.map(drop)
+            }
+        });
+    }
+    while let Some(done) = calls.join_next().await {
+        done.unwrap().unwrap();
+    }
+    let every_one = exchanges(&mut all, 80).await;
+    let captured = exchanges(&mut on_client, 1).await;
+    let key = |x: &Exchange| (x.ids.conn, x.ids.stream.unwrap());
+    let expected: std::collections::BTreeSet<_> = every_one
+        .iter()
+        .map(key)
+        .filter(|(conn, stream)| jackalopefs_perf::hub::chosen(*conn, *stream, 4))
+        .collect();
+    assert_eq!(
+        captured
+            .iter()
+            .map(key)
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected,
+        "exactly the exchanges the hash chooses"
+    );
+    let served = exchanges(&mut on_server, captured.len()).await;
+    let bytes = |found: &[Exchange]| {
+        found
+            .iter()
+            .map(|x| (key(x), (x.request.clone(), x.reply.clone())))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        bytes(&captured),
+        bytes(&served),
+        "the same exchanges, byte for byte"
+    );
+    assert!(captured
+        .iter()
+        .all(|x| x.outcome == "replied" && !x.reply.is_empty()));
+    assert!(
+        captured
+            .iter()
+            .any(|x| x.ids.op.as_deref() == Some("getattr")),
+        "a reply the client rewrites is among them"
+    );
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// Batches of change events are captured at both ends alike: the same batches, numbered the same, with the same bytes.
+#[tokio::test]
+async fn both_ends_capture_the_same_event_batches() {
+    use jackalopefs_proto::control::Happened;
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = server.client().await;
+    let (_client_tap, mut on_client) = client.perf().hub.subscribe(frames(1, false));
+    let (_server_tap, mut on_server) = server.server.perf.hub.subscribe(frames(1, false));
+    for i in 0..3 {
+        std::fs::write(export.path().join(format!("f{i}")), b"x").unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    let batches = |rx: &mut jackalopefs_perf::hub::TapReceiver| {
+        let mut found = std::collections::BTreeMap::new();
+        while let Some(record) = rx.try_recv() {
+            if let Happened::EventFrame { seq, body, .. } = record.what {
+                found.insert(seq, body);
+            }
+        }
+        found
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut sent, mut read) = (
+        std::collections::BTreeMap::new(),
+        std::collections::BTreeMap::new(),
+    );
+    while sent.is_empty() || sent != read {
+        assert!(
+            Instant::now() < deadline,
+            "server {sent:?}, client {read:?}"
+        );
+        sent.extend(batches(&mut on_server));
+        read.extend(batches(&mut on_client));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// A captured read's data is cut unless the tap asked for payloads, and its length kept either way.
+#[tokio::test]
+async fn captured_reads_keep_their_data_only_when_asked() {
+    let export = tempfile::tempdir().unwrap();
+    std::fs::write(export.path().join("f"), vec![7u8; 5000]).unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = server.client().await;
+    let (fh, _) = client
+        .open(path("f"), libc::O_RDONLY, |attr| Ok(attr.ino))
+        .await
+        .unwrap();
+    let (_cut, mut cut) = client
+        .perf()
+        .hub
+        .subscribe(jackalopefs_proto::control::Selection {
+            ops: jackalopefs_proto::control::Names::Some(vec!["read".into()]),
+            ..frames(1, false)
+        });
+    let (_whole, mut whole) = client
+        .perf()
+        .hub
+        .subscribe(jackalopefs_proto::control::Selection {
+            ops: jackalopefs_proto::control::Names::Some(vec!["read".into()]),
+            ..frames(1, true)
+        });
+    client.read(fh, 0, 5000).await.unwrap();
+    let cut = exchanges(&mut cut, 1).await.remove(0);
+    let whole = exchanges(&mut whole, 1).await.remove(0);
+    assert_eq!((cut.reply_elided, whole.reply_elided), (5000, 0));
+    assert!(cut.reply.len() < 100, "{} bytes", cut.reply.len());
+    assert!(whole.reply.len() > 5000);
+    assert_eq!(
+        cut.request, whole.request,
+        "a read request carries no data to cut"
+    );
+    client.release(fh).await.unwrap();
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// A call given up on still shows in a capture: its request, and why there is no reply.
+#[tokio::test]
+async fn an_abandoned_exchange_is_captured_with_its_outcome() {
+    let blackhole = Blackhole::start().await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(blackhole.config(Duration::from_secs(5)))
+            .await
+            .unwrap(),
+    );
+    let (_tap, mut rx) = client.perf().hub.subscribe(frames(1, false));
+    let caller = client.clone();
+    let pending = tokio::spawn(async move { caller.getattr(Some(Path::root()), None).await });
+    wait_for(
+        Duration::from_secs(3),
+        "the getattr to reach the blackhole",
+        || (!blackhole.requests.lock().is_empty()).then_some(()),
+    )
+    .await;
+    pending.abort();
+    let x = exchanges(&mut rx, 1).await.remove(0);
+    assert_eq!(x.outcome, "abandoned");
+    assert!(!x.request.is_empty() && x.reply.is_empty());
+    client.shutdown().await;
+}
+
 #[tokio::test]
 async fn file_lifecycle() {
     let export = tempfile::tempdir().unwrap();
@@ -1798,7 +2005,10 @@ async fn a_lost_reply_is_an_event_naming_its_call() {
     };
     assert_eq!(name, "call_lost_retried");
     assert_eq!(ids.op.as_deref(), Some("getattr"));
-    assert!(ids.session.is_some() && ids.stream.is_some(), "{ids:?}");
+    assert!(
+        ids.session.is_some() && ids.conn.is_some() && ids.stream.is_some(),
+        "{ids:?}"
+    );
     assert!(!detail.is_empty());
     pending.await.unwrap().unwrap_err();
     client.shutdown().await;

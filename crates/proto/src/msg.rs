@@ -231,6 +231,21 @@ impl Request {
         }
     }
 
+    /// This request with the data it carries cut out, and how much that was; `None` when it carries none. For frame captures that leave file contents out.
+    pub fn with_data_elided(&self) -> Option<(Request, u64)> {
+        match self {
+            Request::Write { fh, offset, data } => Some((
+                Request::Write {
+                    fh: *fh,
+                    offset: *offset,
+                    data: Vec::new(),
+                },
+                data.len() as u64,
+            )),
+            _ => None,
+        }
+    }
+
     /// The handle, offset and size (or byte count) this request names, for logs; a copy is described by its destination.
     pub fn perf_fields(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
         match self {
@@ -409,6 +424,35 @@ pub enum Response {
     Xattr(Vec<u8>),
 }
 
+impl Response {
+    /// The reply's kind, as a log names it.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Response::Err(_) => "Err",
+            Response::Entry(_) => "Entry",
+            Response::Attr(_) => "Attr",
+            Response::Readlink(_) => "Readlink",
+            Response::Ok => "Ok",
+            Response::Opened { .. } => "Opened",
+            Response::Read(_) => "Read",
+            Response::Written(_) => "Written",
+            Response::Readdir { .. } => "Readdir",
+            Response::Statfs(_) => "Statfs",
+            Response::Xattr(_) => "Xattr",
+            Response::Copied(_) => "Copied",
+            Response::Seeked(_) => "Seeked",
+        }
+    }
+
+    /// This reply with the data it carries cut out, and how much that was; `None` when it carries none. For frame captures that leave file contents out.
+    pub fn with_data_elided(&self) -> Option<(Response, u64)> {
+        match self {
+            Response::Read(data) => Some((Response::Read(Vec::new()), data.len() as u64)),
+            _ => None,
+        }
+    }
+}
+
 /// One invalidation. `Entry` means the directory entry `dir/name` changed (created, removed, renamed, or its inode replaced); `Data` means the file's contents or attributes changed; `Overflow` means events were dropped and the client should treat everything it caches as suspect; `Unwatched` means the server stopped watching the directory `dir`, so changes to its entries and to its children go unreported until a request names it again, and the client should drop what it cached under it.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum EventItem {
@@ -487,5 +531,31 @@ mod tests {
             len: 1,
         };
         assert_eq!(copy.fhs(), [Some(4), Some(5)]);
+    }
+
+    #[test]
+    fn eliding_data_keeps_everything_but_the_data() {
+        let write = Request::Write {
+            fh: 3,
+            offset: 8,
+            data: vec![7; 100],
+        };
+        assert_eq!(
+            write.with_data_elided(),
+            Some((
+                Request::Write {
+                    fh: 3,
+                    offset: 8,
+                    data: Vec::new()
+                },
+                100
+            ))
+        );
+        assert_eq!(Request::Release { fh: 3 }.with_data_elided(), None);
+        assert_eq!(
+            Response::Read(vec![1; 5]).with_data_elided(),
+            Some((Response::Read(Vec::new()), 5))
+        );
+        assert_eq!(Response::Ok.with_data_elided(), None);
     }
 }

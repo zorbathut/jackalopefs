@@ -1,8 +1,14 @@
 //! What `jackalopefs-ctl` works out without a process to talk to: which processes there are, what a selector asks for, rates between two readings of the counters, and how a record reads.
 
-use jackalopefs_proto::control::{Counters, Happened, Ids, Names, Record, Selection, Summary};
+use jackalopefs_proto::control::{
+    ControlReply, Counters, Exchange, Happened, Ids, Names, Record, Selection, Summary,
+};
+use jackalopefs_proto::{
+    decode, read_frame, write_frame, Event, Request, Response, CONTROL_REVISION, PROTO_REVISION,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A process serving a control socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +97,23 @@ pub fn selection(selectors: &[String]) -> Result<Selection, String> {
         return Err("nothing selected: name events, `events`, `ops` or `op:NAME`".into());
     }
     Ok(selection)
+}
+
+/// What `capture` or `trace --frames` asks for: the frames of the operations the selectors name (of every operation when they name none), one exchange in `every`, and the events they name.
+pub fn frame_selection(
+    selectors: &[String],
+    every: u32,
+    payloads: bool,
+) -> Result<Selection, String> {
+    let mut chosen = if selectors.is_empty() {
+        Selection::default()
+    } else {
+        selection(selectors)?
+    };
+    chosen.frames = true;
+    chosen.every = every.max(1);
+    chosen.payloads = payloads;
+    Ok(chosen)
 }
 
 /// An event's rate between two readings.
@@ -325,6 +348,205 @@ fn line_of(record: &Record) -> String {
         }
         Happened::Request(summary) => format!("{at} {}", fmt_summary(summary)),
         Happened::Dropped(n) => format!("{at} ({n} records dropped: this reader fell behind)"),
+        Happened::Exchange(x) => format!("{at} {}", fmt_exchange(x)),
+        Happened::Undecodable {
+            side,
+            ids,
+            error,
+            body,
+        } => format!(
+            "{at} {side} undecodable frame of {} bytes{}: {error}",
+            body.len(),
+            fmt_ids(ids)
+        ),
+        Happened::EventFrame {
+            side,
+            ids,
+            every,
+            seq,
+            body,
+        } => {
+            let items = match decode::<Event>(body) {
+                Ok(event) => format!("{} change events", event.items.len()),
+                Err(e) => format!("undecodable events ({e})"),
+            };
+            format!(
+                "{at} {side} {items}{} seq={seq} (1 in {every})",
+                fmt_ids(ids)
+            )
+        }
+        Happened::Header(h) => format!(
+            "{at} capture of {} {} ({}), protocol {:016x}, control {:016x}",
+            h.side, h.pid, h.describe, h.proto_revision, h.control_revision
+        ),
+        Happened::Census { ops, dropped } => {
+            let mut out = format!("{at} census:");
+            for op in ops {
+                // A census the capture made itself, its process gone, knows only what it holds.
+                if op.seen == 0 && op.sampled > 0 {
+                    out.push_str(&format!(" {}={}/?", op.op, op.sampled));
+                } else {
+                    out.push_str(&format!(" {}={}/{}", op.op, op.sampled, op.seen));
+                }
+                if op.dropped > 0 {
+                    out.push_str(&format!(" ({} dropped)", op.dropped));
+                }
+            }
+            if *dropped > 0 {
+                out.push_str(&format!(", {dropped} records dropped"));
+            }
+            out
+        }
+    }
+}
+
+/// What a reply says, in a few words.
+fn fmt_response(resp: &Response) -> String {
+    match resp {
+        Response::Err(errno) => format!("errno {errno}"),
+        Response::Read(data) => format!("{} bytes", data.len()),
+        Response::Written(n) => format!("{n} written"),
+        Response::Readdir { entries, end } => {
+            format!(
+                "{} entries{}",
+                entries.len(),
+                if *end { ", end" } else { "" }
+            )
+        }
+        other => other.kind_name().to_owned(),
+    }
+}
+
+/// One line for a captured exchange: what was asked, what came back, and how long it took.
+pub fn fmt_exchange(x: &Exchange) -> String {
+    let asked = match decode::<Request>(&x.request) {
+        Ok(req) => format!("{} {}", req.op_name(), req.subject()),
+        Err(e) => format!("(request undecodable: {e})"),
+    };
+    let mut out = format!(
+        "{} exchange {asked}{} (1 in {})",
+        x.side,
+        fmt_ids(&x.ids),
+        x.every
+    );
+    if x.request_elided > 0 {
+        out.push_str(&format!(" with {} bytes (cut)", x.request_elided));
+    }
+    if x.outcome == "replied" {
+        let answer = match decode::<Response>(&x.reply) {
+            Ok(Response::Read(_)) if x.reply_elided > 0 => {
+                format!("{} bytes (cut)", x.reply_elided)
+            }
+            Ok(resp) => fmt_response(&resp),
+            Err(e) => format!("undecodable ({e})"),
+        };
+        out.push_str(&format!(" -> {answer} in {}", fmt_ns(x.elapsed_ns)));
+    } else {
+        out.push_str(&format!(
+            " -> no reply: {} after {}",
+            x.outcome,
+            fmt_ns(x.elapsed_ns)
+        ));
+    }
+    out
+}
+
+/// What a capture's debug form shows of a frame body: the message decoded in full, or why it does not decode.
+fn decoded<T: jackalopefs_proto::Message + std::fmt::Debug>(body: &[u8]) -> String {
+    match decode::<T>(body) {
+        Ok(message) => format!("{message:#?}"),
+        Err(e) => format!("(does not decode: {e})"),
+    }
+}
+
+/// A record as `dump` shows it: its line, then each frame it holds decoded in full, indented; control characters escaped throughout.
+pub fn fmt_record_long(record: &Record) -> String {
+    let mut out = line_of(record);
+    let mut frame = |what: &str, text: String| {
+        out.push_str(&format!("\n  {what}:"));
+        for line in text.lines() {
+            out.push_str("\n    ");
+            out.push_str(line);
+        }
+    };
+    match &record.what {
+        Happened::Exchange(x) => {
+            frame("request", decoded::<Request>(&x.request));
+            if !x.reply.is_empty() {
+                frame("reply", decoded::<Response>(&x.reply));
+            }
+        }
+        Happened::EventFrame { body, .. } => frame("events", decoded::<Event>(body)),
+        _ => {}
+    }
+    clean_keeping_lines(&out)
+}
+
+fn clean_keeping_lines(text: &str) -> String {
+    text.lines().map(clean).collect::<Vec<_>>().join("\n")
+}
+
+/// What a capture file starts with, before any record: the file's kind and the revisions its records and frames were written in, readable before decoding anything.
+const CAPTURE_MAGIC: &[u8; 8] = b"jfscap\0\x01";
+
+/// The bytes a capture file starts with.
+pub fn capture_preamble() -> Vec<u8> {
+    let mut preamble = CAPTURE_MAGIC.to_vec();
+    preamble.extend_from_slice(&CONTROL_REVISION.to_le_bytes());
+    preamble.extend_from_slice(&PROTO_REVISION.to_le_bytes());
+    preamble
+}
+
+/// Check a capture file's first bytes: an error when it is not a capture or holds records of another control revision, which would read as garbage; a warning when its frames are of another protocol revision, which may decode wrongly.
+pub fn check_preamble(preamble: &[u8; 24]) -> Result<Option<String>, String> {
+    if preamble[..8] != CAPTURE_MAGIC[..] {
+        return Err("not a jackalopefs capture".into());
+    }
+    let revision =
+        |at: usize| u64::from_le_bytes(preamble[at..at + 8].try_into().expect("8 bytes"));
+    let (control, proto) = (revision(8), revision(16));
+    if control != CONTROL_REVISION {
+        return Err(format!(
+            "written with control revision {control:016x}; this jackalopefs-ctl reads {CONTROL_REVISION:016x}"
+        ));
+    }
+    Ok((proto != PROTO_REVISION).then(|| {
+        format!(
+            "its frames are of protocol revision {proto:016x}, not this build's {PROTO_REVISION:016x}, and may decode wrongly; --frames-to keeps their bytes"
+        )
+    }))
+}
+
+/// Write the preamble of a capture file.
+pub async fn write_preamble<W: AsyncWrite + Unpin>(out: &mut W) -> std::io::Result<()> {
+    out.write_all(&capture_preamble()).await
+}
+
+/// Read and check the preamble of a capture file: the warning to give, if any.
+pub async fn read_preamble<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<String>, String> {
+    let mut preamble = [0u8; 24];
+    input
+        .read_exact(&mut preamble)
+        .await
+        .map_err(|e| format!("too short for a capture ({e})"))?;
+    check_preamble(&preamble)
+}
+
+/// Write one record of a capture file.
+pub async fn write_record<W: AsyncWrite + Unpin>(
+    out: &mut W,
+    record: Record,
+) -> Result<(), jackalopefs_proto::ErrorCodec> {
+    write_frame(out, &ControlReply::Record(record)).await
+}
+
+/// The next record of a capture file; `None` at its end.
+pub async fn read_record<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<Record>, String> {
+    match read_frame::<_, ControlReply>(input).await {
+        Ok(ControlReply::Record(record)) => Ok(Some(record)),
+        Ok(other) => Err(format!("not a record: {other:?}")),
+        Err(e) if e.is_eof() => Ok(None),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -467,6 +689,45 @@ mod tests {
     }
 
     #[test]
+    fn a_capture_selects_frames_of_everything_unless_told_otherwise() {
+        let all = frame_selection(&[], 0, false).unwrap();
+        assert!(all.frames && all.ops.is_none() && all.every == 1);
+        let some = frame_selection(
+            &["op:read".to_string(), "reply_stalled".to_string()],
+            8,
+            true,
+        )
+        .unwrap();
+        assert_eq!(some.ops, Names::Some(vec!["read".into()]));
+        assert_eq!(some.events, Names::Some(vec!["reply_stalled".into()]));
+        assert!(some.payloads && some.every == 8);
+    }
+
+    #[test]
+    fn an_exchange_reads_as_what_was_asked_and_answered() {
+        let body = |frame: Vec<u8>| frame[4..].to_vec();
+        let request = body(jackalopefs_proto::encode(&Request::Release { fh: 5 }).unwrap());
+        let replied = Exchange {
+            side: "client".into(),
+            every: 1,
+            request: request.clone(),
+            reply: body(jackalopefs_proto::encode(&Response::Err(2)).unwrap()),
+            outcome: "replied".into(),
+            ..Exchange::default()
+        };
+        let abandoned = Exchange {
+            reply: Vec::new(),
+            outcome: "abandoned".into(),
+            ..replied.clone()
+        };
+        let (a, b) = (fmt_exchange(&replied), fmt_exchange(&abandoned));
+        assert!(a.contains("release") && b.contains("release"));
+        assert!(a.contains('2'));
+        assert!(b.contains("abandoned"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
     fn control_characters_from_a_process_are_shown_not_obeyed() {
         let line = clean("name\x1b[2Jwith\nescapes");
         assert!(!line.chars().any(char::is_control), "{line:?}");
@@ -481,5 +742,67 @@ mod tests {
             },
         };
         assert!(!fmt_record(&record).chars().any(char::is_control));
+    }
+
+    #[tokio::test]
+    async fn a_capture_file_reads_back_as_written_and_refuses_another_revision() {
+        let records = vec![
+            Record {
+                at_ns: 1,
+                what: Happened::Dropped(2),
+            },
+            Record {
+                at_ns: 3,
+                what: Happened::Event {
+                    name: "e".into(),
+                    ids: Ids::default(),
+                    detail: "d".into(),
+                },
+            },
+        ];
+        let mut file = Vec::new();
+        write_preamble(&mut file).await.unwrap();
+        for record in &records {
+            write_record(&mut file, record.clone()).await.unwrap();
+        }
+        let mut input = file.as_slice();
+        assert_eq!(read_preamble(&mut input).await, Ok(None));
+        let mut back = Vec::new();
+        while let Some(record) = read_record(&mut input).await.unwrap() {
+            back.push(record);
+        }
+        assert_eq!(back, records);
+
+        let mut other = capture_preamble();
+        other[8] ^= 1;
+        assert!(read_preamble(&mut other.as_slice()).await.is_err());
+        let mut newer_frames = capture_preamble();
+        newer_frames[16] ^= 1;
+        assert!(matches!(
+            read_preamble(&mut newer_frames.as_slice()).await,
+            Ok(Some(_))
+        ));
+        assert!(read_preamble(&mut &b"not a capture at all...."[..])
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn a_dumped_exchange_shows_its_frames_decoded() {
+        let body = |frame: Vec<u8>| frame[4..].to_vec();
+        let record = Record {
+            at_ns: 0,
+            what: Happened::Exchange(Exchange {
+                side: "server".into(),
+                every: 1,
+                request: body(jackalopefs_proto::encode(&Request::Release { fh: 41 }).unwrap()),
+                reply: body(jackalopefs_proto::encode(&Response::Ok).unwrap()),
+                outcome: "replied".into(),
+                ..Exchange::default()
+            }),
+        };
+        let long = fmt_record_long(&record);
+        assert!(long.lines().count() > fmt_record(&record).lines().count());
+        assert!(long.contains("41"));
     }
 }

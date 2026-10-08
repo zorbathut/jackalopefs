@@ -7,11 +7,11 @@ use crate::inodes::KeyNode;
 use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_perf::event;
-use jackalopefs_perf::hub::IdsEvent;
+use jackalopefs_perf::hub::{elided, Hub, IdsEvent, Side};
 use jackalopefs_perf::stall::ErrorLockHeld;
 use jackalopefs_proto::control::{Ids, Summary};
 use jackalopefs_proto::{
-    read_frame, write_frame, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name, Path,
+    encode, read_frame_body, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name, Path,
     Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
 };
 use quinn::{Connection, RecvStream, SendStream};
@@ -351,13 +351,22 @@ impl KeyRoot {
     }
 }
 
-/// One request on one fresh bidi stream.
+/// Where an exchange goes, for the frames a tap captures: the process's hub, and the session and connection on which it is made.
+#[derive(Clone, Copy)]
+pub(crate) struct Tapping<'a> {
+    pub hub: &'a Arc<Hub>,
+    pub session: u64,
+    pub conn: Option<u64>,
+}
+
+/// One request on one fresh bidi stream. When a tap captures this exchange ([`Hub::sample`]), it gets the request as sent and the reply as received, before any rewriting here, so its bytes are the server's.
 pub(crate) async fn exchange(
     conn: &Connection,
     root: &KeyRoot,
     ids: &IdMap,
     req: &Request,
     timing: &mut Timing<'_>,
+    tapping: Tapping<'_>,
 ) -> Result<Response, ErrorExchange> {
     let (send, recv) = conn
         .open_bi()
@@ -370,19 +379,71 @@ pub(crate) async fn exchange(
         recv,
         done: false,
     };
-    write_frame(&mut streams.send, req)
-        .await
-        .map_err(|e| codec_error(e, ErrorExchange::NotSent))?;
+    let unique = timing.kernel.map(|kernel| kernel.unique);
+    let tap_ids = || IdsEvent {
+        session: Some(tapping.session),
+        conn: tapping.conn,
+        stream: Some(stream),
+        unique,
+        op: Some(req.op_name()),
+    };
+    let frame = encode(req).map_err(|e| ErrorExchange::Protocol(e.to_string()))?;
+    let mut sampled = if tapping.hub.wants_frames() {
+        tapping.hub.sample(Side::Client, tap_ids())
+    } else {
+        None
+    };
+    if let Some(sampled) = sampled.as_mut() {
+        sampled.request(&frame[4..], || elided(req.with_data_elided()));
+        sampled.outcome("not sent");
+    }
     streams
         .send
-        .finish()
-        .map_err(|e| ErrorExchange::Lost(format!("cannot finish the request: {e}")))?;
-    timing.stamp_sent(stream);
-    let mut resp: Response = read_frame(&mut streams.recv)
+        .write_all(&frame)
         .await
-        .map_err(|e| codec_error(e, ErrorExchange::Lost))?;
+        .map_err(|e| ErrorExchange::NotSent(format!("the stream failed: {e}")))?;
+    if let Err(e) = streams.send.finish() {
+        if let Some(sampled) = sampled.as_mut() {
+            sampled.outcome("lost");
+        }
+        return Err(ErrorExchange::Lost(format!(
+            "cannot finish the request: {e}"
+        )));
+    }
+    timing.stamp_sent(stream);
+    // From here, a reply that never comes is the call giving up, unless the stream fails.
+    if let Some(sampled) = sampled.as_mut() {
+        sampled.outcome("abandoned");
+    }
+    let (body, decoded) = match read_frame_body::<_, Response>(&mut streams.recv).await {
+        Ok(read) => read,
+        Err(e) => {
+            if let Some(sampled) = sampled.as_mut() {
+                sampled.outcome("lost");
+            }
+            return Err(codec_error(e, ErrorExchange::Lost));
+        }
+    };
+    let mut resp = match decoded {
+        Ok(resp) => resp,
+        Err(e) => {
+            match sampled {
+                Some(sampled) => sampled.undecodable(&body),
+                None if tapping.hub.wants_frames() => {
+                    tapping
+                        .hub
+                        .undecodable(Side::Client, &tap_ids(), &e.to_string(), &body)
+                }
+                None => {}
+            }
+            return Err(ErrorExchange::Protocol(e.to_string()));
+        }
+    };
     timing.replied = Some(Instant::now());
     streams.done = true;
+    if let Some(sampled) = sampled {
+        sampled.reply(&body, || elided(resp.with_data_elided()));
+    }
     root.as_node_one(&mut resp);
     ids.incoming(req, &mut resp);
     Ok(resp)
@@ -609,6 +670,11 @@ impl Caller {
                         &attached.ids,
                         sent,
                         &mut timing,
+                        Tapping {
+                            hub: &self.perf.hub,
+                            session: attached.session_id,
+                            conn: attached.conn_key,
+                        },
                     ),
                 ),
             )
@@ -728,6 +794,7 @@ impl Client {
                 ids: cfg.ids,
             },
             handles.clone(),
+            perf.hub.clone(),
         )
         .await?;
         Ok(Client {
@@ -1136,25 +1203,7 @@ fn release_request(kind: HandleKind, fh: u64) -> Request {
 }
 
 fn unexpected(resp: Response) -> Error {
-    Error::Protocol(format!("unexpected reply {}", response_name(&resp)))
-}
-
-fn response_name(resp: &Response) -> &'static str {
-    match resp {
-        Response::Err(_) => "Err",
-        Response::Entry(_) => "Entry",
-        Response::Attr(_) => "Attr",
-        Response::Readlink(_) => "Readlink",
-        Response::Ok => "Ok",
-        Response::Opened { .. } => "Opened",
-        Response::Read(_) => "Read",
-        Response::Written(_) => "Written",
-        Response::Readdir { .. } => "Readdir",
-        Response::Statfs(_) => "Statfs",
-        Response::Xattr(_) => "Xattr",
-        Response::Copied(_) => "Copied",
-        Response::Seeked(_) => "Seeked",
-    }
+    Error::Protocol(format!("unexpected reply {}", resp.kind_name()))
 }
 
 #[cfg(test)]

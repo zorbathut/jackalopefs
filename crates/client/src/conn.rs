@@ -1,11 +1,13 @@
 //! The connection manager: one background task that owns the QUIC connection, reconnects with backoff when it drops, resumes (or reopens) the handle table, and forwards the server's event stream.
 
-use crate::client::{exchange, Error, KeyRoot, Timing};
+use crate::client::{exchange, Error, KeyRoot, Tapping, Timing};
 use crate::handles::{HandleKind, HandleTable};
 use crate::ids::{IdMap, ModeIds};
 use crate::transport::{client_config, ServerTrust};
+use jackalopefs_perf::hub::{Hub, IdsEvent, Side};
 use jackalopefs_proto::{
-    read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Resume, PROTO_REVISION,
+    read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply, Resume,
+    PROTO_REVISION,
 };
 use quinn::{Connection, Endpoint};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -106,7 +108,12 @@ impl ErrorConnectKind {
 
 impl ConnManager {
     /// Establish the first connection (failing loudly if it can't be made) and start the reconnect loop.
-    pub async fn start(cfg: ConfigConn, handles: Arc<HandleTable>) -> anyhow::Result<ConnManager> {
+    /// `hub` is where the frames of reconnects, releases and events go when a tap captures them.
+    pub async fn start(
+        cfg: ConfigConn,
+        handles: Arc<HandleTable>,
+        hub: Arc<Hub>,
+    ) -> anyhow::Result<ConnManager> {
         anyhow::ensure!(
             !cfg.server_addrs.is_empty(),
             "no server address to connect to"
@@ -121,7 +128,7 @@ impl ConnManager {
         let (first_tx, first_rx) = oneshot::channel();
         let offline_timeout = cfg.offline_timeout;
         let task = tokio::spawn(run(
-            cfg, candidates, handles, state_tx, events_tx, stop_rx, first_tx,
+            cfg, candidates, handles, hub, state_tx, events_tx, stop_rx, first_tx,
         ));
         match first_rx.await {
             Ok(Ok(())) => {
@@ -185,6 +192,7 @@ async fn run(
     cfg: ConfigConn,
     mut candidates: Vec<Candidate>,
     handles: Arc<HandleTable>,
+    hub: Arc<Hub>,
     state: watch::Sender<ConnState>,
     events: mpsc::Sender<Event>,
     mut stop: watch::Receiver<bool>,
@@ -273,6 +281,11 @@ async fn run(
             handles.kill_all();
         }
         root_mounted = Some(root.clone());
+        let tapping = Tapping {
+            hub: &hub,
+            session: attached.session_id,
+            conn: conn_key,
+        };
         let restore = async {
             if resumed {
                 send_releases(
@@ -282,12 +295,13 @@ async fn run(
                     &handles,
                     handles.take_owed(),
                     cfg.offline_timeout,
+                    tapping,
                 )
                 .await;
             } else {
                 // A new session holds none of the old one's handles, so the releases owed to that one are moot.
                 handles.take_owed();
-                reopen_handles(&conn, &root, ids, &handles, cfg.offline_timeout).await;
+                reopen_handles(&conn, &root, ids, &handles, cfg.offline_timeout, tapping).await;
             }
         };
         tokio::select! {
@@ -314,7 +328,13 @@ async fn run(
                 tracing::debug!("nobody waiting for the first connection result");
             }
         }
-        let reader = tokio::spawn(read_events(conn.clone(), events.clone()));
+        let reader = tokio::spawn(read_events(
+            conn.clone(),
+            events.clone(),
+            hub.clone(),
+            tapping.session,
+            conn_key,
+        ));
         tokio::select! {
             reason = conn.closed() => {
                 offline_since = Instant::now();
@@ -525,6 +545,7 @@ async fn reopen_handles(
     ids: IdMap,
     handles: &HandleTable,
     offline_timeout: Duration,
+    tapping: Tapping<'_>,
 ) {
     let live = handles.live();
     if live.is_empty() {
@@ -533,8 +554,14 @@ async fn reopen_handles(
     tracing::info!(count = live.len(), "reopening handles after a new session");
     let mut reopens = tokio::task::JoinSet::new();
     for (fh, rec) in live {
-        let (conn, root) = (conn.clone(), root.clone());
+        let (conn, root, hub) = (conn.clone(), root.clone(), tapping.hub.clone());
+        let (session, conn_key) = (tapping.session, tapping.conn);
         reopens.spawn(async move {
+            let tapping = Tapping {
+                hub: &hub,
+                session,
+                conn: conn_key,
+            };
             let outcome = match timeout(
                 offline_timeout,
                 exchange(
@@ -543,6 +570,7 @@ async fn reopen_handles(
                     &ids,
                     &rec.reopen_request(fh),
                     &mut Timing::default(),
+                    tapping,
                 ),
             )
             .await
@@ -569,7 +597,7 @@ async fn reopen_handles(
             Err(e) => tracing::error!("reopen task failed: {e}"),
         }
     }
-    send_releases(conn, root, ids, handles, stale, offline_timeout).await;
+    send_releases(conn, root, ids, handles, stale, offline_timeout, tapping).await;
 }
 
 /// Send releases concurrently, each on the offline deadline; one the server never answered is owed again, for the next resume of this session.
@@ -580,6 +608,7 @@ async fn send_releases(
     handles: &HandleTable,
     releases: Vec<jackalopefs_proto::Request>,
     offline_timeout: Duration,
+    tapping: Tapping<'_>,
 ) {
     if releases.is_empty() {
         return;
@@ -587,11 +616,24 @@ async fn send_releases(
     tracing::debug!(count = releases.len(), "sending releases");
     let mut sends = tokio::task::JoinSet::new();
     for release in releases {
-        let (conn, root) = (conn.clone(), root.clone());
+        let (conn, root, hub) = (conn.clone(), root.clone(), tapping.hub.clone());
+        let (session, conn_key) = (tapping.session, tapping.conn);
         sends.spawn(async move {
+            let tapping = Tapping {
+                hub: &hub,
+                session,
+                conn: conn_key,
+            };
             let sent = timeout(
                 offline_timeout,
-                exchange(&conn, &root, &ids, &release, &mut Timing::default()),
+                exchange(
+                    &conn,
+                    &root,
+                    &ids,
+                    &release,
+                    &mut Timing::default(),
+                    tapping,
+                ),
             )
             .await;
             (release, sent)
@@ -614,7 +656,13 @@ async fn send_releases(
 }
 
 /// Reads the server's uni event stream into the bounded queue. When the consumer falls behind, batches are dropped and a single `Overflow` is queued as soon as there is room, so the consumer knows to distrust its cache rather than miss changes silently.
-async fn read_events(conn: Connection, events: mpsc::Sender<Event>) {
+async fn read_events(
+    conn: Connection,
+    events: mpsc::Sender<Event>,
+    hub: Arc<Hub>,
+    session: u64,
+    conn_key: Option<u64>,
+) {
     let mut recv = match conn.accept_uni().await {
         Ok(recv) => recv,
         Err(e) => {
@@ -622,15 +670,35 @@ async fn read_events(conn: Connection, events: mpsc::Sender<Event>) {
             return;
         }
     };
+    let tap_ids = IdsEvent {
+        session: Some(session),
+        conn: conn_key,
+        stream: Some(u64::from(recv.id())),
+        op: Some("event"),
+        ..IdsEvent::default()
+    };
     let mut overflow_pending = false;
-    loop {
-        let event: Event = match read_frame(&mut recv).await {
-            Ok(event) => event,
+    for seq in 0u64.. {
+        let (body, decoded) = match read_frame_body::<_, Event>(&mut recv).await {
+            Ok(read) => read,
             Err(e) => {
                 tracing::debug!("event stream ended: {e}");
                 return;
             }
         };
+        let event = match decoded {
+            Ok(event) => event,
+            Err(e) => {
+                if hub.wants_frames() {
+                    hub.undecodable(Side::Client, &tap_ids, &e.to_string(), &body);
+                }
+                tracing::debug!("event stream ended: {e}");
+                return;
+            }
+        };
+        if hub.wants_frames() {
+            hub.event_frame(Side::Client, &tap_ids, seq, || Some(body));
+        }
         if overflow_pending {
             match events.try_send(Event {
                 items: vec![EventItem::Overflow],

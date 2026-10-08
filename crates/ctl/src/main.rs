@@ -1,10 +1,14 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use jackalopefs_ctl::{fmt_record, rates, render_top, selection, targets, Target};
-use jackalopefs_proto::control::{
-    Ask, ControlReply, ControlRequest, Counters, Happened, Selection,
+use jackalopefs_ctl::{
+    fmt_record, fmt_record_long, frame_selection, rates, read_preamble, read_record, render_top,
+    selection, targets, write_preamble, write_record, Target,
 };
-use jackalopefs_proto::{read_frame, write_frame, CONTROL_REVISION};
+use jackalopefs_proto::control::{
+    Ask, CensusOp, ControlReply, ControlRequest, Counters, Happened, Header, Record, Selection,
+};
+use jackalopefs_proto::{read_frame, write_frame, CONTROL_REVISION, PROTO_REVISION};
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::os::linux::net::SocketAddrExt;
 use std::time::{Duration, Instant};
@@ -46,7 +50,42 @@ enum Command {
         /// Stop after this many records.
         #[arg(long)]
         limit: Option<u64>,
+        /// Show the exchanges themselves, decoded, instead of request summaries: one in `--every`, of the operations named (all when none is).
+        #[arg(long)]
+        frames: bool,
+        /// With --frames: one exchange in this many, the same ones at both ends.
+        #[arg(long)]
+        every: Option<u32>,
         selectors: Vec<String>,
+    },
+    /// Write one process's frames to a file for `dump`: one exchange in `--every` of the operations named (all when none is), with any events named, and at the end a census of what the capture holds against what the process exchanged meanwhile.
+    Capture {
+        /// The process; needed when there is more than one.
+        #[arg(long)]
+        pid: Option<u32>,
+        /// The file to write; created readable by this user alone.
+        #[arg(short = 'o', long)]
+        output: std::path::PathBuf,
+        /// One exchange in this many, the same ones at both ends.
+        #[arg(long, default_value_t = 1)]
+        every: u32,
+        /// Stop after this many exchanges.
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Stop after this long.
+        #[arg(long, value_parser = humantime::parse_duration)]
+        duration: Option<Duration>,
+        /// Keep the data of reads and writes; without it, their contents are cut and only their lengths kept.
+        #[arg(long)]
+        payloads: bool,
+        selectors: Vec<String>,
+    },
+    /// Print a capture, each exchange's frames decoded in full.
+    Dump {
+        file: std::path::PathBuf,
+        /// Also write each frame body to its own file here, readable by this user alone, for `capnp convert`.
+        #[arg(long)]
+        frames_to: Option<std::path::PathBuf>,
     },
 }
 
@@ -82,11 +121,32 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Trace {
             pid,
             limit,
+            frames,
+            every,
             selectors,
         } => {
-            let selection = selection(&selectors).map_err(anyhow::Error::msg)?;
+            let selection = match (frames, every) {
+                (true, every) => frame_selection(&selectors, every.unwrap_or(1), false),
+                (false, Some(_)) => Err("--every chooses frames; add --frames".to_owned()),
+                (false, None) => selection(&selectors),
+            }
+            .map_err(anyhow::Error::msg)?;
             trace(pick(pid)?, selection, limit).await
         }
+        Command::Capture {
+            pid,
+            output,
+            every,
+            limit,
+            duration,
+            payloads,
+            selectors,
+        } => {
+            let selection =
+                frame_selection(&selectors, every, payloads).map_err(anyhow::Error::msg)?;
+            capture(pick(pid)?, selection, &output, limit, duration).await
+        }
+        Command::Dump { file, frames_to } => dump(&file, frames_to.as_deref()).await,
     }
 }
 
@@ -239,6 +299,195 @@ async fn trace(target: Target, selection: Selection, limit: Option<u64>) -> anyh
         if !matches!(record.what, Happened::Dropped(_)) {
             seen += 1;
         }
+    }
+    Ok(())
+}
+
+fn record_now(what: Happened) -> Record {
+    Record {
+        at_ns: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos() as u64),
+        what,
+    }
+}
+
+/// What a capture holds, counted as it goes, for a census when the process cannot give one.
+#[derive(Default)]
+struct Tally {
+    exchanges: u64,
+    sampled: BTreeMap<String, u64>,
+}
+
+impl Tally {
+    fn take(&mut self, record: &Record) {
+        if let Happened::Exchange(x) = &record.what {
+            self.exchanges += 1;
+            *self
+                .sampled
+                .entry(x.ids.op.clone().unwrap_or_default())
+                .or_default() += 1;
+        }
+    }
+}
+
+/// Why a capture stopped taking records.
+enum Ended {
+    /// It ran its course; the process is asked for its census.
+    Asked,
+    /// The process went away; the census is what the capture itself counted.
+    Gone(String),
+}
+
+async fn capture(
+    target: Target,
+    selection: Selection,
+    output: &std::path::Path,
+    limit: Option<u64>,
+    duration: Option<Duration>,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut interrupt = interrupts()?;
+    let mut stream = connect(&target).await?;
+    let about = counters(&mut stream).await?;
+    send(&mut stream, Ask::Subscribe(selection.clone())).await?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(output)
+        .with_context(|| format!("creating {}", output.display()))?;
+    let mut file = tokio::io::BufWriter::new(tokio::fs::File::from_std(file));
+    write_preamble(&mut file).await?;
+    let header = Header {
+        proto_revision: PROTO_REVISION,
+        control_revision: CONTROL_REVISION,
+        side: about.side,
+        pid: about.pid,
+        describe: about.describe,
+        selection,
+    };
+    write_record(&mut file, record_now(Happened::Header(header))).await?;
+    let deadline = duration.map(|d| tokio::time::Instant::now() + d);
+    let mut tally = Tally::default();
+    let ended = loop {
+        if limit.is_some_and(|limit| tally.exchanges >= limit) {
+            break Ended::Asked;
+        }
+        let deadline_passed = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
+        let record = tokio::select! {
+            reply = read_frame::<_, ControlReply>(&mut stream) => match reply {
+                Ok(ControlReply::Record(record)) => record,
+                Ok(other) => break Ended::Gone(format!("expected records, got {other:?}")),
+                Err(e) => break Ended::Gone(e.to_string()),
+            },
+            _ = deadline_passed => break Ended::Asked,
+            _ = interrupt.recv() => break Ended::Asked,
+        };
+        tally.take(&record);
+        write_record(&mut file, record).await?;
+    };
+    // What was still queued in the process, then its census; or, the process gone, a census of what came.
+    let gone = match ended {
+        Ended::Asked => {
+            let finished = async {
+                send(&mut stream, Ask::Census).await?;
+                loop {
+                    let ControlReply::Record(record) = reply(&mut stream).await? else {
+                        bail!("expected records");
+                    };
+                    let census = matches!(record.what, Happened::Census { .. });
+                    tally.take(&record);
+                    write_record(&mut file, record).await?;
+                    if census {
+                        return Ok(());
+                    }
+                }
+            };
+            match tokio::time::timeout(PATIENCE, finished).await {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(format!("{e:#}")),
+                Err(_) => Some("no census within 5s".to_owned()),
+            }
+        }
+        Ended::Gone(why) => Some(why),
+    };
+    if let Some(why) = &gone {
+        let ops = tally
+            .sampled
+            .iter()
+            .map(|(op, n)| CensusOp {
+                op: op.clone(),
+                sampled: *n,
+                ..CensusOp::default()
+            })
+            .collect();
+        write_record(&mut file, record_now(Happened::Census { ops, dropped: 0 })).await?;
+        eprintln!(
+            "the process stopped answering ({why}); the census counts only what the capture holds"
+        );
+    }
+    tokio::io::AsyncWriteExt::flush(&mut file).await?;
+    eprintln!(
+        "{} exchanges written to {}",
+        tally.exchanges,
+        output.display()
+    );
+    Ok(())
+}
+
+async fn dump(file: &std::path::Path, frames_to: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let mut input = tokio::io::BufReader::new(
+        tokio::fs::File::open(file)
+            .await
+            .with_context(|| format!("opening {}", file.display()))?,
+    );
+    if let Some(warning) = read_preamble(&mut input)
+        .await
+        .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?
+    {
+        eprintln!("{}: {warning}", file.display());
+    }
+    if let Some(dir) = frames_to {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let mut n = 0u64;
+    while let Some(record) = read_record(&mut input)
+        .await
+        .map_err(|e| anyhow::anyhow!("record {n} of {}: {e}", file.display()))?
+    {
+        say(&fmt_record_long(&record))?;
+        if let Some(dir) = frames_to {
+            let bodies: Vec<(&str, &[u8])> = match &record.what {
+                Happened::Exchange(x) => vec![("request", &x.request), ("reply", &x.reply)],
+                Happened::EventFrame { body, .. } => vec![("event", body)],
+                Happened::Undecodable { body, .. } => vec![("undecodable", body)],
+                _ => Vec::new(),
+            };
+            for (what, body) in bodies.into_iter().filter(|(_, b)| !b.is_empty()) {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let path = dir.join(format!("{n:06}-{what}.bin"));
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .and_then(|mut f| f.write_all(body))
+                    .with_context(|| format!("writing {}", path.display()))?;
+            }
+        }
+        n += 1;
     }
     Ok(())
 }

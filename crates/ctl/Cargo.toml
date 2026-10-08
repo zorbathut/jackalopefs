@@ -12,4 +12,4 @@ clap = { workspace = true }
 humantime = { workspace = true }
 jackalopefs-proto = { workspace = true }
 nix = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
