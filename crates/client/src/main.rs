@@ -198,16 +198,21 @@ fn main() -> anyhow::Result<()> {
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticks
         });
-        loop {
+        let ended = loop {
             tokio::select! {
-                _ = next_signal(&mut signals.term) => break,
-                _ = next_signal(&mut signals.int) => break,
+                _ = next_signal(&mut signals.term) => break false,
+                _ = next_signal(&mut signals.int) => break false,
                 _ = next_signal(&mut signals.usr1) => mount.report(),
                 _ = next_signal(&mut signals.usr2) => usr2_unused(),
                 _ = next_tick(&mut ticks) => mount.report(),
+                _ = mount.ended() => break true,
             }
+        };
+        if ended {
+            tracing::info!("the FUSE session ended without this client unmounting: the mount was unmounted from outside, or the session thread failed; shutting down");
+        } else {
+            tracing::info!("unmounting; a second signal abandons every pending request");
         }
-        tracing::info!("unmounting; a second signal abandons every pending request");
         let aborter = mount.aborter();
         let mut unmount = std::pin::pin!(mount.unmount());
         tokio::select! {

@@ -321,6 +321,16 @@ impl Mount {
         }
     }
 
+    /// Completes once the FUSE session has ended, whoever ended it; before this client unmounts, that means the mount was unmounted from outside or the session thread failed.
+    pub async fn ended(&self) {
+        self.shared
+            .session_over
+            .subscribe()
+            .wait_for(|over| *over)
+            .await
+            .expect("the sender lives in what this mount holds");
+    }
+
     pub fn aborter(&self) -> Aborter {
         Aborter {
             control: self

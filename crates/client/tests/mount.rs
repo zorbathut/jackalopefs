@@ -2360,6 +2360,39 @@ async fn an_io_uring_timeout_still_cancels_its_worker() {
     m.abort_and_finish().await;
 }
 
+/// A mount unmounted from outside says so, so the client can end instead of serving nothing, and its own unmount afterwards still succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unmount_from_outside_ends_the_mount() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            m.mount.as_ref().unwrap().ended()
+        )
+        .await
+        .is_err(),
+        "a mount still in place has not ended"
+    );
+    let mnt = m.mnt();
+    let status = blocking(move || {
+        std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&mnt)
+            .status()
+            .unwrap()
+    })
+    .await;
+    assert!(status.success(), "fusermount3 -u failed: {status}");
+    tokio::time::timeout(Duration::from_secs(5), m.mount.as_ref().unwrap().ended())
+        .await
+        .expect("the mount did not notice it was unmounted");
+    tokio::time::timeout(Duration::from_secs(5), m.finish())
+        .await
+        .expect("the unmount after an outside unmount did not complete");
+}
+
 /// Aborting the mount's FUSE connection fails every pending request and lets an unmount complete however stuck the server is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_abort_fails_pending_requests_and_frees_the_unmount() {

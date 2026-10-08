@@ -54,6 +54,8 @@ pub struct Shared {
     pub session_tid: AtomicI32,
     /// Set when this client starts unmounting, after which the session thread is meant to end.
     pub unmounting: AtomicBool,
+    /// Whether the FUSE session has ended, whoever ended it.
+    pub session_over: tokio::sync::watch::Sender<bool>,
     /// The invalidation thread's notifier call in progress, if one is; such a call is a blocking write to `/dev/fuse` that waits on kernel locks.
     pub notifier_busy: Mutex<Option<NotifierWork>>,
     /// Whether an interrupt stands for a signal (`crate::signals`).
@@ -197,6 +199,7 @@ impl Backend {
             ended: Ended::default(),
             session_tid: AtomicI32::new(0),
             unmounting: AtomicBool::new(false),
+            session_over: tokio::sync::watch::Sender::new(false),
             notifier_busy: Mutex::new(None),
             judge: signals::Judge::for_this_process(),
             entry_ttl,
@@ -878,6 +881,11 @@ fn tag_with_cookies<T>(entries: Vec<T>, first: u64, next: impl Fn(&T) -> u64) ->
 }
 
 impl Filesystem for Backend {
+    /// fuser calls this as the session loop returns: after this client's own unmount, or after one from outside (`fusermount -u`), which leaves nothing for this process to serve.
+    fn destroy(&mut self) {
+        self.shared.session_over.send_replace(true);
+    }
+
     /// Each setter answers with the previous value when it accepts and the ceiling when it refuses, so what is logged is the value asked for or the ceiling it hit. The kernel proposes its own readahead (the mount's `bdi` setting, 128 KiB by default) and lets the daemon only lower it, so the readahead cap is the usual outcome and it bounds every read the kernel will ever issue; the effective values are read from sysfs after mounting.
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         let max_write = config
