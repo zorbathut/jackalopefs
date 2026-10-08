@@ -391,7 +391,7 @@ impl Perf {
         let (snapshot, events) = {
             let mut inner = self.inner.lock();
             let now = Instant::now();
-            let (events, line) = inner.events.take();
+            let (events, line) = inner.events.take("events");
             let snapshot = Snapshot {
                 window: now.duration_since(inner.since),
                 inflight: inner.active.len() as u32,

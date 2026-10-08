@@ -58,8 +58,8 @@ impl CountsEvent {
         *self.total.entry(event).or_default() += 1;
     }
 
-    /// The window's counts and their report line (`name=window/total`, or `None` when nothing happened), starting a new window.
-    pub fn take(&mut self) -> (BTreeMap<&'static str, u64>, Option<String>) {
+    /// The window's counts and their report line (`perf {what} (window/total): name=window/total …`, or `None` when nothing happened), starting a new window.
+    pub fn take(&mut self, what: &str) -> (BTreeMap<&'static str, u64>, Option<String>) {
         let window = std::mem::take(&mut self.window);
         if window.is_empty() {
             return (window, None);
@@ -73,7 +73,7 @@ impl CountsEvent {
                 )
             })
             .collect();
-        let line = format!("perf events (window/total): {}", counts.join(" "));
+        let line = format!("perf {what} (window/total): {}", counts.join(" "));
         (window, Some(line))
     }
 }
@@ -656,16 +656,16 @@ mod tests {
         events.count("a");
         events.count("a");
         events.count("b");
-        let (window, line) = events.take();
+        let (window, line) = events.take("events");
         assert_eq!(window, BTreeMap::from([("a", 2), ("b", 1)]));
         assert!(line.is_some());
         events.count("a");
-        let (window, line) = events.take();
+        let (window, line) = events.take("events");
         assert_eq!(window, BTreeMap::from([("a", 1)]));
         assert_eq!(events.total, BTreeMap::from([("a", 3), ("b", 1)]));
         let line = line.unwrap();
         assert!(line.contains("a=") && !line.contains("b="), "{line}");
-        assert_eq!(events.take(), (BTreeMap::new(), None));
+        assert_eq!(events.take("events"), (BTreeMap::new(), None));
     }
 
     #[test]
