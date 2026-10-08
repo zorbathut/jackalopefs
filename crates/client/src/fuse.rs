@@ -3,7 +3,7 @@
 use crate::client::{Client, Error, RequestKernel};
 use crate::inodes::{KeyNode, NodeTable, ROOT};
 use crate::invalidate::Work;
-use crate::perf::{Outcome, TRACE_TARGET};
+use crate::perf::{Outcome, Slowpath, TRACE_TARGET};
 use crate::signals;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
@@ -765,7 +765,11 @@ impl Filesystem for Backend {
             return;
         };
         let stands = self.shared.judge.stands(tid);
-        self.shared.client.perf().record_interrupt(!stands);
+        let perf = self.shared.client.perf();
+        perf.count(Slowpath::Interrupt);
+        if !stands {
+            perf.count(Slowpath::InterruptIgnored);
+        }
         if stands {
             request.interrupt();
             return;

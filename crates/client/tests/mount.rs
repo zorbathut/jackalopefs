@@ -4,6 +4,7 @@ mod common;
 
 use common::*;
 use jackalopefs_client::mount::{Mount, MountOptions};
+use jackalopefs_client::perf::Slowpath;
 use jackalopefs_proto::{Request, Response};
 use std::ffi::{CString, OsStr};
 use std::fs;
@@ -1949,8 +1950,9 @@ async fn interrupts_until(
     let (mut received, mut ignored) = (0, 0);
     loop {
         let snapshot = mount.perf().report();
-        received += snapshot.interrupts;
-        ignored += snapshot.interrupts_ignored;
+        let count = |event: Slowpath| snapshot.events.get(event.name()).copied().unwrap_or(0);
+        received += count(Slowpath::Interrupt);
+        ignored += count(Slowpath::InterruptIgnored);
         if until(received, ignored) || Instant::now() > deadline {
             return (received, ignored);
         }

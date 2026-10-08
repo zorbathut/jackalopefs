@@ -42,6 +42,7 @@
 
 ### Improved
 
+- The client perf report's interrupt counts move from the `perf window` line (`interrupts=`, `ignored=`) to the `perf events` line (`interrupt`, `interrupt_ignored`).
 - `scripts/validate/fsstress.sh` gives a verdict on the operations that failed, which it used to print and ignore (a `syncfs` failing with `ESTALE` on every run went unseen that way). The log is parsed by the shape of each line, and a line of no known shape fails the suite; no operation may fail with an errno that means the mount broke (`EIO`, `ESTALE`, `ENOTCONN`, `ECONNABORTED`, `EBADF`, `ENOSYS`, `EFAULT`) or take a `SIGBUS`; and the failing operations are held against an expected-failure baseline per mode (`fsstress.baseline.user`, `.root`) whose every entry carries a reason established by traced runs and by `scripts/validate/fsstress-native.sh`, the same run on the export's filesystem without a mount. `all.sh` runs `selftest.sh` first. `docs/validation.md` reviews what each expected failure says about the client and server.
 - The server raises its open-file soft limit to the hard limit at startup and logs the limit in force.
 - A session's open handles are capped from the server's open-file limit, shared among every session that can hold handles at once (4080 at the common 524288), so the server's own work keeps its descriptors.

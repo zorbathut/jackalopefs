@@ -2,7 +2,7 @@
 
 pub mod logging;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,39 @@ pub fn fmt_bytes(n: u64) -> String {
         format!("{n}B")
     } else {
         format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+/// Slowpath events by name, counted whether or not anything logs them: per report window, and since the process started.
+#[derive(Default)]
+pub struct CountsEvent {
+    window: BTreeMap<&'static str, u64>,
+    total: BTreeMap<&'static str, u64>,
+}
+
+impl CountsEvent {
+    pub fn count(&mut self, event: &'static str) {
+        *self.window.entry(event).or_default() += 1;
+        *self.total.entry(event).or_default() += 1;
+    }
+
+    /// The window's counts and their report line (`name=window/total`, or `None` when nothing happened), starting a new window.
+    pub fn take(&mut self) -> (BTreeMap<&'static str, u64>, Option<String>) {
+        let window = std::mem::take(&mut self.window);
+        if window.is_empty() {
+            return (window, None);
+        }
+        let counts: Vec<String> = window
+            .iter()
+            .map(|(event, n)| {
+                format!(
+                    "{event}={n}/{}",
+                    self.total.get(event).copied().unwrap_or(0)
+                )
+            })
+            .collect();
+        let line = format!("perf events (window/total): {}", counts.join(" "));
+        (window, Some(line))
     }
 }
 
@@ -615,6 +648,24 @@ pub fn verdict(ports: &[SampleLink], this: &SampleQuic) -> Option<Verdict> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn event_windows_reset_and_totals_persist() {
+        let mut events = CountsEvent::default();
+        events.count("a");
+        events.count("a");
+        events.count("b");
+        let (window, line) = events.take();
+        assert_eq!(window, BTreeMap::from([("a", 2), ("b", 1)]));
+        assert!(line.is_some());
+        events.count("a");
+        let (window, line) = events.take();
+        assert_eq!(window, BTreeMap::from([("a", 1)]));
+        assert_eq!(events.total, BTreeMap::from([("a", 3), ("b", 1)]));
+        let line = line.unwrap();
+        assert!(line.contains("a=") && !line.contains("b="), "{line}");
+        assert_eq!(events.take(), (BTreeMap::new(), None));
+    }
 
     #[test]
     fn formatting_helpers() {
