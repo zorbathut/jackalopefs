@@ -237,9 +237,10 @@ impl Server {
         }
     }
 
-    /// Log the per-op table for the window since the last report, the process's open file descriptors and every session's open handles, the host's physical ports and UDP drop counters, and then, per attached session, its connection's QUIC statistics with the window and the verdict against those ports, so a verdict follows the lines it is drawn from. The server is the sending side of every read a client makes, so its window and losses are what bound a download.
+    /// Log the per-op table for the window since the last report, the requests being answered at least a second, the process's open file descriptors and every session's open handles, the host's physical ports and UDP drop counters, and then, per attached session, its connection's QUIC statistics with the window and the verdict against those ports, so a verdict follows the lines it is drawn from. The server is the sending side of every read a client makes, so its window and losses are what bound a download.
     pub fn report(&self) {
         self.perf.report();
+        crate::watchdog::report_pending(&self.perf);
         // The walk holds a descriptor of its own, which is not counted.
         match std::fs::read_dir("/proc/self/fd") {
             Ok(fds) => {
@@ -614,7 +615,7 @@ async fn handle_request(
     mut recv: RecvStream,
 ) {
     let accepted = Instant::now();
-    let _inflight = perf.start();
+    let inflight = Arc::new(perf.start(ops.session_id, u64::from(recv.id())));
     let req: Request = match timeout(REQUEST_READ_TIMEOUT, read_frame(&mut recv)).await {
         Ok(Ok(req)) => req,
         // The client finishes a stream early or resets it when it gives up on a call.
@@ -656,8 +657,11 @@ async fn handle_request(
     };
     let op = req.op_name();
     let (fh, offset, size) = req.perf_fields();
+    inflight.decoded(op, req.subject());
     let queued = Instant::now();
+    let running = inflight.clone();
     let resp = match tokio::task::spawn_blocking(move || {
+        running.running(nix::unistd::gettid().as_raw());
         let started = Instant::now();
         let resp = ops::dispatch(&ops, req);
         (started, Instant::now(), resp)
@@ -676,6 +680,7 @@ async fn handle_request(
         }
     };
     let outcome = outcome_of(&resp);
+    inflight.sending();
     let sending = Instant::now();
     match timeout(REPLY_WRITE_TIMEOUT, write_frame(&mut send, &resp)).await {
         Ok(Ok(())) => {

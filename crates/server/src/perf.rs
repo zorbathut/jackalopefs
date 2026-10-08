@@ -1,8 +1,9 @@
 //! Per-op accounting for every request the server answers, split into reading it off the stream, waiting for a blocking thread, the filesystem work, and sending the reply. Counting is always on and costs one mutex lock per request; the report is logged on demand and starts a new window.
 
+use jackalopefs_perf::stall::{Ended, ErrorLockHeld, ModeScan, Progress, LOCK_PATIENCE};
 use jackalopefs_perf::{fmt_bytes, fmt_duration, CountsEvent};
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -144,9 +145,84 @@ pub struct Snapshot {
     pub rows: BTreeMap<&'static str, Row>,
 }
 
+/// Where a request being answered stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PhaseServer {
+    /// Reading the request off its stream.
+    Read,
+    /// Waiting for a blocking thread to run the operation on.
+    Wait,
+    /// The filesystem work itself.
+    Op,
+    /// Writing the reply.
+    Send,
+}
+
+impl PhaseServer {
+    pub fn name(self) -> &'static str {
+        match self {
+            PhaseServer::Read => "reading the request",
+            PhaseServer::Wait => "waiting for a blocking thread",
+            PhaseServer::Op => "in the filesystem",
+            PhaseServer::Send => "sending the reply",
+        }
+    }
+}
+
+/// A request being answered, as the stall watchdog and the report describe it.
+#[derive(Clone, Debug)]
+pub struct Pending {
+    pub session: u64,
+    /// The QUIC stream it came on, which the client's stall lines name too.
+    pub stream: u64,
+    pub accepted: Instant,
+    /// Known once the request is decoded.
+    pub op: Option<&'static str>,
+    /// The files it is about ([`jackalopefs_proto::Request::subject`]), formatted at decode: the operation consumes the request.
+    pub subject: Option<String>,
+    pub phase: PhaseServer,
+    /// When it entered its phase.
+    pub since: Instant,
+    /// The blocking thread running the operation, once one is.
+    pub tid: Option<i32>,
+    /// The age at which the watchdog last reported it; zero if never.
+    reported: Duration,
+}
+
+impl Pending {
+    /// Session, stream, operation and the files it names, for a log line.
+    pub fn what(&self) -> String {
+        let mut what = format!(
+            "session {} stream {} {}",
+            self.session,
+            self.stream,
+            self.op.unwrap_or(UNDECODED)
+        );
+        if let Some(subject) = &self.subject {
+            what.push(' ');
+            what.push_str(subject);
+        }
+        what
+    }
+}
+
+/// What a request not yet decoded is called in a log line.
+pub const UNDECODED: &str = "undecoded request";
+
+/// What a scan of the requests being answered found.
+#[derive(Clone, Debug)]
+pub struct ScanPending {
+    pub count: usize,
+    /// The ones the scan selected, oldest first, with their ages.
+    pub found: Vec<(Pending, Duration)>,
+    /// Requests whose own lock was held past the watchdog's patience, and so went unexamined.
+    pub unreadable: usize,
+}
+
 struct Inner {
     since: Instant,
-    inflight: u32,
+    active: HashMap<u64, Arc<Mutex<Pending>>>,
+    next: u64,
     peak: u32,
     events: CountsEvent,
     rows: BTreeMap<&'static str, Row>,
@@ -154,6 +230,10 @@ struct Inner {
 
 pub struct Perf {
     inner: Mutex<Inner>,
+    /// Requests answered, and when the last one was.
+    pub progress: Progress,
+    /// Requests reported as stalled that have since ended, for the watchdog to log.
+    pub ended: Ended,
 }
 
 impl Default for Perf {
@@ -161,37 +241,135 @@ impl Default for Perf {
         Perf {
             inner: Mutex::new(Inner {
                 since: Instant::now(),
-                inflight: 0,
+                active: HashMap::new(),
+                next: 0,
                 peak: 0,
                 events: CountsEvent::default(),
                 rows: BTreeMap::new(),
             }),
+            progress: Progress::default(),
+            ended: Ended::default(),
         }
     }
 }
 
-/// Counts one request as in flight until dropped.
+/// One request being answered, until dropped; its transitions move the phase the watchdog sees.
 pub struct InFlight {
     perf: Arc<Perf>,
+    id: u64,
+    active: Arc<Mutex<Pending>>,
+}
+
+impl InFlight {
+    fn phase(&self, phase: PhaseServer) {
+        let mut active = self.active.lock();
+        active.phase = phase;
+        active.since = Instant::now();
+    }
+
+    /// The request is decoded; it waits for a blocking thread next.
+    pub fn decoded(&self, op: &'static str, subject: String) {
+        let mut active = self.active.lock();
+        active.op = Some(op);
+        active.subject = Some(subject);
+        active.phase = PhaseServer::Wait;
+        active.since = Instant::now();
+    }
+
+    /// A blocking thread, `tid`, is running the operation.
+    pub fn running(&self, tid: i32) {
+        let mut active = self.active.lock();
+        active.tid = Some(tid);
+        active.phase = PhaseServer::Op;
+        active.since = Instant::now();
+    }
+
+    pub fn sending(&self) {
+        self.phase(PhaseServer::Send);
+    }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.perf.inner.lock().inflight -= 1;
+        self.perf.inner.lock().active.remove(&self.id);
+        self.perf.progress.record();
+        let active = self.active.lock().clone();
+        if !active.reported.is_zero() {
+            self.perf.ended.push(|| {
+                format!(
+                    "{} ended after {}, last {}",
+                    active.what(),
+                    fmt_duration(active.accepted.elapsed()),
+                    active.phase.name()
+                )
+            });
+        }
     }
 }
 
 impl Perf {
-    /// Start counting a request; the guard ends it.
-    pub fn start(self: &Arc<Perf>) -> InFlight {
+    /// Start counting a request that arrived on `stream` of `session`; the guard ends it.
+    pub fn start(self: &Arc<Perf>, session: u64, stream: u64) -> InFlight {
+        let now = Instant::now();
+        let active = Arc::new(Mutex::new(Pending {
+            session,
+            stream,
+            accepted: now,
+            op: None,
+            subject: None,
+            phase: PhaseServer::Read,
+            since: now,
+            tid: None,
+            reported: Duration::ZERO,
+        }));
         let mut inner = self.inner.lock();
-        inner.inflight += 1;
-        inner.peak = inner.peak.max(inner.inflight);
-        InFlight { perf: self.clone() }
+        let id = inner.next;
+        inner.next += 1;
+        inner.active.insert(id, active.clone());
+        inner.peak = inner.peak.max(inner.active.len() as u32);
+        InFlight {
+            perf: self.clone(),
+            id,
+            active,
+        }
     }
 
     pub fn inflight(&self) -> u32 {
-        self.inner.lock().inflight
+        self.inner.lock().active.len() as u32
+    }
+
+    /// The requests being answered that `mode` selects, oldest first. Each lock is waited for at most [`LOCK_PATIENCE`] and none is taken inside another; `Err` when the table's own lock was held longer than that, which in a hang is itself the finding.
+    pub fn scan_pending(&self, now: Instant, mode: ModeScan) -> Result<ScanPending, ErrorLockHeld> {
+        let active: Vec<Arc<Mutex<Pending>>> = {
+            let inner = self
+                .inner
+                .try_lock_for(LOCK_PATIENCE)
+                .ok_or(ErrorLockHeld)?;
+            inner.active.values().cloned().collect()
+        };
+        let mut scan = ScanPending {
+            count: active.len(),
+            found: Vec::new(),
+            unreadable: 0,
+        };
+        for entry in active {
+            // Once one lock has been held past patience, the rest are only tried, so a crowd of held locks cannot hold the scan for long.
+            let patience = if scan.unreadable == 0 {
+                LOCK_PATIENCE
+            } else {
+                Duration::ZERO
+            };
+            let Some(mut entry) = entry.try_lock_for(patience) else {
+                scan.unreadable += 1;
+                continue;
+            };
+            let age = now.saturating_duration_since(entry.accepted);
+            if mode.selects(age, &mut entry.reported) {
+                scan.found.push((entry.clone(), age));
+            }
+        }
+        scan.found.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
+        Ok(scan)
     }
 
     /// A slowpath event happened.
@@ -216,13 +394,13 @@ impl Perf {
             let (events, line) = inner.events.take();
             let snapshot = Snapshot {
                 window: now.duration_since(inner.since),
-                inflight: inner.inflight,
+                inflight: inner.active.len() as u32,
                 peak: inner.peak,
                 events,
                 rows: std::mem::take(&mut inner.rows),
             };
             inner.since = now;
-            inner.peak = inner.inflight;
+            inner.peak = inner.active.len() as u32;
             (snapshot, line)
         };
         tracing::info!(
@@ -315,9 +493,9 @@ mod tests {
     #[test]
     fn gauge_survives_a_report_and_peak_restarts_from_it() {
         let perf = Arc::new(Perf::default());
-        let a = perf.start();
-        let b = perf.start();
-        drop(perf.start());
+        let a = perf.start(1, 0);
+        let b = perf.start(1, 4);
+        drop(perf.start(1, 8));
         assert_eq!(perf.inflight(), 2);
         let snap = perf.report();
         assert_eq!((snap.inflight, snap.peak), (2, 3));
@@ -326,6 +504,59 @@ mod tests {
         assert_eq!((snap.inflight, snap.peak), (1, 2));
         drop(a);
         assert_eq!(perf.inflight(), 0);
+    }
+
+    #[test]
+    fn requests_are_listed_with_their_phase_and_reported_on_schedule() {
+        let perf = Arc::new(Perf::default());
+        let read = perf.start(3, 0);
+        let op = perf.start(3, 4);
+        op.decoded("rename", "/a -> /b".into());
+        op.running(1234);
+        let start = Instant::now();
+        let listed = |at: Duration| perf.scan_pending(start + at, ModeScan::Listed).unwrap();
+        assert!(
+            listed(Duration::ZERO).found.is_empty(),
+            "nothing is a second old yet"
+        );
+        let scan = listed(Duration::from_secs(2));
+        assert_eq!((scan.count, scan.found.len(), scan.unreadable), (2, 2, 0));
+        let renaming = scan
+            .found
+            .iter()
+            .map(|(active, _)| active)
+            .find(|active| active.op == Some("rename"))
+            .unwrap();
+        assert_eq!(
+            (renaming.phase, renaming.tid),
+            (PhaseServer::Op, Some(1234))
+        );
+        assert_eq!((renaming.session, renaming.stream), (3, 4));
+        assert_eq!(renaming.subject.as_deref(), Some("/a -> /b"));
+
+        let due = |at: u64| {
+            perf.scan_pending(start + Duration::from_secs(at), ModeScan::Due)
+                .unwrap()
+                .found
+                .len()
+        };
+        assert_eq!(due(4), 0);
+        assert_eq!(due(5), 2);
+        assert_eq!(due(6), 0, "reported once until the age doubles");
+        assert_eq!(due(10), 2);
+        drop(read);
+        assert_eq!(
+            perf.ended.lines().len(),
+            1,
+            "a reported request that ends is collected"
+        );
+        let completed = perf.progress.completed();
+        drop(op);
+        assert_eq!(perf.progress.completed(), completed + 1);
+        let ended = perf.ended.lines();
+        assert_eq!(ended.len(), 1);
+        assert!(ended[0].contains("/a -> /b"), "{}", ended[0]);
+        assert_eq!(listed(Duration::from_secs(60)).count, 0);
     }
 
     #[test]

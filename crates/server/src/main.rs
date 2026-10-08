@@ -1,10 +1,12 @@
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
+use jackalopefs_perf::stall::{Watchdog, WATCH_PERIOD};
 use jackalopefs_server::export::Export;
 use jackalopefs_server::ids::{IdMap, ModeIds};
 use jackalopefs_server::session::{self, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch};
+use jackalopefs_server::watchdog::WatchServer;
 use jackalopefs_server::{handles, transport_config, Limits, MAX_CONNECTIONS};
 use nix::sys::resource::{getrlimit, setrlimit, Resource, RLIM_INFINITY};
 use std::net::SocketAddr;
@@ -179,6 +181,9 @@ fn main() -> anyhow::Result<()> {
         let server = Arc::new(Server::new(
             export, args.token, events, changes, limits, ids,
         ));
+        let mut watch = WatchServer::new(server.perf.clone(), tokio::runtime::Handle::current());
+        let watchdog = Watchdog::spawn("jfs-watchdog", WATCH_PERIOD, move || watch.tick())
+            .context("starting the stall watchdog")?;
 
         let closer = {
             let endpoint = endpoint.clone();
@@ -207,6 +212,9 @@ fn main() -> anyhow::Result<()> {
         session::serve(endpoint.clone(), server.clone()).await;
         closer.abort();
         endpoint.wait_idle().await;
+        tokio::task::spawn_blocking(move || watchdog.stop())
+            .await
+            .context("watchdog shutdown")?;
         server.report();
         Ok(())
     })

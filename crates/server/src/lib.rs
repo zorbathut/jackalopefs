@@ -11,6 +11,7 @@ pub mod perf;
 pub mod session;
 pub mod tls;
 pub mod watch;
+pub mod watchdog;
 
 use std::sync::Arc;
 use std::time::Duration;
