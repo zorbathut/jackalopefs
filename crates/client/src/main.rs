@@ -5,11 +5,9 @@ use jackalopefs_client::mount::{Mount, MountOptions};
 use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::Auth;
 use jackalopefs_proto::DEFAULT_PORT;
-use std::io::IsTerminal;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing_subscriber::EnvFilter;
 
 /// Mount a jackalopefs export.
 #[derive(Parser, Debug)]
@@ -105,12 +103,7 @@ async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_ansi(std::io::stdout().is_terminal())
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    jackalopefs_perf::logging::init();
     let args = Args::parse();
     if args.allow_other && !args.default_permissions {
         tracing::warn!("--allow-other without --default-permissions: every local user gets the server user's access to the export");

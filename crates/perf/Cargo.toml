@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 quinn = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

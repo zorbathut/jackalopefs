@@ -7,13 +7,11 @@ use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch};
 use jackalopefs_server::{handles, transport_config, Limits, MAX_CONNECTIONS};
 use nix::sys::resource::{getrlimit, setrlimit, Resource, RLIM_INFINITY};
-use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use tracing_subscriber::EnvFilter;
 
 /// Export a directory over QUIC for jackalopefs clients.
 #[derive(Parser, Debug)]
@@ -115,12 +113,7 @@ fn default_state_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_ansi(std::io::stdout().is_terminal())
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
+    jackalopefs_perf::logging::init();
     let args = Args::parse();
 
     // The client kernel already applied the caller's umask to every mode it sends; applying ours too would mask modes twice.
