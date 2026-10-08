@@ -2,7 +2,7 @@
 
 use jackalopefs_perf::{fmt_count, level_outermost, totals_at, RateResources};
 use jackalopefs_proto::control::{
-    ControlReply, Counters, Exchange, Happened, Ids, Names, Record, Selection, Summary,
+    Bucket, ControlReply, Counters, Exchange, Happened, Ids, Names, Record, Selection, Summary,
 };
 use jackalopefs_proto::{
     decode, read_frame, write_frame, Event, Request, Response, CONTROL_REVISION, PROTO_REVISION,
@@ -134,8 +134,41 @@ pub struct RateOp {
     pub bytes_per_second: f64,
     /// Mean time per request over the interval; `None` when none completed in it.
     pub mean_ns: Option<u64>,
+    /// The interval's median and 99th-percentile latency, as the bound of the bucket each falls in (at most a quarter above the true value).
+    pub p50_ns: Option<u64>,
+    pub p99_ns: Option<u64>,
+    /// The interval's median bytes moved, among the requests that moved any.
+    pub size_p50: Option<u64>,
     pub errors_per_second: f64,
     pub total: u64,
+}
+
+/// The `q` quantile (0 to 1) of what was added to a histogram between readings `before` and `now`, as the upper bound of the bucket it falls in; `None` when nothing was added.
+pub fn quantile(before: &[Bucket], now: &[Bucket], q: f64) -> Option<u64> {
+    let earlier: BTreeMap<u64, u64> = before.iter().map(|b| (b.upper, b.count)).collect();
+    let mut added: Vec<(u64, u64)> = now
+        .iter()
+        .map(|b| {
+            (
+                b.upper,
+                b.count
+                    .saturating_sub(earlier.get(&b.upper).copied().unwrap_or(0)),
+            )
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    added.sort_unstable();
+    let total: u64 = added.iter().map(|(_, n)| n).sum();
+    if total == 0 {
+        return None;
+    }
+    // The rank of the value wanted, from 1: the smallest that has at least q of the values at or below it.
+    let rank = ((q * total as f64).ceil() as u64).clamp(1, total);
+    let mut seen = 0;
+    added.into_iter().find_map(|(upper, n)| {
+        seen += n;
+        (seen >= rank).then_some(upper)
+    })
 }
 
 /// What changed between readings `before` and `now`, `seconds` apart: every event and operation that has happened at all, busiest first.
@@ -184,6 +217,9 @@ pub fn rates(before: &Counters, now: &Counters, seconds: f64) -> (Vec<RateEvent>
                 per_second: count as f64 / seconds,
                 bytes_per_second: delta(t.bytes, |w| w.bytes) as f64 / seconds,
                 mean_ns: (count > 0).then(|| total_ns / count),
+                p50_ns: quantile(was.map_or(&[], |w| &w.latency), &t.latency, 0.5),
+                p99_ns: quantile(was.map_or(&[], |w| &w.latency), &t.latency, 0.99),
+                size_p50: quantile(was.map_or(&[], |w| &w.sizes), &t.sizes, 0.5),
                 errors_per_second: delta(t.errors, |w| w.errors) as f64 / seconds,
                 total: t.count,
             }
@@ -266,6 +302,12 @@ pub fn counter_lines(c: &Counters) -> String {
         put(&format!("{key}.items"), &t.items);
         put(&format!("{key}.errors"), &t.errors);
         put(&format!("{key}.total_ns"), &t.total_ns);
+        for b in &t.latency {
+            put(&format!("{key}.latency_ns_le.{}", b.upper), &b.count);
+        }
+        for b in &t.sizes {
+            put(&format!("{key}.bytes_le.{}", b.upper), &b.count);
+        }
     }
     out
 }
@@ -320,19 +362,23 @@ pub fn render_top(
     }
     writeln!(
         out,
-        "\n{:<8} {:<16} {:>9} {:>11} {:>10} {:>8} {:>10}",
-        "level", "op", "per sec", "bytes/s", "mean", "err/s", "total"
+        "\n{:<8} {:<16} {:>9} {:>11} {:>9} {:>10} {:>10} {:>10} {:>8} {:>10}",
+        "level", "op", "per sec", "bytes/s", "size p50", "mean", "p50", "p99", "err/s", "total"
     )
     .expect("a String takes any write");
+    let or_dash = |v: Option<u64>, f: fn(u64) -> String| v.map_or_else(|| "-".to_owned(), f);
     for op in ops {
         writeln!(
             out,
-            "{:<8} {:<16} {:>9.1} {:>11} {:>10} {:>8.1} {:>10}",
+            "{:<8} {:<16} {:>9.1} {:>11} {:>9} {:>10} {:>10} {:>10} {:>8.1} {:>10}",
             clean(&op.level),
             clean(&op.op),
             op.per_second,
             fmt_bytes(op.bytes_per_second),
-            op.mean_ns.map_or_else(|| "-".to_owned(), fmt_ns),
+            or_dash(op.size_p50, |b| fmt_bytes(b as f64)),
+            or_dash(op.mean_ns, fmt_ns),
+            or_dash(op.p50_ns, fmt_ns),
+            or_dash(op.p99_ns, fmt_ns),
             op.errors_per_second,
             op.total
         )
@@ -681,6 +727,7 @@ mod tests {
             items: 0,
             errors,
             total_ns,
+            ..TotalOp::default()
         }
     }
 
@@ -721,6 +768,54 @@ mod tests {
         );
         let (_, idle) = rates(&now, &now, 1.0);
         assert_eq!(idle[0].mean_ns, None);
+    }
+
+    fn buckets(pairs: &[(u64, u64)]) -> Vec<Bucket> {
+        pairs
+            .iter()
+            .map(|&(upper, count)| Bucket { upper, count })
+            .collect()
+    }
+
+    #[test]
+    fn quantiles_come_from_what_the_interval_added() {
+        let before = buckets(&[(4096, 100), (131072, 5)]);
+        let now = buckets(&[(1024, 1), (4096, 100), (131072, 50)]);
+        assert_eq!(
+            quantile(&before, &now, 0.5),
+            Some(131072),
+            "the 100 old 4 KiB values are not the window's"
+        );
+        assert_eq!(quantile(&before, &now, 0.0), Some(1024));
+        assert_eq!(quantile(&[], &now, 0.5), Some(4096));
+        assert_eq!(quantile(&now, &now, 0.5), None);
+        let wide = buckets(&[(10, 98), (20, 1), (30, 1)]);
+        assert_eq!(quantile(&[], &wide, 0.99), Some(20));
+        assert_eq!(quantile(&[], &wide, 1.0), Some(30));
+    }
+
+    #[test]
+    fn rates_carry_the_windows_quantiles() {
+        let mut before = total("call", "write", 10, 10 * 4096, 0, 10_000);
+        before.latency = buckets(&[(1024, 10)]);
+        before.sizes = buckets(&[(4096, 10)]);
+        let mut now = total("call", "write", 30, 30 * 4096, 0, 50_000);
+        now.latency = buckets(&[(1024, 10), (2048, 15), (8192, 5)]);
+        now.sizes = buckets(&[(4096, 30)]);
+        let (_, ops) = rates(
+            &Counters {
+                ops: vec![before],
+                ..Counters::default()
+            },
+            &Counters {
+                ops: vec![now],
+                ..Counters::default()
+            },
+            1.0,
+        );
+        assert_eq!(ops[0].size_p50, Some(4096));
+        assert_eq!(ops[0].p50_ns, Some(2048));
+        assert!(ops[0].p99_ns >= ops[0].p50_ns);
     }
 
     #[test]
@@ -764,7 +859,10 @@ mod tests {
             side: "server".into(),
             pid: 7,
             events: vec![("reply_stalled".into(), 2)],
-            ops: vec![total("request", "read", 3, 12288, 0, 300)],
+            ops: vec![TotalOp {
+                sizes: buckets(&[(4096, 3)]),
+                ..total("request", "read", 3, 12288, 0, 300)
+            }],
             ..Counters::default()
         };
         let text = counter_lines(&c);
@@ -779,6 +877,7 @@ mod tests {
             ("event.reply_stalled", "2"),
             ("op.request.read.count", "3"),
             ("op.request.read.bytes", "12288"),
+            ("op.request.read.bytes_le.4096", "3"),
         ] {
             assert!(
                 text.lines().any(|l| l == format!("{key} {value}")),

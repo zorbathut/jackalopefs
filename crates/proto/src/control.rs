@@ -52,6 +52,13 @@ pub struct ControlRequest {
     pub ask: Ask,
 }
 
+/// A histogram bucket: values at most `upper`, above the bound of the bucket below.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bucket {
+    pub upper: u64,
+    pub count: u64,
+}
+
 /// One operation's totals since the process started, at one level: `fuse`, `call` or `request`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TotalOp {
@@ -62,6 +69,10 @@ pub struct TotalOp {
     pub items: u64,
     pub errors: u64,
     pub total_ns: u64,
+    /// Latencies in nanoseconds, the counted buckets only, by rising bound.
+    pub latency: Vec<Bucket>,
+    /// Bytes moved by the requests that moved any, likewise.
+    pub sizes: Vec<Bucket>,
 }
 
 /// What a process has used since it started; see `Resources` in the schema.
@@ -500,6 +511,26 @@ fn parse_record(r: schema::record::Reader<'_>) -> Result<Record, ErrorDecode> {
     })
 }
 
+fn build_buckets(
+    mut list: capnp::struct_list::Builder<'_, schema::bucket::Owned>,
+    buckets: &[Bucket],
+) {
+    for (i, b) in buckets.iter().enumerate() {
+        let mut o = list.reborrow().get(i as u32);
+        o.set_upper(b.upper);
+        o.set_count(b.count);
+    }
+}
+
+fn parse_buckets(list: capnp::struct_list::Reader<'_, schema::bucket::Owned>) -> Vec<Bucket> {
+    list.iter()
+        .map(|b| Bucket {
+            upper: b.get_upper(),
+            count: b.get_count(),
+        })
+        .collect()
+}
+
 impl Message for ControlReply {
     fn build(&self, message: &mut message::Builder<HeapAllocator>) {
         let mut b = message.init_root::<schema::control_reply::Builder<'_>>();
@@ -535,6 +566,11 @@ impl Message for ControlReply {
                     o.set_items(t.items);
                     o.set_errors(t.errors);
                     o.set_total_ns(t.total_ns);
+                    build_buckets(
+                        o.reborrow().init_latency(t.latency.len() as u32),
+                        &t.latency,
+                    );
+                    build_buckets(o.init_sizes(t.sizes.len() as u32), &t.sizes);
                 }
             }
             ControlReply::Record(record) => build_record(b.init_record(), record),
@@ -571,6 +607,8 @@ impl Message for ControlReply {
                                 items: o.get_items(),
                                 errors: o.get_errors(),
                                 total_ns: o.get_total_ns(),
+                                latency: parse_buckets(o.get_latency()?),
+                                sizes: parse_buckets(o.get_sizes()?),
                             })
                         })
                         .collect::<Result<_, ErrorDecode>>()?,
@@ -595,7 +633,14 @@ impl Message for ControlReply {
 
     fn size_hint(&self) -> u32 {
         match self {
-            ControlReply::Counters(c) => 48 + 8 * (c.events.len() + 4 * c.ops.len()) as u32,
+            ControlReply::Counters(c) => {
+                48 + 8
+                    * (c.events.len()
+                        + c.ops
+                            .iter()
+                            .map(|t| 6 + 2 * (t.latency.len() + t.sizes.len()))
+                            .sum::<usize>()) as u32
+            }
             ControlReply::Record(Record {
                 what: Happened::Event { detail, .. },
                 ..
@@ -658,6 +703,20 @@ mod tests {
                 items: 0,
                 errors: 1,
                 total_ns: 1000,
+                latency: vec![
+                    Bucket {
+                        upper: 1024,
+                        count: 8,
+                    },
+                    Bucket {
+                        upper: 1280,
+                        count: 1,
+                    },
+                ],
+                sizes: vec![Bucket {
+                    upper: 4096,
+                    count: 9,
+                }],
             }],
             resources: Resources {
                 user_ns: 1,

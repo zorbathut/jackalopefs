@@ -2,10 +2,12 @@
 
 pub mod control;
 pub mod events;
+pub mod histogram;
 pub mod hub;
 pub mod logging;
 pub mod stall;
 
+use histogram::Histogram;
 use jackalopefs_proto::control::{Resources, TotalOp};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -49,7 +51,7 @@ pub fn fmt_bytes(n: u64) -> String {
     }
 }
 
-/// Every operation's totals since the process started, by level (`fuse`, `call`, `request`) and operation: what `jackalopefs-ctl top` turns into rates. Unlike the report's windows these never reset, so any number of readers can each take differences of their own.
+/// Every operation's totals since the process started, by level (`fuse`, `call`, `request`) and operation: what `jackalopefs-ctl top` turns into rates and, from the histograms, quantiles. Unlike the report's windows these never reset, so any number of readers can each take differences of their own.
 #[derive(Default)]
 pub struct Totals(BTreeMap<(&'static str, &'static str), TotalsOp>);
 
@@ -60,6 +62,8 @@ struct TotalsOp {
     items: u64,
     errors: u64,
     total_ns: u64,
+    latency: Histogram,
+    sizes: Histogram,
 }
 
 impl Totals {
@@ -79,6 +83,10 @@ impl Totals {
         total.items += items;
         total.errors += u64::from(errno != 0);
         total.total_ns += ns;
+        total.latency.record(ns);
+        if bytes > 0 {
+            total.sizes.record(bytes);
+        }
     }
 
     /// The requests and bytes of every operation at `level`.
@@ -100,6 +108,8 @@ impl Totals {
                 items: t.items,
                 errors: t.errors,
                 total_ns: t.total_ns,
+                latency: t.latency.buckets(),
+                sizes: t.sizes.buckets(),
             })
             .collect()
     }
@@ -929,7 +939,7 @@ mod tests {
     }
 
     #[test]
-    fn totals_count_each_operation_and_sum_a_level() {
+    fn totals_list_every_request_once_in_its_latency_and_only_data_in_its_sizes() {
         let mut totals = Totals::default();
         totals.add("request", "read", 4096, 0, 0, Duration::from_micros(20));
         totals.add("request", "read", 0, 0, 0, Duration::from_micros(30));
@@ -943,7 +953,23 @@ mod tests {
             .unwrap();
         assert_eq!(read.count, 3);
         assert_eq!(read.errors, 1);
-        assert_eq!(read.total_ns, 2_050_000);
+        assert_eq!(
+            read.latency.iter().map(|b| b.count).sum::<u64>(),
+            read.count
+        );
+        for (ns, b) in [20_000u64, 30_000, 2_000_000].iter().zip(&read.latency) {
+            assert_eq!(b.upper, histogram::upper(histogram::bucket(*ns)));
+        }
+        assert_eq!(
+            read.sizes
+                .iter()
+                .map(|b| (b.upper, b.count))
+                .collect::<Vec<_>>(),
+            vec![(4096, 1), (131072, 1)],
+            "the read that moved nothing is in no size bucket"
+        );
+        let getattr = list.iter().find(|t| t.op == "getattr").unwrap();
+        assert!(getattr.sizes.is_empty());
         assert_eq!(totals.at("request"), (4, 4096 + 131072));
         assert_eq!(totals.at("call"), (1, 4096));
     }

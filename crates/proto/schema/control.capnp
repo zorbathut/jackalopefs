@@ -59,6 +59,12 @@ struct Count {
   value @1 :UInt64;
 }
 
+# One bucket of a histogram: how many values were at most `upper` and above the bucket below's bound.
+struct Bucket {
+  upper @0 :UInt64;
+  count @1 :UInt64;
+}
+
 # One operation's totals since the process started, at one level: `fuse` (what
 # the kernel asked the client), `call` (what the client asked the server) or
 # `request` (what the server answered).
@@ -70,6 +76,9 @@ struct TotalOp {
   items @4 :UInt64;
   errors @5 :UInt64;
   totalNs @6 :UInt64;
+  # Every request's latency in nanoseconds, and the bytes of those that moved any, since the process started, as the buckets that have counts; differences between two readings give an interval's quantiles.
+  latency @7 :List(Bucket);
+  sizes @8 :List(Bucket);
 }
 
 # What the process has used since it started: its CPU time and context switches (every thread's, exited ones included), and its main runtime's workers, the time they spent busy (summed) and how often they parked.
