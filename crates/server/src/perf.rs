@@ -1,7 +1,9 @@
 //! Per-op accounting for every request the server answers, split into reading it off the stream, waiting for a blocking thread, the filesystem work, and sending the reply. Counting is always on and costs one mutex lock per request; the report is logged on demand and starts a new window.
 
+use jackalopefs_perf::events::{Events, Kind};
+use jackalopefs_perf::hub::Hub;
 use jackalopefs_perf::stall::{Ended, ErrorLockHeld, ModeScan, Progress, LOCK_PATIENCE};
-use jackalopefs_perf::{fmt_bytes, fmt_duration, CountsEvent};
+use jackalopefs_perf::{fmt_bytes, fmt_duration};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -10,6 +12,9 @@ use std::time::{Duration, Instant};
 
 /// Target of the per-request trace lines, so `RUST_LOG=jackalopefs_server::perf=trace` enables them alone.
 pub const TRACE_TARGET: &str = "jackalopefs_server::perf";
+
+/// Target under which events are logged at `debug`, detail and all.
+pub const EVENT_TARGET: &str = "jackalopefs_server::event";
 
 /// What one request produced: payload bytes moved, directory entries returned, and the errno it failed with (0 for success).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,7 +47,7 @@ impl Outcome {
     }
 }
 
-/// Slowpath events, counted whether or not anything logs them.
+/// Slowpath events, counted whether or not anything logs them; their detail is built only while a tap selects them or [`EVENT_TARGET`] is logged at `debug`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slowpath {
     /// The client ended or reset a request stream before the request was complete: a call it interrupted or gave up on.
@@ -66,6 +71,24 @@ impl Slowpath {
             Slowpath::ReplyUndelivered => "reply_undelivered",
             Slowpath::ReplyStalled => "reply_stalled",
         }
+    }
+}
+
+impl Kind for Slowpath {
+    const ALL: &'static [Slowpath] = &[
+        Slowpath::RequestCancelled,
+        Slowpath::RequestStreamFailed,
+        Slowpath::RequestReadTimeout,
+        Slowpath::ReplyUndelivered,
+        Slowpath::ReplyStalled,
+    ];
+
+    fn name(self) -> &'static str {
+        Slowpath::name(self)
+    }
+
+    fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -227,12 +250,16 @@ struct Inner {
     active: HashMap<u64, Arc<Mutex<Pending>>>,
     next: u64,
     peak: u32,
-    events: CountsEvent,
+    /// The event counts at the last report.
+    events_seen: Vec<u64>,
     rows: BTreeMap<&'static str, Row>,
 }
 
 pub struct Perf {
     inner: Mutex<Inner>,
+    /// The taps of this server: what `jackalopefs-ctl` is watching.
+    pub hub: Arc<Hub>,
+    pub events: Arc<Events<Slowpath>>,
     /// Requests answered, and when the last one was.
     pub progress: Progress,
     /// Requests reported as stalled that have since ended, for the watchdog to log.
@@ -241,13 +268,16 @@ pub struct Perf {
 
 impl Default for Perf {
     fn default() -> Perf {
+        let hub = Arc::new(Hub::default());
         Perf {
+            events: Events::new(&hub),
+            hub,
             inner: Mutex::new(Inner {
                 since: Instant::now(),
                 active: HashMap::new(),
                 next: 0,
                 peak: 0,
-                events: CountsEvent::default(),
+                events_seen: Vec::new(),
                 rows: BTreeMap::new(),
             }),
             progress: Progress::default(),
@@ -293,6 +323,11 @@ impl InFlight {
         active.tid = Some(tid);
         active.phase = PhaseServer::Op;
         active.since = Instant::now();
+    }
+
+    /// What the request names, once decoded, for the events about it.
+    pub fn subject(&self) -> Option<String> {
+        self.active.lock().subject.clone()
     }
 
     pub fn sending(&self) {
@@ -383,11 +418,6 @@ impl Perf {
         Ok(scan)
     }
 
-    /// A slowpath event happened.
-    pub fn count(&self, event: Slowpath) {
-        self.inner.lock().events.count(event.name());
-    }
-
     pub fn record(&self, op: &'static str, outcome: &Outcome, total: Duration, phases: Phases) {
         self.inner
             .lock()
@@ -402,7 +432,7 @@ impl Perf {
         let (snapshot, events) = {
             let mut inner = self.inner.lock();
             let now = Instant::now();
-            let (events, line) = inner.events.take("events");
+            let (events, line) = self.events.window(&mut inner.events_seen, "events");
             let snapshot = Snapshot {
                 window: now.duration_since(inner.since),
                 inflight: inner.active.len() as u32,
@@ -573,12 +603,22 @@ mod tests {
     #[test]
     fn events_are_counted_per_window() {
         let perf = Arc::new(Perf::default());
-        perf.count(Slowpath::ReplyStalled);
-        perf.count(Slowpath::ReplyStalled);
+        perf.events.inc(Slowpath::ReplyStalled);
+        perf.events.inc(Slowpath::ReplyStalled);
         assert_eq!(
             perf.report().events,
             BTreeMap::from([(Slowpath::ReplyStalled.name(), 2)])
         );
         assert!(perf.report().events.is_empty());
+    }
+
+    #[test]
+    fn every_event_is_listed_once_in_its_place() {
+        for (i, kind) in Slowpath::ALL.iter().enumerate() {
+            assert_eq!(Kind::index(*kind), i, "{kind:?}");
+        }
+        let names: std::collections::BTreeSet<&str> =
+            Slowpath::ALL.iter().map(|k| k.name()).collect();
+        assert_eq!(names.len(), Slowpath::ALL.len(), "names are distinct");
     }
 }

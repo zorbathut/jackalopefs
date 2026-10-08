@@ -1676,6 +1676,52 @@ async fn a_pending_call_fails_when_its_connection_is_lost() {
     client.shutdown().await;
 }
 
+/// A reply lost with its connection is an event, and a tap that selects it gets its detail with the call's identifiers.
+#[tokio::test]
+async fn a_lost_reply_is_an_event_naming_its_call() {
+    use jackalopefs_perf::hub::{Names, Record, Selection};
+    let hole = Blackhole::start_handshaking(vec![
+        Blackhole::ack(),
+        HelloReply::RevisionMismatch {
+            revision: PROTO_REVISION ^ 1,
+        },
+    ])
+    .await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(hole.config(Duration::from_millis(500)))
+            .await
+            .unwrap(),
+    );
+    let (_tap, mut records) = client.perf().hub.subscribe(Selection {
+        events: Names::Some(vec!["call_lost_retried".into()]),
+    });
+    let caller = client.clone();
+    let pending = tokio::spawn(async move { caller.getattr(Some(Path::root()), None).await });
+    wait_for(
+        Duration::from_secs(3),
+        "the getattr to reach the blackhole",
+        || (!hole.requests.lock().is_empty()).then_some(()),
+    )
+    .await;
+    hole.connections.lock()[0].close(9u32.into(), b"simulated blip");
+    let record = tokio::time::timeout(Duration::from_secs(3), records.recv())
+        .await
+        .expect("no event for the lost reply")
+        .unwrap();
+    let Record::Event {
+        name, ids, detail, ..
+    } = record
+    else {
+        panic!("{record:?}");
+    };
+    assert_eq!(name, "call_lost_retried");
+    assert_eq!(ids.op, Some("getattr"));
+    assert!(ids.session.is_some() && ids.stream.is_some(), "{ids:?}");
+    assert!(!detail.is_empty());
+    pending.await.unwrap().unwrap_err();
+    client.shutdown().await;
+}
+
 /// Once the connection has been gone for the offline deadline, a call fails at once rather than waiting out a deadline of its own, so a program making call after call through an outage is not held for each one.
 #[tokio::test]
 async fn an_outage_past_the_offline_deadline_fails_calls_at_once() {

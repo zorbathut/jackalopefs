@@ -4,8 +4,10 @@ use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::{HandleKind, HandleTable};
 use crate::ids::{IdMap, ModeIds};
 use crate::inodes::KeyNode;
-use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, TRACE_TARGET};
+use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TRACE_TARGET};
 use crate::transport::ServerTrust;
+use jackalopefs_perf::event;
+use jackalopefs_perf::hub::IdsEvent;
 use jackalopefs_perf::stall::ErrorLockHeld;
 use jackalopefs_proto::{
     read_frame, write_frame, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name, Path,
@@ -58,18 +60,18 @@ impl Error {
     }
 }
 
-/// Outcome of one stream exchange, distinguishing "never sent" from "sent, reply lost" because the former is always safe to retry.
+/// Outcome of one stream exchange, distinguishing "never sent" from "sent, reply lost" because the former is always safe to retry; the connection failures say why, for the events that report them.
 #[derive(Debug)]
 pub(crate) enum ErrorExchange {
-    NotSent,
-    Lost,
+    NotSent(String),
+    Lost(String),
     Protocol(String),
 }
 
 impl From<ErrorExchange> for Error {
     fn from(e: ErrorExchange) -> Error {
         match e {
-            ErrorExchange::NotSent | ErrorExchange::Lost => Error::Disconnected,
+            ErrorExchange::NotSent(_) | ErrorExchange::Lost(_) => Error::Disconnected,
             ErrorExchange::Protocol(msg) => Error::Protocol(msg),
         }
     }
@@ -267,6 +269,8 @@ pub(crate) struct Timing<'a> {
     pub opened: Option<Instant>,
     pub sent: Option<Instant>,
     pub replied: Option<Instant>,
+    /// The QUIC stream the request went on, once one was opened.
+    pub stream: Option<u64>,
     kernel: Option<&'a RequestKernel>,
 }
 
@@ -280,6 +284,7 @@ impl<'a> Timing<'a> {
 
     fn stamp_opened(&mut self, stream: u64) {
         self.opened = Some(Instant::now());
+        self.stream = Some(stream);
         if let Some(kernel) = self.kernel {
             kernel.call_phase(PhaseCall::Send, None, Some(stream));
         }
@@ -346,10 +351,10 @@ pub(crate) async fn exchange(
     req: &Request,
     timing: &mut Timing<'_>,
 ) -> Result<Response, ErrorExchange> {
-    let (send, recv) = conn.open_bi().await.map_err(|e| {
-        tracing::debug!("cannot open request stream: {e}");
-        ErrorExchange::NotSent
-    })?;
+    let (send, recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| ErrorExchange::NotSent(format!("cannot open a stream: {e}")))?;
     let stream = u64::from(send.id());
     timing.stamp_opened(stream);
     let mut streams = Streams {
@@ -360,7 +365,10 @@ pub(crate) async fn exchange(
     write_frame(&mut streams.send, req)
         .await
         .map_err(|e| codec_error(e, ErrorExchange::NotSent))?;
-    streams.send.finish().map_err(|_| ErrorExchange::Lost)?;
+    streams
+        .send
+        .finish()
+        .map_err(|e| ErrorExchange::Lost(format!("cannot finish the request: {e}")))?;
     timing.stamp_sent(stream);
     let mut resp: Response = read_frame(&mut streams.recv)
         .await
@@ -385,13 +393,21 @@ fn outcome_of(result: &Result<Response, Error>) -> Outcome {
     }
 }
 
-fn codec_error(e: ErrorCodec, on_io: ErrorExchange) -> ErrorExchange {
+fn codec_error(e: ErrorCodec, on_io: fn(String) -> ErrorExchange) -> ErrorExchange {
     match e {
-        ErrorCodec::Io(io) => {
-            tracing::debug!("request stream failed: {io}");
-            on_io
-        }
+        ErrorCodec::Io(io) => on_io(format!("the stream failed: {io}")),
         other => ErrorExchange::Protocol(other.to_string()),
+    }
+}
+
+/// The identifiers of a call's attempt on `attached`, for the events it raises.
+fn call_ids(req: &Request, attached: &Attached, timing: &Timing<'_>) -> IdsEvent {
+    IdsEvent {
+        session: Some(attached.session_id),
+        stream: timing.stream,
+        unique: timing.kernel.map(|kernel| kernel.unique),
+        op: Some(req.op_name()),
+        ..IdsEvent::default()
     }
 }
 
@@ -559,19 +575,37 @@ impl Caller {
             match exchanged {
                 Ok(Ok(Response::Err(errno))) => return Err(Error::Remote(errno)),
                 Ok(Ok(resp)) => return Ok(resp),
-                Ok(Err(ErrorExchange::NotSent)) => {
-                    self.perf.count(Slowpath::CallNotSent);
+                Ok(Err(ErrorExchange::NotSent(cause))) => {
+                    event!(
+                        target: EVENT_TARGET,
+                        self.perf.events,
+                        Slowpath::CallNotSent,
+                        call_ids(req, &attached, &timing),
+                        format!(
+                            "{} {} on generation {}: {cause}; waiting for the next connection",
+                            req.op_name(),
+                            req.subject(),
+                            attached.generation
+                        )
+                    );
                     min_generation = attached.generation + 1;
                 }
-                Ok(Err(ErrorExchange::Lost)) => {
+                Ok(Err(ErrorExchange::Lost(cause))) => {
                     if lost_once || !retry_safe(req) {
                         return Err(Error::Disconnected);
                     }
-                    tracing::debug!(
-                        op = req.op_name(),
-                        "reply lost with the connection; retrying once on the next one"
+                    event!(
+                        target: EVENT_TARGET,
+                        self.perf.events,
+                        Slowpath::CallLostRetried,
+                        call_ids(req, &attached, &timing),
+                        format!(
+                            "{} {} on generation {}: {cause}; the reply was lost with the connection, so it is sent once more on the next",
+                            req.op_name(),
+                            req.subject(),
+                            attached.generation
+                        )
                     );
-                    self.perf.count(Slowpath::CallLostRetried);
                     lost_once = true;
                     offline_deadline = Instant::now() + self.offline_timeout;
                     min_generation = attached.generation + 1;

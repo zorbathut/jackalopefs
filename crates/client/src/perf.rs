@@ -1,6 +1,8 @@
 //! Per-op accounting at the two levels of the client: what the kernel asked for and how long the answer took (`fuse`), and every request to the server with the time spent in each of its phases (`call`). Counting is always on and costs one mutex lock per op; the report is logged on demand and starts a new window.
 
-use jackalopefs_perf::{fmt_bytes, fmt_duration, CountsEvent};
+use jackalopefs_perf::events::{Events, Kind};
+use jackalopefs_perf::hub::Hub;
+use jackalopefs_perf::{fmt_bytes, fmt_duration};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -9,6 +11,9 @@ use std::time::{Duration, Instant};
 
 /// Target of the per-request trace lines, so `RUST_LOG=jackalopefs_client::perf=trace` enables them alone.
 pub const TRACE_TARGET: &str = "jackalopefs_client::perf";
+
+/// Target under which events are logged at `debug`, detail and all.
+pub const EVENT_TARGET: &str = "jackalopefs_client::event";
 
 /// What one request produced: payload bytes moved, directory entries returned, and the errno it failed with (0 for success).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,7 +46,7 @@ impl Outcome {
     }
 }
 
-/// Slowpath events, counted whether or not anything logs them.
+/// Slowpath events, counted whether or not anything logs them; their detail is built only while a tap selects them or [`EVENT_TARGET`] is logged at `debug`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slowpath {
     /// A `FUSE_INTERRUPT` for a request still being answered.
@@ -68,6 +73,25 @@ impl Slowpath {
             Slowpath::AliasStale => "alias_stale",
             Slowpath::FileDroppedFromKernel => "file_dropped_from_kernel",
         }
+    }
+}
+
+impl Kind for Slowpath {
+    const ALL: &'static [Slowpath] = &[
+        Slowpath::Interrupt,
+        Slowpath::InterruptIgnored,
+        Slowpath::CallNotSent,
+        Slowpath::CallLostRetried,
+        Slowpath::AliasStale,
+        Slowpath::FileDroppedFromKernel,
+    ];
+
+    fn name(self) -> &'static str {
+        Slowpath::name(self)
+    }
+
+    fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -179,23 +203,30 @@ struct Inner {
     since: Instant,
     inflight: u32,
     peak: u32,
-    events: CountsEvent,
+    /// The event counts at the last report.
+    events_seen: Vec<u64>,
     fuse: BTreeMap<&'static str, Row>,
     call: BTreeMap<&'static str, RowCall>,
 }
 
 pub struct Perf {
     inner: Mutex<Inner>,
+    /// The taps of this client: what `jackalopefs-ctl` is watching.
+    pub hub: Arc<Hub>,
+    pub events: Arc<Events<Slowpath>>,
 }
 
 impl Default for Perf {
     fn default() -> Perf {
+        let hub = Arc::new(Hub::default());
         Perf {
+            events: Events::new(&hub),
+            hub,
             inner: Mutex::new(Inner {
                 since: Instant::now(),
                 inflight: 0,
                 peak: 0,
-                events: CountsEvent::default(),
+                events_seen: Vec::new(),
                 fuse: BTreeMap::new(),
                 call: BTreeMap::new(),
             }),
@@ -228,11 +259,6 @@ impl Perf {
         self.inner.lock().inflight
     }
 
-    /// A slowpath event happened.
-    pub fn count(&self, event: Slowpath) {
-        self.inner.lock().events.count(event.name());
-    }
-
     pub fn record_fuse(&self, op: &'static str, outcome: &Outcome, total: Duration) {
         self.inner
             .lock()
@@ -262,7 +288,7 @@ impl Perf {
         let (snapshot, events) = {
             let mut inner = self.inner.lock();
             let now = Instant::now();
-            let (events, line) = inner.events.take("events");
+            let (events, line) = self.events.window(&mut inner.events_seen, "events");
             let snapshot = Snapshot {
                 window: now.duration_since(inner.since),
                 inflight: inner.inflight,
@@ -433,5 +459,15 @@ mod tests {
         perf.record_fuse("read", &Outcome::bytes(1), ms(1));
         assert_eq!(perf.report().fuse.len(), 1);
         assert!(perf.report().fuse.is_empty());
+    }
+
+    #[test]
+    fn every_event_is_listed_once_in_its_place() {
+        for (i, kind) in Slowpath::ALL.iter().enumerate() {
+            assert_eq!(Kind::index(*kind), i, "{kind:?}");
+        }
+        let names: std::collections::BTreeSet<&str> =
+            Slowpath::ALL.iter().map(|k| k.name()).collect();
+        assert_eq!(names.len(), Slowpath::ALL.len(), "names are distinct");
     }
 }

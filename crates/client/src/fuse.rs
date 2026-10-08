@@ -3,7 +3,7 @@
 use crate::client::{CallNow, Client, Error, RequestKernel};
 use crate::inodes::{KeyNode, NodeTable, ROOT};
 use crate::invalidate::Work;
-use crate::perf::{Outcome, Slowpath, TRACE_TARGET};
+use crate::perf::{Outcome, Slowpath, EVENT_TARGET, TRACE_TARGET};
 use crate::signals;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
@@ -11,6 +11,8 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, RequestId,
 };
+use jackalopefs_perf::event;
+use jackalopefs_perf::hub::IdsEvent;
 use jackalopefs_perf::stall::{Ended, ErrorLockHeld, ModeScan, Progress, LOCK_PATIENCE};
 use jackalopefs_proto::{
     Attr, DirEntry, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, Whence, MAX_IO,
@@ -523,8 +525,16 @@ impl Shared {
         if known.is_some_and(|key| key.describes(attr)) {
             return true;
         }
-        tracing::debug!(node = id, was = ?known, now = ?KeyNode::of(attr), "the path to a node led to another file");
-        self.client.perf().count(Slowpath::AliasStale);
+        event!(
+            target: EVENT_TARGET,
+            self.client.perf().events,
+            Slowpath::AliasStale,
+            IdsEvent::default(),
+            format!(
+                "node {id}: the path to it led to another file (was {known:?}, now {:?})",
+                KeyNode::of(attr)
+            )
+        );
         false
     }
 
@@ -607,23 +617,32 @@ impl Shared {
             size: attr.size,
             mtime: attr.mtime,
         };
-        let changed = {
+        let before = {
             let mut reported = self.reported.lock();
             match reported.get(&id) {
-                Some(before) => *before != now,
+                Some(before) => *before,
                 None => {
                     reported.insert(id, now);
-                    false
+                    return;
                 }
             }
         };
         // A file held open cannot be evicted, and while we write it the server's view is noise; the record stays behind so the first reply after the last close detects the change and drops the file then.
-        if !changed || self.client.handles().any_live_for(id).is_some() {
+        if before == now || self.client.handles().any_live_for(id).is_some() {
             return;
         }
         // The record moves only once the invalidation is queued; until then it stays behind so the next reply detects the same change again.
         if self.drop_by_name(id) {
-            self.client.perf().count(Slowpath::FileDroppedFromKernel);
+            event!(
+                target: EVENT_TARGET,
+                self.client.perf().events,
+                Slowpath::FileDroppedFromKernel,
+                IdsEvent::default(),
+                format!(
+                    "node {id}: changed on the server (size {} -> {}, mtime {:?} -> {:?}); dropped from the kernel's cache by name",
+                    before.size, now.size, before.mtime, now.mtime
+                )
+            );
             self.reported.lock().insert(id, now);
         }
     }
@@ -879,12 +898,12 @@ impl Filesystem for Backend {
 
     /// The kernel interrupts a request whenever the thread blocked in it has a signal pending by its reckoning, which counts task work (an io_uring completion, a freezer, a tracer's stop) as well as signals. Only a real signal abandons the call, with `EINTR` (`signals::Judge`). Otherwise the call goes on, and since the kernel sends no second interrupt for a request, a watcher looks for a real signal until the request is answered. A request already answered is ignored, as the kernel does.
     fn interrupt(&self, _req: &Request, unique: RequestId) {
-        let Some((request, tid)) = self
+        let Some((request, tid, op)) = self
             .shared
             .inflight
             .lock()
             .get(&unique.0)
-            .map(|a| (a.request.clone(), a.key.pid))
+            .map(|a| (a.request.clone(), a.key.pid, a.key.op))
         else {
             tracing::trace!(
                 unique = unique.0,
@@ -894,15 +913,29 @@ impl Filesystem for Backend {
         };
         let stands = self.shared.judge.stands(tid);
         let perf = self.shared.client.perf();
-        perf.count(Slowpath::Interrupt);
-        if !stands {
-            perf.count(Slowpath::InterruptIgnored);
-        }
+        let ids = IdsEvent {
+            unique: Some(unique.0),
+            op: Some(op),
+            ..IdsEvent::default()
+        };
+        event!(
+            target: EVENT_TARGET,
+            perf.events,
+            Slowpath::Interrupt,
+            ids.clone(),
+            format!("thread {tid}: a signal is pending: {stands}")
+        );
         if stands {
             request.interrupt();
             return;
         }
-        tracing::debug!(unique = unique.0, tid, "interrupt without a pending signal (task work such as an io_uring completion); the call goes on");
+        event!(
+            target: EVENT_TARGET,
+            perf.events,
+            Slowpath::InterruptIgnored,
+            ids,
+            format!("thread {tid}: interrupted without a pending signal (task work such as an io_uring completion); the call goes on")
+        );
         // The in-flight table and the task answering the request hold it; once both let go it is answered, and the watcher stops.
         let request = Arc::downgrade(&request);
         let shared = self.shared.clone();

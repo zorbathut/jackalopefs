@@ -4,11 +4,14 @@ use crate::export::Export;
 use crate::handles::Handles;
 use crate::ids::IdMap;
 use crate::ops::{self, Ops};
-use crate::perf::{Outcome, Perf, Phases, Slowpath, TRACE_TARGET};
+use crate::perf::{Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch, Watches};
 use crate::{Limits, SESSION_GRACE};
+use jackalopefs_perf::event;
+use jackalopefs_perf::hub::IdsEvent;
 use jackalopefs_perf::{
-    line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, SampleLink, TrackerQuic,
+    fmt_duration, line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, SampleLink,
+    TrackerQuic,
 };
 use jackalopefs_proto::{
     read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Request, Response,
@@ -627,7 +630,13 @@ async fn handle_request(
     mut recv: RecvStream,
 ) {
     let accepted = Instant::now();
-    let inflight = Arc::new(perf.start(ops.session_id, u64::from(recv.id())));
+    let stream = u64::from(recv.id());
+    let inflight = Arc::new(perf.start(ops.session_id, stream));
+    let ids = IdsEvent {
+        session: Some(ops.session_id),
+        stream: Some(stream),
+        ..IdsEvent::default()
+    };
     let req: Request = match timeout(REQUEST_READ_TIMEOUT, read_frame(&mut recv)).await {
         Ok(Ok(req)) => req,
         // The client finishes a stream early or resets it when it gives up on a call.
@@ -635,13 +644,23 @@ async fn handle_request(
             if e.is_eof()
                 || matches!(&e, jackalopefs_proto::ErrorCodec::Io(io) if io.kind() == std::io::ErrorKind::ConnectionReset) =>
         {
-            tracing::debug!("request cancelled before it was fully sent: {e}");
-            perf.count(Slowpath::RequestCancelled);
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::RequestCancelled,
+                ids,
+                format!("the request ended before it was fully sent: {e}")
+            );
             return;
         }
         Ok(Err(jackalopefs_proto::ErrorCodec::Io(e))) => {
-            tracing::debug!("request stream ended: {e}");
-            perf.count(Slowpath::RequestStreamFailed);
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::RequestStreamFailed,
+                ids,
+                format!("the request stream failed: {e}")
+            );
             return;
         }
         Ok(Err(jackalopefs_proto::ErrorCodec::Decode(
@@ -658,8 +677,16 @@ async fn handle_request(
             return;
         }
         Err(_) => {
-            tracing::debug!("request read timed out");
-            perf.count(Slowpath::RequestReadTimeout);
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::RequestReadTimeout,
+                ids,
+                format!(
+                    "the request was not fully sent within {}",
+                    fmt_duration(REQUEST_READ_TIMEOUT)
+                )
+            );
             return;
         }
     };
@@ -706,12 +733,36 @@ async fn handle_request(
             }
         }
         Ok(Err(e)) => {
-            tracing::debug!(op, "reply not delivered: {e}");
-            perf.count(Slowpath::ReplyUndelivered);
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::ReplyUndelivered,
+                IdsEvent {
+                    op: Some(op),
+                    ..ids.clone()
+                },
+                format!(
+                    "{}: the reply could not be written: {e}",
+                    inflight.subject().unwrap_or_default()
+                )
+            );
         }
         Err(_) => {
             tracing::warn!(op, "client is not reading its reply; abandoning it");
-            perf.count(Slowpath::ReplyStalled);
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::ReplyStalled,
+                IdsEvent {
+                    op: Some(op),
+                    ..ids.clone()
+                },
+                format!(
+                    "{}: the client did not read the reply within {}",
+                    inflight.subject().unwrap_or_default(),
+                    fmt_duration(REPLY_WRITE_TIMEOUT)
+                )
+            );
             if let Err(e) = send.reset(close_code::EVENT_STREAM_STALLED.into()) {
                 tracing::debug!(op, "reset after stalled reply: {e}");
             }
