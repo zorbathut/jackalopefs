@@ -11,8 +11,9 @@ pub mod mount;
 pub mod perf;
 pub mod signals;
 pub mod transport;
+pub mod watchdog;
 
-pub use client::{Client, Config, Error, RequestKernel};
+pub use client::{CallNow, Client, Config, Error, PhaseCall, RequestKernel};
 pub use conn::{ConnState, ErrorConnect, ErrorConnectKind};
 pub use perf::Perf;
 pub use transport::ServerTrust;

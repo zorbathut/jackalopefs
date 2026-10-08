@@ -5,6 +5,7 @@ mod common;
 use common::*;
 use jackalopefs_client::mount::{Mount, MountOptions};
 use jackalopefs_client::perf::Slowpath;
+use jackalopefs_client::PhaseCall;
 use jackalopefs_proto::{Request, Response};
 use std::ffi::{CString, OsStr};
 use std::fs;
@@ -2157,4 +2158,55 @@ async fn an_abort_fails_pending_requests_and_frees_the_unmount() {
     tokio::time::timeout(Duration::from_secs(3), m.finish())
         .await
         .expect("unmount did not complete after the abort");
+}
+
+/// A request the server never answers is in the in-flight table with the call it is making, under the process blocked in it, and leaves the table once a signal ends it. Aborting the connection would not: that fails the request in the kernel, while the call goes on waiting for the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_request_is_listed_in_flight_with_its_call() {
+    let Some(m) = Mounted::start_stalled().await else {
+        return;
+    };
+    let mut child = std::process::Command::new("stat")
+        .arg(m.mnt().join("never"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mount = m.mount.as_ref().unwrap();
+    let theirs = |mount: &Mount| -> Vec<jackalopefs_client::fuse::Pending> {
+        mount
+            .pending()
+            .expect("the table's lock is free")
+            .found
+            .into_iter()
+            .filter(|i| i.key.pid == pid)
+            .collect()
+    };
+    let listed = wait_for(
+        Duration::from_secs(5),
+        "the stat's request to be listed in flight",
+        || theirs(mount).into_iter().next(),
+    )
+    .await;
+    assert!(listed.started);
+    assert!(listed.age >= jackalopefs_perf::stall::INFLIGHT_LISTED);
+    let call = listed.call.unwrap().expect("the request is in a call");
+    assert_eq!(call.phase, PhaseCall::Reply);
+    assert!(call.stream.is_some());
+    assert!(
+        call.req.subject().contains("never"),
+        "{}",
+        call.req.subject()
+    );
+
+    child.kill().unwrap();
+    wait_for(
+        Duration::from_secs(3),
+        "the request to leave the table",
+        || theirs(mount).is_empty().then_some(()),
+    )
+    .await;
+    blocking(move || child.wait().unwrap()).await;
+    m.abort_and_finish().await;
 }

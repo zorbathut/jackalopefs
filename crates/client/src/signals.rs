@@ -37,6 +37,11 @@ impl Judge {
         }
     }
 
+    /// Whether `/proc` is this process's pid namespace's.
+    pub fn proc_ours(&self) -> bool {
+        self.enabled
+    }
+
     /// Whether an interrupt for a request from thread `tid` is to be honoured: when a signal is pending for the thread, when the thread is an io_uring worker (io_uring stops one, on a cancellation, a linked timeout or the ring's teardown, with the very notification that is no signal anywhere else), and when it cannot be judged, rather than risk a call nothing can end.
     pub fn stands(&self, tid: u32) -> bool {
         self.verdict(tid, |tid| {

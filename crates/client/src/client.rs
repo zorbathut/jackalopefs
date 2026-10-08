@@ -6,6 +6,7 @@ use crate::ids::{IdMap, ModeIds};
 use crate::inodes::KeyNode;
 use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, TRACE_TARGET};
 use crate::transport::ServerTrust;
+use jackalopefs_perf::stall::ErrorLockHeld;
 use jackalopefs_proto::{
     read_frame, write_frame, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name, Path,
     Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
@@ -13,6 +14,7 @@ use jackalopefs_proto::{
 use quinn::{Connection, RecvStream, SendStream};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
@@ -73,10 +75,40 @@ impl From<ErrorExchange> for Error {
     }
 }
 
-/// The kernel request a call is made for: its id, so a `call` trace line can be joined to the `fuse` line it served, and the kernel's signal that it wants the request abandoned. A call made outside one (an orphan handle release, a reopen after a reconnect) has none and cannot be interrupted.
+/// The kernel request a call is made for: its id, so a `call` trace line can be joined to the `fuse` line it served; the kernel's signal that it wants the request abandoned; and the call it is making right now, for the stall watchdog. A call made outside one (an orphan handle release, a reopen after a reconnect) has none, cannot be interrupted, and is not watched.
 pub struct RequestKernel {
     pub unique: u64,
     interrupt: watch::Sender<bool>,
+    /// Whether the task answering the request has run at all; one registered but never run is waiting for the runtime, not the server.
+    started: AtomicBool,
+    call: parking_lot::Mutex<Option<CallNow>>,
+}
+
+/// Where a call stands, as the stall watchdog reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseCall {
+    /// For a usable connection.
+    Wait,
+    /// For a request stream; the server's limit on concurrent streams holds a call here while others are outstanding.
+    Open,
+    /// Writing the request, which flow control can hold up.
+    Send,
+    /// The request is with the server, and the reply has not come back.
+    Reply,
+}
+
+/// The call a kernel request is making.
+#[derive(Clone, Debug)]
+pub struct CallNow {
+    pub req: Arc<Request>,
+    pub phase: PhaseCall,
+    /// When the call entered its phase.
+    pub since: std::time::Instant,
+    /// The connection the phase is on, once there is one.
+    pub generation: Option<u64>,
+    /// The QUIC stream carrying the request, which the server's stall lines name too.
+    pub stream: Option<u64>,
+    pub retries: u32,
 }
 
 impl RequestKernel {
@@ -84,12 +116,61 @@ impl RequestKernel {
         Arc::new(RequestKernel {
             unique,
             interrupt: watch::Sender::new(false),
+            started: AtomicBool::new(false),
+            call: parking_lot::Mutex::new(None),
         })
     }
 
     /// Run `f` as the work of this request, so every call it makes can be interrupted with it.
     pub async fn scope<F: Future>(self: Arc<Self>, f: F) -> F::Output {
+        self.started.store(true, Ordering::Relaxed);
         REQUEST_KERNEL.scope(self, f).await
+    }
+
+    pub fn started(&self) -> bool {
+        self.started.load(Ordering::Relaxed)
+    }
+
+    /// The call this request is making, if any. Waits at most `patience` for the lock, as a watchdog must; `Err` if it is held longer than that.
+    pub fn call_now(&self, patience: Duration) -> Result<Option<CallNow>, ErrorLockHeld> {
+        self.call
+            .try_lock_for(patience)
+            .map(|call| call.clone())
+            .ok_or(ErrorLockHeld)
+    }
+
+    /// A kernel request makes its calls one at a time: a second call while one is in progress would have its record wiped by the first one's end.
+    fn call_begin(&self, req: Arc<Request>) {
+        let mut call = self.call.lock();
+        debug_assert!(
+            call.is_none(),
+            "a kernel request is making two calls at once"
+        );
+        *call = Some(CallNow {
+            req,
+            phase: PhaseCall::Wait,
+            since: std::time::Instant::now(),
+            generation: None,
+            stream: None,
+            retries: 0,
+        });
+    }
+
+    /// The call enters `phase`. A `generation` names the connection the phase starts on and is kept until a resend clears it; the `stream` is the phase's own, absent before one is open.
+    fn call_phase(&self, phase: PhaseCall, generation: Option<u64>, stream: Option<u64>) {
+        if let Some(call) = self.call.lock().as_mut() {
+            call.phase = phase;
+            call.since = std::time::Instant::now();
+            call.generation = generation.or(call.generation);
+            call.stream = stream;
+        }
+    }
+
+    fn call_retried(&self, retries: u32) {
+        if let Some(call) = self.call.lock().as_mut() {
+            call.retries = retries;
+            call.generation = None;
+        }
     }
 
     /// The kernel wants the request abandoned. Latches: a call made after this fails at once.
@@ -107,6 +188,28 @@ impl RequestKernel {
 
 tokio::task_local! {
     static REQUEST_KERNEL: Arc<RequestKernel>;
+}
+
+/// Marks a call on its kernel request for as long as it runs, however it ends: finished, failed, or its future dropped by an interrupt or a timeout.
+struct CallTracked {
+    kernel: Option<Arc<RequestKernel>>,
+}
+
+impl CallTracked {
+    fn begin(kernel: Option<Arc<RequestKernel>>, req: &Arc<Request>) -> CallTracked {
+        if let Some(kernel) = &kernel {
+            kernel.call_begin(req.clone());
+        }
+        CallTracked { kernel }
+    }
+}
+
+impl Drop for CallTracked {
+    fn drop(&mut self) {
+        if let Some(kernel) = &self.kernel {
+            *kernel.call.lock() = None;
+        }
+    }
 }
 
 /// The kernel request the current task is answering, if any.
@@ -158,15 +261,37 @@ impl Drop for Streams {
     }
 }
 
-/// When each step of an exchange completed; a step that never completed leaves its instant unset.
+/// When each step of an exchange completed; a step that never completed leaves its instant unset. Each step also moves the phase of the kernel request's call, when the exchange is made for one.
 #[derive(Default)]
-pub(crate) struct Timing {
+pub(crate) struct Timing<'a> {
     pub opened: Option<Instant>,
     pub sent: Option<Instant>,
     pub replied: Option<Instant>,
+    kernel: Option<&'a RequestKernel>,
 }
 
-impl Timing {
+impl<'a> Timing<'a> {
+    fn for_kernel(kernel: Option<&'a RequestKernel>) -> Timing<'a> {
+        Timing {
+            kernel,
+            ..Timing::default()
+        }
+    }
+
+    fn stamp_opened(&mut self, stream: u64) {
+        self.opened = Some(Instant::now());
+        if let Some(kernel) = self.kernel {
+            kernel.call_phase(PhaseCall::Send, None, Some(stream));
+        }
+    }
+
+    fn stamp_sent(&mut self, stream: u64) {
+        self.sent = Some(Instant::now());
+        if let Some(kernel) = self.kernel {
+            kernel.call_phase(PhaseCall::Reply, None, Some(stream));
+        }
+    }
+
     /// The phases of one attempt that began at `started`; a phase still in progress is charged up to now, so a timeout shows where it was spent.
     fn phases(&self, started: Instant) -> Phases {
         let now = Instant::now();
@@ -219,13 +344,14 @@ pub(crate) async fn exchange(
     root: &KeyRoot,
     ids: &IdMap,
     req: &Request,
-    timing: &mut Timing,
+    timing: &mut Timing<'_>,
 ) -> Result<Response, ErrorExchange> {
     let (send, recv) = conn.open_bi().await.map_err(|e| {
         tracing::debug!("cannot open request stream: {e}");
         ErrorExchange::NotSent
     })?;
-    timing.opened = Some(Instant::now());
+    let stream = u64::from(send.id());
+    timing.stamp_opened(stream);
     let mut streams = Streams {
         send,
         recv,
@@ -235,7 +361,7 @@ pub(crate) async fn exchange(
         .await
         .map_err(|e| codec_error(e, ErrorExchange::NotSent))?;
     streams.send.finish().map_err(|_| ErrorExchange::Lost)?;
-    timing.sent = Some(Instant::now());
+    timing.stamp_sent(stream);
     let mut resp: Response = read_frame(&mut streams.recv)
         .await
         .map_err(|e| codec_error(e, ErrorExchange::Lost))?;
@@ -348,8 +474,11 @@ impl Caller {
     /// Send one request and account for it: the outcome and phase times go to the table, and one trace line per call to [`TRACE_TARGET`].
     async fn call(&self, req: Request) -> Result<Response, Error> {
         let started = Instant::now();
+        let req = Arc::new(req);
+        let kernel = current_request();
+        let _tracked = CallTracked::begin(kernel.clone(), &req);
         let mut account = AccountCall::default();
-        let result = self.attempt(&req, &mut account).await;
+        let result = self.attempt(&req, kernel.as_deref(), &mut account).await;
         let total = started.elapsed();
         let outcome = outcome_of(&result);
         let op = req.op_name();
@@ -358,7 +487,7 @@ impl Caller {
             let (fh, offset, size) = req.perf_fields();
             tracing::trace!(
                 target: TRACE_TARGET,
-                unique = current_request().map(|r| r.unique),
+                unique = kernel.as_ref().map(|r| r.unique),
                 op,
                 fh,
                 offset,
@@ -379,9 +508,12 @@ impl Caller {
     }
 
     /// The exchange and its retries; every attempt's phases are added to `account`. The two waits have different clocks. The wait for a connection is bounded by the offline deadline, set once and renewed only for the one resend a lost reply gets, so a server that keeps accepting connections and failing streams cannot hold a call forever; it also ends when the outage itself has lasted the offline timeout, so through a long outage calls fail at once instead of each waiting out a deadline of its own. The exchange itself is bounded only by the optional operation deadline: a server slow to answer on a live connection is not an error, and the connection's own idle timeout fails the exchange if the server dies. Either wait ends early when the kernel interrupts the request the call is made for.
-    async fn attempt(&self, req: &Request, account: &mut AccountCall) -> Result<Response, Error> {
-        let kernel = current_request();
-        let kernel = kernel.as_deref();
+    async fn attempt(
+        &self,
+        req: &Request,
+        kernel: Option<&RequestKernel>,
+        account: &mut AccountCall,
+    ) -> Result<Response, Error> {
         let mut offline_deadline = Instant::now() + self.offline_timeout;
         let handles = req.fhs().map(|fh| fh.and_then(|fh| self.handles.get(fh)));
         let mut min_generation = 0;
@@ -389,6 +521,9 @@ impl Caller {
         loop {
             if handles.iter().flatten().any(|h| h.is_dead()) {
                 return Err(Error::Stale);
+            }
+            if let Some(kernel) = kernel {
+                kernel.call_phase(PhaseCall::Wait, None, None);
             }
             let waiting = Instant::now();
             let attached = interruptible(
@@ -401,7 +536,10 @@ impl Caller {
             // Owners are put in server terms against the connection that carries the request, so a retry on the next one uses that one's.
             let mapped = attached.ids.outgoing(req)?;
             let sent = mapped.as_ref().unwrap_or(req);
-            let mut timing = Timing::default();
+            if let Some(kernel) = kernel {
+                kernel.call_phase(PhaseCall::Open, Some(attached.generation), None);
+            }
+            let mut timing = Timing::for_kernel(kernel);
             let attempt = Instant::now();
             let exchanged = interruptible(
                 kernel,
@@ -442,6 +580,9 @@ impl Caller {
                 Err(e) => return Err(e),
             }
             account.retries += 1;
+            if let Some(kernel) = kernel {
+                kernel.call_retried(account.retries);
+            }
         }
     }
 

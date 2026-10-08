@@ -292,6 +292,90 @@ impl Request {
             Request::Lseek { .. } => "lseek",
         }
     }
+
+    /// The files this request is about, for a log line: paths from the export root (`/a/b`), handles with their offsets and sizes. Never a payload or an attribute value.
+    pub fn subject(&self) -> String {
+        let at = |parent: &Path, name: &Name| {
+            let mut path = shown(parent);
+            if !parent.is_root() {
+                path.push('/');
+            }
+            path.push_str(&name.to_string());
+            path
+        };
+        let path_or_fh = |path: &Option<Path>, fh: &Option<u64>| match (path, fh) {
+            (Some(path), Some(fh)) => format!("{} fh={fh}", shown(path)),
+            (Some(path), None) => shown(path),
+            (None, Some(fh)) => format!("fh={fh}"),
+            (None, None) => "nothing".to_string(),
+        };
+        match self {
+            Request::Lookup { parent, name }
+            | Request::Mknod { parent, name, .. }
+            | Request::Mkdir { parent, name, .. }
+            | Request::Unlink { parent, name }
+            | Request::Rmdir { parent, name }
+            | Request::Symlink { parent, name, .. } => at(parent, name),
+            Request::Create {
+                fh, parent, name, ..
+            } => format!("{} fh={fh}", at(parent, name)),
+            Request::Getattr { path, fh } | Request::Setattr { path, fh, .. } => {
+                path_or_fh(path, fh)
+            }
+            Request::Readlink { path }
+            | Request::Statfs { path }
+            | Request::Setxattr { path, .. }
+            | Request::Getxattr { path, .. }
+            | Request::Listxattr { path }
+            | Request::Removexattr { path, .. }
+            | Request::Access { path, .. } => shown(path),
+            Request::Open { fh, path, .. } | Request::Opendir { fh, path } => {
+                format!("{} fh={fh}", shown(path))
+            }
+            Request::Rename {
+                parent,
+                name,
+                newparent,
+                newname,
+                ..
+            } => format!("{} -> {}", at(parent, name), at(newparent, newname)),
+            Request::Link {
+                path,
+                newparent,
+                newname,
+            } => format!("{} -> {}", shown(path), at(newparent, newname)),
+            Request::Release { fh } | Request::Releasedir { fh } | Request::Fsync { fh, .. } => {
+                format!("fh={fh}")
+            }
+            Request::Read { fh, offset, size } => format!("fh={fh} offset={offset} size={size}"),
+            Request::Write { fh, offset, data } => {
+                format!("fh={fh} offset={offset} size={}", data.len())
+            }
+            Request::Readdir {
+                fh,
+                offset,
+                max_bytes,
+            } => format!("fh={fh} offset={offset} size={max_bytes}"),
+            Request::Fallocate {
+                fh, offset, len, ..
+            } => format!("fh={fh} offset={offset} len={len}"),
+            Request::Lseek { fh, offset, .. } => format!("fh={fh} offset={offset}"),
+            Request::CopyFileRange {
+                fh_in,
+                offset_in,
+                fh_out,
+                offset_out,
+                len,
+            } => format!(
+                "fh={fh_in} offset={offset_in} -> fh={fh_out} offset={offset_out} len={len}"
+            ),
+        }
+    }
+}
+
+/// A path as a log shows it: from the export root, with a leading slash.
+fn shown(path: &Path) -> String {
+    format!("/{}", path.to_os_string().to_string_lossy())
 }
 
 /// Reply to a [`Request`]; `Err` carries a Linux errno.
@@ -342,6 +426,43 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path(s: &str) -> Path {
+        Path::from_names(s.split('/').map(|n| Name::new(n).unwrap()).collect()).unwrap()
+    }
+
+    #[test]
+    fn subjects_name_paths_and_handles_but_no_payload() {
+        let rename = Request::Rename {
+            parent: path("torrents"),
+            name: Name::new("big.iso").unwrap(),
+            newparent: path("done/iso"),
+            newname: Name::new("big.iso").unwrap(),
+            flags: 0,
+        };
+        let subject = rename.subject();
+        assert!(subject.contains("/torrents/big.iso"), "{subject}");
+        assert!(subject.contains("/done/iso/big.iso"), "{subject}");
+        let at_root = Request::Lookup {
+            parent: Path::root(),
+            name: Name::new("x").unwrap(),
+        };
+        assert!(at_root.subject().contains("/x") && !at_root.subject().contains("//"));
+        let write = Request::Write {
+            fh: 3,
+            offset: 0,
+            data: b"PAYLOAD".to_vec(),
+        };
+        assert!(!write.subject().contains("PAYLOAD"));
+        assert!(write.subject().contains('3'));
+        let setxattr = Request::Setxattr {
+            path: path("f"),
+            name: b"user.k".to_vec(),
+            value: b"SECRET".to_vec(),
+            flags: 0,
+        };
+        assert!(!setxattr.subject().contains("SECRET"));
+    }
 
     #[test]
     fn fhs_names_every_handle() {

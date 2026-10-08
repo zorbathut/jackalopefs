@@ -1,11 +1,12 @@
 //! Turns server events (and reconnects) into kernel cache invalidations. The `Notifier` calls are blocking writes to `/dev/fuse` that can wait on kernel directory locks, so they run on their own thread, fed by a bounded queue; a full queue collapses into one bounded sweep rather than blocking the event reader.
 
 use crate::conn::ConnState;
-use crate::fuse::Shared;
+use crate::fuse::{NotifierWork, Shared};
 use fuser::{INodeNo, Notifier};
 use jackalopefs_proto::{Event, EventItem, FileKind, Name};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, watch};
 
 /// Pending notifier calls; beyond this, events collapse into a sweep.
@@ -145,7 +146,7 @@ fn notifier_loop(rx: Receiver<Work>, notifier: Notifier, shared: Arc<Shared>) {
         match work {
             Work::Entry(parent, name) => {
                 shared.dir_grew(parent);
-                inval_entry(&notifier, parent, &name)
+                inval_entry(&notifier, &shared, parent, &name)
             }
             Work::Inode(ino) => {
                 shared.xattr_forget(ino);
@@ -159,8 +160,22 @@ fn notifier_loop(rx: Receiver<Work>, notifier: Notifier, shared: Arc<Shared>) {
     }
 }
 
-fn inval_entry(notifier: &Notifier, parent: u64, name: &Name) {
-    match notifier.inval_entry(INodeNo(parent), name.as_os_str()) {
+/// Make one notifier call, marked as in progress for the watchdog while it lasts.
+fn notifying<T>(shared: &Shared, kind: &'static str, ino: u64, call: impl FnOnce() -> T) -> T {
+    *shared.notifier_busy.lock() = Some(NotifierWork {
+        kind,
+        ino,
+        since: Instant::now(),
+    });
+    let out = call();
+    *shared.notifier_busy.lock() = None;
+    out
+}
+
+fn inval_entry(notifier: &Notifier, shared: &Shared, parent: u64, name: &Name) {
+    match notifying(shared, "inval_entry", parent, || {
+        notifier.inval_entry(INodeNo(parent), name.as_os_str())
+    }) {
         Ok(()) => tracing::trace!(parent, %name, "inval_entry"),
         Err(e) => tracing::debug!(parent, %name, "inval_entry: {e}"),
     }
@@ -170,7 +185,9 @@ fn inval_entry(notifier: &Notifier, parent: u64, name: &Name) {
 fn inval_inode(notifier: &Notifier, shared: &Shared, ino: u64) {
     let pages = !shared.client.handles().has_writer(ino);
     let offset = if pages { 0 } else { -1 };
-    match notifier.inval_inode(INodeNo(ino), offset, 0) {
+    match notifying(shared, "inval_inode", ino, || {
+        notifier.inval_inode(INodeNo(ino), offset, 0)
+    }) {
         Ok(()) => tracing::trace!(ino, pages, "inval_inode"),
         Err(e) => tracing::debug!(ino, pages, "inval_inode: {e}"),
     }
@@ -202,6 +219,6 @@ fn sweep(notifier: &Notifier, shared: &Shared) {
         inval_inode(notifier, shared, ino);
     }
     for (parent, name, _) in entries {
-        inval_entry(notifier, parent, &name);
+        inval_entry(notifier, shared, parent, &name);
     }
 }

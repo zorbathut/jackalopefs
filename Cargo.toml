@@ -24,7 +24,7 @@ fuser = { path = "vendor/fuser" }
 humantime = "2"
 io-uring = "0.7"
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "dir", "user"] }
+nix = { version = "0.31", features = ["fs", "dir", "user", "process"] }
 notify = "8"
 parking_lot = "0.12"
 quinn = "0.11"

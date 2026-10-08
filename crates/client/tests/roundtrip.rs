@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use jackalopefs_client::ids::{IdMap, ModeIds as ModeIdsClient};
 use jackalopefs_client::{
-    ConnState, Error, ErrorConnect, ErrorConnectKind, RequestKernel, ServerTrust,
+    ConnState, Error, ErrorConnect, ErrorConnectKind, PhaseCall, RequestKernel, ServerTrust,
 };
 use jackalopefs_proto::owners::NOBODY;
 use jackalopefs_proto::{
@@ -1926,5 +1926,95 @@ async fn perf_counts_an_interrupt_with_its_phases() {
         "reply phase {:?}",
         row.phases.reply
     );
+    client.shutdown().await;
+}
+
+/// What the stall watchdog reads off a kernel request: the call it is making, which phase that is in and on which connection and stream, and nothing once the call is over.
+#[tokio::test]
+async fn a_kernel_request_shows_where_its_call_stands() {
+    let blackhole = Blackhole::start_handshaking(vec![
+        Blackhole::ack(),
+        HelloReply::Reject {
+            reason: "not now".into(),
+        },
+    ])
+    .await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(blackhole.config(Duration::from_secs(2)))
+            .await
+            .unwrap(),
+    );
+    let patience = Duration::from_secs(1);
+    let call_in = |req: &RequestKernel, phase: PhaseCall| {
+        req.call_now(patience)
+            .expect("the call lock is free")
+            .filter(|call| call.phase == phase)
+    };
+    let req = RequestKernel::new(7);
+    assert!(req.call_now(patience).unwrap().is_none());
+    let (caller, scoped) = (client.clone(), req.clone());
+    let pending = tokio::spawn(async move {
+        scoped
+            .scope(async move { caller.getattr(Some(Path::root()), None).await })
+            .await
+    });
+    let call = wait_for(
+        Duration::from_secs(3),
+        "the getattr to await its reply",
+        || call_in(&req, PhaseCall::Reply),
+    )
+    .await;
+    assert!(req.started());
+    assert_eq!(call.req.op_name(), "getattr");
+    assert_eq!((call.generation, call.retries), (Some(1), 0));
+    assert!(call.stream.is_some());
+
+    // getattr is resent once when its reply is lost, and every reconnect is refused, so it waits for a connection until the offline deadline.
+    blackhole.connections.lock()[0].close(9u32.into(), b"simulated blip");
+    let call = wait_for(
+        Duration::from_secs(3),
+        "the resent getattr to wait for a connection",
+        || call_in(&req, PhaseCall::Wait),
+    )
+    .await;
+    assert_eq!(
+        (call.generation, call.retries, call.stream),
+        (None, 1, None)
+    );
+    let err = pending.await.unwrap().unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    assert!(req.call_now(patience).unwrap().is_none());
+    client.shutdown().await;
+}
+
+/// A call whose future is dropped (an interrupt, a timeout, an aborted task) leaves no call behind on its kernel request.
+#[tokio::test]
+async fn a_dropped_call_leaves_no_trace_on_its_kernel_request() {
+    let blackhole = Blackhole::start().await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(blackhole.config(Duration::from_secs(5)))
+            .await
+            .unwrap(),
+    );
+    let req = RequestKernel::new(8);
+    let (caller, scoped) = (client.clone(), req.clone());
+    let pending = tokio::spawn(async move {
+        scoped
+            .scope(async move { caller.mkdir(Path::root(), name("d"), 0o755).await })
+            .await
+    });
+    wait_for(
+        Duration::from_secs(3),
+        "the mkdir to await its reply",
+        || {
+            req.call_now(Duration::from_secs(1))
+                .unwrap()
+                .filter(|call| call.phase == PhaseCall::Reply)
+        },
+    )
+    .await;
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    assert!(req.call_now(Duration::from_secs(1)).unwrap().is_none());
     client.shutdown().await;
 }

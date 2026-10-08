@@ -1,6 +1,6 @@
 //! The FUSE backend: every kernel request is copied out of the session thread and answered from a tokio task, so the session thread never waits on the network.
 
-use crate::client::{Client, Error, RequestKernel};
+use crate::client::{CallNow, Client, Error, RequestKernel};
 use crate::inodes::{KeyNode, NodeTable, ROOT};
 use crate::invalidate::Work;
 use crate::perf::{Outcome, Slowpath, TRACE_TARGET};
@@ -11,6 +11,7 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyIoctl, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr,
     Request, RequestId,
 };
+use jackalopefs_perf::stall::{Ended, ErrorLockHeld, ModeScan, Progress, LOCK_PATIENCE};
 use jackalopefs_proto::{
     Attr, DirEntry, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, Whence, MAX_IO,
 };
@@ -18,7 +19,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,10 +43,49 @@ pub struct Shared {
     invalidations: Mutex<Option<std::sync::mpsc::SyncSender<Work>>>,
     /// The kernel requests being answered right now, by id, so an interrupt reaches the task answering one. Bounded by what the kernel keeps in flight. A request is registered on the session thread before its task is spawned, and the session has one thread, so the interrupt for a request is always read after the request was registered.
     inflight: Mutex<HashMap<u64, Answering>>,
+    /// Kernel requests answered, and when the last one was.
+    pub progress: Progress,
+    /// Requests reported as stalled that have since been answered, for the watchdog to log.
+    pub ended: Ended,
+    /// The FUSE session thread, which reads every request off `/dev/fuse`; 0 until the first request after `init`.
+    pub session_tid: AtomicI32,
+    /// Set when this client starts unmounting, after which the session thread is meant to end.
+    pub unmounting: AtomicBool,
+    /// The invalidation thread's notifier call in progress, if one is; such a call is a blocking write to `/dev/fuse` that waits on kernel locks.
+    pub notifier_busy: Mutex<Option<NotifierWork>>,
     /// Whether an interrupt stands for a signal (`crate::signals`).
     judge: signals::Judge,
     pub entry_ttl: Duration,
     pub attr_ttl: Duration,
+}
+
+/// A notifier call the invalidation thread is making.
+#[derive(Clone, Copy, Debug)]
+pub struct NotifierWork {
+    pub kind: &'static str,
+    /// The inode it is about: the parent directory for an entry.
+    pub ino: u64,
+    pub since: Instant,
+}
+
+/// A kernel request being answered, as a scan found it.
+#[derive(Clone, Debug)]
+pub struct Pending {
+    pub key: KeyPerf,
+    pub age: Duration,
+    /// Whether its task has run at all.
+    pub started: bool,
+    /// The call it is making; `Err` when the call's lock was held past the watchdog's patience.
+    pub call: Result<Option<CallNow>, ErrorLockHeld>,
+}
+
+/// What a scan of the in-flight table found.
+#[derive(Clone, Debug)]
+pub struct ScanPending {
+    /// Kernel requests being answered.
+    pub count: usize,
+    /// The ones the scan selected, oldest first.
+    pub found: Vec<Pending>,
 }
 
 struct KnownXattrs {
@@ -77,15 +117,17 @@ pub struct Backend {
     runtime: tokio::runtime::Handle,
 }
 
-/// What identifies a kernel request in the trace line.
-struct KeyPerf {
-    op: &'static str,
-    unique: u64,
-    pid: u32,
-    ino: u64,
-    fh: Option<u64>,
-    offset: Option<u64>,
-    size: Option<u64>,
+/// What identifies a kernel request in the trace line and the stall watchdog's.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyPerf {
+    pub op: &'static str,
+    pub unique: u64,
+    /// The thread blocked in the request, as the FUSE header gives it: 0 for one outside the mounter's pid namespace.
+    pub pid: u32,
+    pub ino: u64,
+    pub fh: Option<u64>,
+    pub offset: Option<u64>,
+    pub size: Option<u64>,
 }
 
 impl KeyPerf {
@@ -102,21 +144,34 @@ impl KeyPerf {
     }
 }
 
-/// A kernel request being answered: the task's handle on it, and the thread blocked in it, which an interrupt for it is judged by (the FUSE header's pid is the kernel's task pid, a thread id).
+/// A kernel request being answered: the task's handle on it; what it is, including the thread blocked in it, which an interrupt for it is judged by (the FUSE header's pid is the kernel's task pid, a thread id); when it arrived; and the age at which the watchdog last reported it (zero if never).
 struct Answering {
     request: Arc<RequestKernel>,
-    tid: u32,
+    key: KeyPerf,
+    arrived: Instant,
+    reported: Duration,
 }
 
 /// Takes a request out of the in-flight table when the task answering it ends, however it ends.
 struct Registered {
     shared: Arc<Shared>,
     unique: u64,
+    done: bool,
+}
+
+impl Registered {
+    /// Take the request out of the table; it says whether the watchdog had reported it as stalled.
+    fn finish(mut self) -> Option<Answering> {
+        self.done = true;
+        self.shared.inflight.lock().remove(&self.unique)
+    }
 }
 
 impl Drop for Registered {
     fn drop(&mut self) {
-        self.shared.inflight.lock().remove(&self.unique);
+        if !self.done {
+            self.shared.inflight.lock().remove(&self.unique);
+        }
     }
 }
 
@@ -135,6 +190,11 @@ impl Backend {
             reported: Mutex::new(HashMap::new()),
             invalidations: Mutex::new(None),
             inflight: Mutex::new(HashMap::new()),
+            progress: Progress::default(),
+            ended: Ended::default(),
+            session_tid: AtomicI32::new(0),
+            unmounting: AtomicBool::new(false),
+            notifier_busy: Mutex::new(None),
             judge: signals::Judge::for_this_process(),
             entry_ttl,
             attr_ttl,
@@ -150,26 +210,49 @@ impl Backend {
 
     /// Answer one kernel request from a task, counting it as in flight until it is answered and recording what it took. The task's end is the moment the kernel has its answer: fuser replies with a synchronous `writev` to `/dev/fuse`, and every handler replies last.
     fn spawn<F: std::future::Future<Output = Outcome> + Send + 'static>(&self, key: KeyPerf, f: F) {
+        // This runs on the session thread; fuser makes `init` on the mounting thread instead, so the first request is where the session thread can be named.
+        if self.shared.session_tid.load(Ordering::Relaxed) == 0 {
+            self.shared
+                .session_tid
+                .store(nix::unistd::gettid().as_raw(), Ordering::Relaxed);
+        }
         let perf = self.shared.client.perf().clone();
         let started = Instant::now();
         let request = RequestKernel::new(key.unique);
         let registered = Registered {
             shared: self.shared.clone(),
             unique: key.unique,
+            done: false,
         };
         self.shared.inflight.lock().insert(
             key.unique,
             Answering {
                 request: request.clone(),
-                tid: key.pid,
+                key,
+                arrived: started,
+                reported: Duration::ZERO,
             },
         );
+        let shared = self.shared.clone();
         self.runtime.spawn(async move {
             let inflight = perf.start();
             let outcome = request.scope(f).await;
-            drop(registered);
+            let answered = registered.finish();
             let total = started.elapsed();
+            shared.progress.record();
             perf.record_fuse(key.op, &outcome, total);
+            if answered.is_some_and(|a| !a.reported.is_zero()) {
+                shared.ended.push(|| {
+                    format!(
+                        "fuse {} ino {} (unique {}) answered after {}, errno {}",
+                        key.op,
+                        key.ino,
+                        key.unique,
+                        jackalopefs_perf::fmt_duration(total),
+                        outcome.errno
+                    )
+                });
+            }
             if tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE) {
                 tracing::trace!(
                     target: TRACE_TARGET,
@@ -367,6 +450,42 @@ fn name_of(os: &OsStr) -> Result<Name, Errno> {
 }
 
 impl Shared {
+    /// Whether `/proc` is this process's pid namespace's, so the thread ids the kernel sends and this process's own name threads there.
+    pub fn proc_ours(&self) -> bool {
+        self.judge.proc_ours()
+    }
+
+    /// The kernel requests being answered that `mode` selects, oldest first. The table's lock is waited for at most [`LOCK_PATIENCE`] and held only to copy entries out; each call's lock is then taken alone, never inside it. `Err` when the table's lock was held longer than that, which in a hang is itself the finding.
+    pub fn scan_pending(&self, now: Instant, mode: ModeScan) -> Result<ScanPending, ErrorLockHeld> {
+        let (count, selected) = {
+            let mut inflight = self
+                .inflight
+                .try_lock_for(LOCK_PATIENCE)
+                .ok_or(ErrorLockHeld)?;
+            let count = inflight.len();
+            let selected: Vec<(KeyPerf, Duration, Arc<RequestKernel>)> = inflight
+                .values_mut()
+                .filter_map(|a| {
+                    let age = now.saturating_duration_since(a.arrived);
+                    mode.selects(age, &mut a.reported)
+                        .then(|| (a.key, age, a.request.clone()))
+                })
+                .collect();
+            (count, selected)
+        };
+        let mut found: Vec<Pending> = selected
+            .into_iter()
+            .map(|(key, age, request)| Pending {
+                key,
+                age,
+                started: request.started(),
+                call: request.call_now(LOCK_PATIENCE),
+            })
+            .collect();
+        found.sort_by_key(|i| std::cmp::Reverse(i.age));
+        Ok(ScanPending { count, found })
+    }
+
     fn path_of(&self, ino: u64) -> Result<Path, Errno> {
         self.nodes.lock().path_of(ino).ok_or(Errno::ESTALE)
     }
@@ -758,7 +877,7 @@ impl Filesystem for Backend {
             .inflight
             .lock()
             .get(&unique.0)
-            .map(|a| (a.request.clone(), a.tid))
+            .map(|a| (a.request.clone(), a.key.pid))
         else {
             tracing::trace!(
                 unique = unique.0,

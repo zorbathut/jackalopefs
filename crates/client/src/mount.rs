@@ -1,20 +1,24 @@
 //! Mount lifecycle: FUSE session, invalidator, and client, started and torn down together.
 
 use crate::client::Client;
-use crate::fuse::{Backend, Shared};
+use crate::fuse::{Backend, ScanPending, Shared};
 use crate::invalidate::Invalidator;
 use crate::perf::{Perf, TRACE_TARGET};
+use crate::watchdog::{report_pending, WatchClient};
 use anyhow::Context;
 use fuser::{BackgroundSession, MountOption, SessionACL};
+use jackalopefs_perf::stall::{ErrorLockHeld, ModeScan, Watchdog, WATCH_PERIOD};
 use jackalopefs_perf::{
     line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, TrackerQuic,
 };
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Where the kernel publishes what it granted this mount. What `init` asked for is only a request: the readahead in particular is capped by the mount's backing-device setting, and the queue limits are whatever the kernel accepted.
-struct KernelLimits {
+#[derive(Clone)]
+pub(crate) struct KernelLimits {
     /// `/sys/fs/fuse/connections/<minor>`: `max_background`, `congestion_threshold`, and `waiting`, the requests queued for the daemon right now.
     connection: PathBuf,
     /// `/sys/class/bdi/0:<minor>`: `read_ahead_kb`, the ceiling on every read the kernel issues.
@@ -82,7 +86,7 @@ impl KernelLimits {
     }
 
     /// Requests the kernel has queued for the daemon at this moment.
-    fn waiting(&self) -> Option<u64> {
+    pub(crate) fn waiting(&self) -> Option<u64> {
         self.read(&self.connection, "waiting")
     }
 }
@@ -161,6 +165,7 @@ pub struct MountOptions {
 pub struct Mount {
     session: Option<BackgroundSession>,
     invalidator: Option<Invalidator>,
+    watchdog: Option<Watchdog>,
     shared: Arc<Shared>,
     limits: Option<KernelLimits>,
     meters: Meters,
@@ -245,9 +250,17 @@ impl Mount {
         if let Some(limits) = &limits {
             limits.log();
         }
+        let mut watch = WatchClient::new(
+            shared.clone(),
+            tokio::runtime::Handle::current(),
+            limits.clone(),
+        );
+        let watchdog = Watchdog::spawn("jfs-watchdog", WATCH_PERIOD, move || watch.tick())
+            .context("starting the stall watchdog")?;
         Ok(Mount {
             session: Some(session),
             invalidator: Some(invalidator),
+            watchdog: Some(watchdog),
             shared,
             limits,
             meters: Meters {
@@ -263,9 +276,21 @@ impl Mount {
         self.shared.client.perf()
     }
 
-    /// Log the per-op tables for the window since the last report, the kernel's queue depth, the host's physical ports and UDP drop counters, the connection's QUIC statistics with its window, and the verdict when a port is full, in that order so the verdict follows the lines it is drawn from.
+    /// The thread id of the FUSE session thread, once a request has reached it; 0 before.
+    pub fn session_thread(&self) -> i32 {
+        self.shared.session_tid.load(Ordering::Relaxed)
+    }
+
+    /// The kernel requests in flight at least [`jackalopefs_perf::stall::INFLIGHT_LISTED`], oldest first; `Err` if the table's lock was held past the watchdog's patience.
+    pub fn pending(&self) -> Result<ScanPending, ErrorLockHeld> {
+        self.shared
+            .scan_pending(std::time::Instant::now(), ModeScan::Listed)
+    }
+
+    /// Log the per-op tables for the window since the last report, the requests in flight at least a second, the kernel's queue depth, the host's physical ports and UDP drop counters, the connection's QUIC statistics with its window, and the verdict when a port is full, in that order so the verdict follows the lines it is drawn from.
     pub fn report(&mut self) {
         self.perf().report();
+        report_pending(&self.shared);
         if let Some(waiting) = self.limits.as_ref().and_then(KernelLimits::waiting) {
             tracing::info!(target: TRACE_TARGET, "perf kernel queue waiting={waiting}");
         }
@@ -307,6 +332,7 @@ impl Mount {
 
     /// Unmount, stop invalidating, and close the connection. The unmount writes back what the kernel has cached and waits for every pending request, so against a server that never answers it completes only once [`Aborter::abort`] has failed those requests.
     pub async fn unmount(mut self) -> anyhow::Result<()> {
+        self.shared.unmounting.store(true, Ordering::Relaxed);
         let outcome = match self.session.take() {
             Some(session) => {
                 match tokio::task::spawn_blocking(move || session.umount_and_join())
@@ -328,6 +354,12 @@ impl Mount {
                 .await
                 .context("invalidator shutdown")?;
         }
+        // Stopped only now, so a stall while unmounting is still reported.
+        if let Some(watchdog) = self.watchdog.take() {
+            tokio::task::spawn_blocking(move || watchdog.stop())
+                .await
+                .context("watchdog shutdown")?;
+        }
         // The session thread is joined, so no new kernel request can arrive; the sysfs entries left with the mount.
         self.limits = None;
         self.report();
@@ -338,6 +370,7 @@ impl Mount {
 
 impl Drop for Mount {
     fn drop(&mut self) {
+        self.shared.unmounting.store(true, Ordering::Relaxed);
         if self.session.is_some() {
             self.aborter().abort();
         }
@@ -348,6 +381,7 @@ impl Drop for Mount {
         }
         // Once the mount is gone the notifier can no longer block, so joining its thread is safe here.
         self.invalidator.take();
+        self.watchdog.take();
         self.shared.client.stop();
     }
 }
