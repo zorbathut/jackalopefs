@@ -7,9 +7,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+parking_lot = { workspace = true }
 quinn = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 tempfile = { workspace = true }

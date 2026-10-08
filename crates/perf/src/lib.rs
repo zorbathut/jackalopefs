@@ -1,6 +1,7 @@
 //! What the client's and the server's performance reports share: the number formatting, the QUIC statistics line with its per-window delta, meters for the host's physical ports and UDP socket drop counters, and the verdict that names a link that is full and mostly not ours. Each side logs the lines under its own target, so the functions here return text rather than logging it.
 
 pub mod logging;
+pub mod stall;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

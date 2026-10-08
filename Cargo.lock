@@ -612,8 +612,11 @@ dependencies = [
 name = "jackalopefs-perf"
 version = "0.1.0"
 dependencies = [
+ "libc",
+ "parking_lot",
  "quinn",
  "tempfile",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
