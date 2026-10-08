@@ -48,6 +48,8 @@ pub struct Attached {
     pub resumed: bool,
     /// Increments with every successful connection; callers that lost a reply wait for a strictly newer generation before retrying.
     pub generation: u64,
+    /// [`conn_key`](jackalopefs_perf::conn_key): what the server's lines call this connection.
+    pub conn_key: Option<u64>,
     pub root: KeyRoot,
     pub ids: IdMap,
 }
@@ -246,10 +248,12 @@ async fn run(
         candidates.rotate_left(winner);
         let (conn, resumed, root, ids) =
             (attached.conn, attached.resumed, attached.root, attached.ids);
+        let conn_key = jackalopefs_perf::conn_key(&conn);
         tracing::info!(
             session = attached.session_id,
             resumed,
             generation,
+            conn = conn_key,
             offline = (generation > 1)
                 .then(|| tracing::field::display(format!("{:.1?}", offline_since.elapsed()))),
             ids = ids.describe(),
@@ -298,6 +302,7 @@ async fn run(
             session_id: attached.session_id,
             resumed,
             generation,
+            conn_key,
             root,
             ids,
         });

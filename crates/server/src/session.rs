@@ -379,7 +379,8 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
             return;
         }
     };
-    tracing::info!(%remote, session = session.id, resumed, "session attached");
+    let conn_key = jackalopefs_perf::conn_key(&conn);
+    tracing::info!(%remote, session = session.id, conn = conn_key, resumed, "session attached");
     let tracker = Arc::new(Mutex::new(TrackerQuic::default()));
     {
         let mut connections = server.connections.lock();
@@ -414,6 +415,7 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         export: server.export.clone(),
         handles: session.handles.clone(),
         session_id: session.id,
+        conn: conn_key,
         changes: server.changes.clone(),
         watches: server.watches.clone(),
         ids: server.ids,
@@ -631,9 +633,10 @@ async fn handle_request(
 ) {
     let accepted = Instant::now();
     let stream = u64::from(recv.id());
-    let inflight = Arc::new(perf.start(ops.session_id, stream));
+    let inflight = Arc::new(perf.start(ops.session_id, ops.conn, stream));
     let ids = IdsEvent {
         session: Some(ops.session_id),
+        conn: ops.conn,
         stream: Some(stream),
         ..IdsEvent::default()
     };
@@ -774,6 +777,9 @@ async fn handle_request(
     if tracing::enabled!(target: TRACE_TARGET, tracing::Level::TRACE) {
         tracing::trace!(
             target: TRACE_TARGET,
+            session = ids.session,
+            conn = ids.conn,
+            stream,
             op,
             fh,
             offset,

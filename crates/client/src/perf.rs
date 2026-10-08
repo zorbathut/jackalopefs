@@ -158,6 +158,11 @@ impl std::ops::AddAssign for Phases {
 pub struct AccountCall {
     pub phases: Phases,
     pub retries: u32,
+    /// Where the last attempt went, which joins the call's line to the server's.
+    pub session: Option<u64>,
+    pub generation: Option<u64>,
+    pub conn: Option<u64>,
+    pub stream: Option<u64>,
 }
 
 /// One op at the call level. Phase sums cover only calls that were not resent, so a few reconnects cannot dominate the means; `phased` is how many calls they cover.
@@ -410,6 +415,7 @@ mod tests {
                 reply: ms(4),
             },
             retries: 0,
+            ..AccountCall::default()
         };
         let retried = AccountCall {
             phases: Phases {
@@ -419,6 +425,7 @@ mod tests {
                 reply: ms(4),
             },
             retries: 1,
+            ..AccountCall::default()
         };
         perf.record_call("read", &Outcome::bytes(10), ms(10), &clean);
         perf.record_call("read", &Outcome::bytes(10), ms(10), &clean);

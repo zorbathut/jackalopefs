@@ -47,6 +47,18 @@ pub fn fmt_bytes(n: u64) -> String {
     }
 }
 
+/// The connection's key: 8 bytes of its TLS keying material, the same on both sides and different for every connection, so a client's line and the server's line about one request can be joined on `(conn, stream)` across reconnects and server restarts.
+pub fn conn_key(conn: &quinn::Connection) -> Option<u64> {
+    let mut key = [0u8; 8];
+    match conn.export_keying_material(&mut key, b"jackalopefs conn id", b"") {
+        Ok(()) => Some(u64::from_le_bytes(key)),
+        Err(e) => {
+            tracing::warn!("the connection has no keying material to name it by ({e:?}); its lines carry no connection key");
+            None
+        }
+    }
+}
+
 fn fmt_rate(bytes_per_second: f64) -> String {
     format!("{}/s", fmt_bytes(bytes_per_second as u64))
 }

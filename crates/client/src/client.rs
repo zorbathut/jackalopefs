@@ -108,6 +108,8 @@ pub struct CallNow {
     pub since: std::time::Instant,
     /// The connection the phase is on, once there is one.
     pub generation: Option<u64>,
+    /// That connection's key, which the server's lines name it by.
+    pub conn: Option<u64>,
     /// The QUIC stream carrying the request, which the server's stall lines name too.
     pub stream: Option<u64>,
     pub retries: u32,
@@ -153,17 +155,21 @@ impl RequestKernel {
             phase: PhaseCall::Wait,
             since: std::time::Instant::now(),
             generation: None,
+            conn: None,
             stream: None,
             retries: 0,
         });
     }
 
-    /// The call enters `phase`. A `generation` names the connection the phase starts on and is kept until a resend clears it; the `stream` is the phase's own, absent before one is open.
-    fn call_phase(&self, phase: PhaseCall, generation: Option<u64>, stream: Option<u64>) {
+    /// The call enters `phase`. An `attached` names the connection the phase starts on, by generation and key, and is kept until a resend clears it; the `stream` is the phase's own, absent before one is open.
+    fn call_phase(&self, phase: PhaseCall, attached: Option<&Attached>, stream: Option<u64>) {
         if let Some(call) = self.call.lock().as_mut() {
             call.phase = phase;
             call.since = std::time::Instant::now();
-            call.generation = generation.or(call.generation);
+            if let Some(attached) = attached {
+                call.generation = Some(attached.generation);
+                call.conn = attached.conn_key;
+            }
             call.stream = stream;
         }
     }
@@ -172,6 +178,7 @@ impl RequestKernel {
         if let Some(call) = self.call.lock().as_mut() {
             call.retries = retries;
             call.generation = None;
+            call.conn = None;
         }
     }
 
@@ -404,10 +411,10 @@ fn codec_error(e: ErrorCodec, on_io: fn(String) -> ErrorExchange) -> ErrorExchan
 fn call_ids(req: &Request, attached: &Attached, timing: &Timing<'_>) -> IdsEvent {
     IdsEvent {
         session: Some(attached.session_id),
+        conn: attached.conn_key,
         stream: timing.stream,
         unique: timing.kernel.map(|kernel| kernel.unique),
         op: Some(req.op_name()),
-        ..IdsEvent::default()
     }
 }
 
@@ -504,6 +511,10 @@ impl Caller {
             tracing::trace!(
                 target: TRACE_TARGET,
                 unique = kernel.as_ref().map(|r| r.unique),
+                session = account.session,
+                generation = account.generation,
+                conn = account.conn,
+                stream = account.stream,
                 op,
                 fh,
                 offset,
@@ -553,7 +564,7 @@ impl Caller {
             let mapped = attached.ids.outgoing(req)?;
             let sent = mapped.as_ref().unwrap_or(req);
             if let Some(kernel) = kernel {
-                kernel.call_phase(PhaseCall::Open, Some(attached.generation), None);
+                kernel.call_phase(PhaseCall::Open, Some(&attached), None);
             }
             let mut timing = Timing::for_kernel(kernel);
             let attempt = Instant::now();
@@ -572,6 +583,10 @@ impl Caller {
             )
             .await;
             account.phases += timing.phases(attempt);
+            account.session = Some(attached.session_id);
+            account.generation = Some(attached.generation);
+            account.conn = attached.conn_key;
+            account.stream = timing.stream;
             match exchanged {
                 Ok(Ok(Response::Err(errno))) => return Err(Error::Remote(errno)),
                 Ok(Ok(resp)) => return Ok(resp),

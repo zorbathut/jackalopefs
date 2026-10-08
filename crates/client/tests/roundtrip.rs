@@ -56,6 +56,34 @@ async fn hello_token_and_fingerprint() {
     server.stop().await;
 }
 
+/// Both ends name a connection by the same key, and no two connections share one, so a client's line and the server's about one request join on (connection, stream).
+#[tokio::test]
+async fn both_ends_name_a_connection_by_the_same_key() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let key_of = |client: &jackalopefs_client::Client| match &*client.state().borrow() {
+        ConnState::Connected(attached) => attached.conn_key.expect("a key"),
+        other => panic!("{other:?}"),
+    };
+    let first = server.client().await;
+    let second = server.client().await;
+    let server_keys: std::collections::HashSet<u64> = server
+        .server
+        .connections
+        .lock()
+        .values()
+        .map(|entry| jackalopefs_perf::conn_key(&entry.conn).expect("a key"))
+        .collect();
+    assert_eq!(
+        server_keys,
+        std::collections::HashSet::from([key_of(&first), key_of(&second)])
+    );
+    assert_ne!(key_of(&first), key_of(&second));
+    first.shutdown().await;
+    second.shutdown().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn file_lifecycle() {
     let export = tempfile::tempdir().unwrap();
@@ -1716,7 +1744,10 @@ async fn a_lost_reply_is_an_event_naming_its_call() {
     };
     assert_eq!(name, "call_lost_retried");
     assert_eq!(ids.op, Some("getattr"));
-    assert!(ids.session.is_some() && ids.stream.is_some(), "{ids:?}");
+    assert!(
+        ids.session.is_some() && ids.conn.is_some() && ids.stream.is_some(),
+        "{ids:?}"
+    );
     assert!(!detail.is_empty());
     pending.await.unwrap().unwrap_err();
     client.shutdown().await;

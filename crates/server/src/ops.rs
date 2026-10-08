@@ -55,6 +55,8 @@ pub struct Ops {
     pub export: Arc<Export>,
     pub handles: Arc<Handles>,
     pub session_id: u64,
+    /// The connection's key ([`jackalopefs_perf::conn_key`]), for the lines about its requests.
+    pub conn: Option<u64>,
     pub changes: Arc<ChangeLog>,
     /// What a handle holds watched while it is open.
     pub watches: Arc<Watches>,
@@ -724,6 +726,7 @@ mod tests {
                 export,
                 handles: Arc::new(Handles::new(crate::handles::MAX_HANDLES)),
                 session_id: 1,
+                conn: None,
                 changes: Arc::new(ChangeLog::default()),
                 watches: Watches::disabled(),
                 ids: IdMap::of_process(ModeIds::Direct).unwrap(),

@@ -215,6 +215,8 @@ impl PhaseServer {
 #[derive(Clone, Debug)]
 pub struct Pending {
     pub session: u64,
+    /// The connection's key ([`jackalopefs_perf::conn_key`]), which the client's lines name too.
+    pub conn: Option<u64>,
     /// The QUIC stream it came on, which the client's stall lines name too.
     pub stream: u64,
     pub accepted: Instant,
@@ -234,12 +236,15 @@ pub struct Pending {
 impl Pending {
     /// Session, stream, operation and the files it names, for a log line.
     pub fn what(&self) -> String {
-        let mut what = format!(
-            "session {} stream {} {}",
-            self.session,
+        let mut what = format!("session {}", self.session);
+        if let Some(conn) = self.conn {
+            what.push_str(&format!(" connection {conn}"));
+        }
+        what.push_str(&format!(
+            " stream {} {}",
             self.stream,
             self.op.unwrap_or(UNDECODED)
-        );
+        ));
         if let Some(subject) = &self.subject {
             what.push(' ');
             what.push_str(subject);
@@ -371,10 +376,11 @@ impl Drop for InFlight {
 
 impl Perf {
     /// Start counting a request that arrived on `stream` of `session`; the guard ends it.
-    pub fn start(self: &Arc<Perf>, session: u64, stream: u64) -> InFlight {
+    pub fn start(self: &Arc<Perf>, session: u64, conn: Option<u64>, stream: u64) -> InFlight {
         let now = Instant::now();
         let active = Arc::new(Mutex::new(Pending {
             session,
+            conn,
             stream,
             accepted: now,
             op: None,
@@ -550,9 +556,9 @@ mod tests {
     #[test]
     fn gauge_survives_a_report_and_peak_restarts_from_it() {
         let perf = Arc::new(Perf::default());
-        let a = perf.start(1, 0);
-        let b = perf.start(1, 4);
-        drop(perf.start(1, 8));
+        let a = perf.start(1, None, 0);
+        let b = perf.start(1, None, 4);
+        drop(perf.start(1, None, 8));
         assert_eq!(perf.inflight(), 2);
         let snap = perf.report();
         assert_eq!((snap.inflight, snap.peak), (2, 3));
@@ -566,8 +572,8 @@ mod tests {
     #[test]
     fn requests_are_listed_with_their_phase_and_reported_on_schedule() {
         let perf = Arc::new(Perf::default());
-        let read = perf.start(3, 0);
-        let op = perf.start(3, 4);
+        let read = perf.start(3, None, 0);
+        let op = perf.start(3, None, 4);
         op.decoded("rename", "/a -> /b".into());
         op.running(1234);
         let start = Instant::now();

@@ -319,6 +319,9 @@ fn describe_call(call: &CallNow) -> String {
     if let Some(generation) = call.generation {
         line.push_str(&format!(", generation {generation}"));
     }
+    if let Some(conn) = call.conn {
+        line.push_str(&format!(", connection {conn}"));
+    }
     if let Some(stream) = call.stream {
         line.push_str(&format!(", stream {stream}"));
     }
@@ -362,6 +365,7 @@ mod tests {
             phase,
             since: Instant::now(),
             generation: Some(1),
+            conn: Some(77),
             stream: Some(4),
             retries: 0,
         }
