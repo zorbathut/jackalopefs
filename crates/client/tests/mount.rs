@@ -305,7 +305,7 @@ fn process_umask() -> u32 {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn posix_basics_through_the_mount() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -456,7 +456,7 @@ async fn posix_basics_through_the_mount() {
     m.finish().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn large_directory_pages_through_the_kernel_correctly() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -503,7 +503,7 @@ async fn large_directory_pages_through_the_kernel_correctly() {
 }
 
 /// A readdirplus page hands the kernel attributes to cache, so it is not served from a buffer fetched longer ago than the attribute TTL; a plain page, whose numbers do not depend on attributes, still is.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_old_buffer_serves_plain_pages_but_not_readdirplus() {
     // No events: the files made below would reach the client during the wait, and each clears the end the fetch reported.
     let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(1)).await
@@ -539,7 +539,7 @@ async fn an_old_buffer_serves_plain_pages_but_not_readdirplus() {
     m.finish().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_listing_longer_than_one_kernel_page_is_fetched_once() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -584,7 +584,7 @@ async fn a_listing_longer_than_one_kernel_page_is_fetched_once() {
     m.finish().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_complete_listing_does_not_read_past_its_end() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -640,7 +640,7 @@ async fn a_complete_listing_does_not_read_past_its_end() {
 }
 
 /// The recorded end is per handle and only short-circuits a read at that exact cookie; `rewinddir` starts at offset 0, which always goes to the server, so a directory that grew is re-read in full.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn rewinding_a_directory_handle_sees_entries_added_after_its_end() {
     let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(60)).await
     else {
@@ -671,7 +671,7 @@ async fn rewinding_a_directory_handle_sees_entries_added_after_its_end() {
 }
 
 /// A handle left at its end after a full listing reads there again, as a directory poller does. Whether a name added afterwards shows up there is the export filesystem's decision (a hashed or newest-first order puts it before the cursor), so the mount is held to what a handle on the export itself yields; what this client owes is to ask the server again once a name was added, by this client or in a server event, instead of answering from the end it recorded.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_handle_parked_at_the_end_reads_like_one_on_the_export() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(60)).await else {
         return;
@@ -737,7 +737,7 @@ fn read_until_the_server_is_asked(
 }
 
 /// An overflow means the client cannot know what changed, so a handle parked at a listing's end must ask the server again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_handle_parked_at_the_end_asks_again_after_an_overflow() {
     let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(60)).await
     else {
@@ -764,7 +764,7 @@ async fn a_handle_parked_at_the_end_asks_again_after_an_overflow() {
 }
 
 /// A directory the server stops watching takes with it what the kernel cached beneath it: entries and attributes, the pages of a file held open there, and the end a parked handle recorded. The server here sends no events of its own, so only the notice can have done it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_unwatched_notice_drops_what_the_kernel_cached_under_the_directory() {
     let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(60)).await
     else {
@@ -833,7 +833,7 @@ async fn an_unwatched_notice_drops_what_the_kernel_cached_under_the_directory() 
 }
 
 /// A server that may watch only two directories drops the others as the mount uses more, and tells the client, so whatever changes on the export is seen through the mount within a few seconds despite a minute's TTL, whether its directory is still watched or was dropped; and a directory used again is watched again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn directories_beyond_the_watch_budget_are_dropped_with_notice() {
     let Some(m) =
         Mounted::start_full(Duration::from_secs(10), Duration::from_secs(60), Some(2)).await
@@ -885,7 +885,7 @@ async fn directories_beyond_the_watch_budget_are_dropped_with_notice() {
 }
 
 /// The kernel trusts what it caches for a file held open, so the server keeps that file's directory watched however many others the mount uses: it is never dropped while the file is open, and every change to the file is pushed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_open_files_directory_stays_watched_beyond_the_budget() {
     let Some(m) =
         Mounted::start_full(Duration::from_secs(10), Duration::from_secs(60), Some(1)).await
@@ -940,7 +940,7 @@ async fn an_open_files_directory_stays_watched_beyond_the_budget() {
     m.finish().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_failing_test_body_still_leaves_no_mount_behind() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -962,7 +962,7 @@ async fn a_failing_test_body_still_leaves_no_mount_behind() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn server_side_changes_become_visible_despite_long_ttls() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(60)).await else {
         return;
@@ -1009,7 +1009,7 @@ async fn server_side_changes_become_visible_despite_long_ttls() {
     m.finish().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn server_vanishing_times_out_and_unmounts_cleanly() {
     let Some(mut m) = Mounted::start(Duration::from_millis(500), Duration::from_secs(1)).await
     else {
@@ -1032,7 +1032,7 @@ async fn server_vanishing_times_out_and_unmounts_cleanly() {
     m.finish().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn perf_tables_see_the_kernel_requests() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1067,7 +1067,7 @@ async fn perf_tables_see_the_kernel_requests() {
     m.finish().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_ioctl_is_refused_and_counted() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1155,7 +1155,7 @@ fn xattr_set(path: &Path, name: &str, value: &[u8]) -> Result<(), i32> {
 }
 
 /// The perf tables are the oracle: the `fuse` table counts what the kernel asked, the `call` table what went to the server.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn absent_xattrs_are_answered_from_the_listing() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(60)).await else {
         return;
@@ -1260,7 +1260,7 @@ async fn absent_xattrs_are_answered_from_the_listing() {
 }
 
 /// The kernel caches writes: many small `write(2)` calls reach the server as few large requests, and the file is complete once closed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn writes_are_merged_by_the_kernel_before_they_reach_the_server() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1299,7 +1299,7 @@ async fn writes_are_merged_by_the_kernel_before_they_reach_the_server() {
 }
 
 /// The kernel copies through the mount by itself when the daemon refuses, and the result looks the same, so the request count is what shows the server did the work.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn copy_file_range_moves_no_data_through_the_mount() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1353,7 +1353,7 @@ async fn copy_file_range_moves_no_data_through_the_mount() {
 }
 
 /// Refused, `posix_fallocate` succeeds all the same, by writing into every block, so the request count is what shows the server did the work.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn fallocate_reaches_the_server_and_moves_no_data() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1426,7 +1426,7 @@ fn seek(file: &fs::File, offset: i64, whence: i32) -> Result<i64, i32> {
 }
 
 /// Refused, the kernel answers by itself that the whole file is data, so the request count is what shows the server was asked.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn seeking_data_and_holes_asks_the_server_unless_this_client_is_writing() {
     use std::os::unix::fs::FileExt;
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
@@ -1489,7 +1489,7 @@ async fn seeking_data_and_holes_asks_the_server_unless_this_client_is_writing() 
 }
 
 /// A file with two names, opened through one of them; that name is then removed through the mount and the other looked up. It is one file throughout, so the descriptor must go on working: the client used to take the lookup for a new file with a recycled inode number, and the kernel then declared the open inode bad.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_descriptor_survives_its_name_when_the_file_has_another() {
     use std::os::unix::fs::MetadataExt;
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
@@ -1524,7 +1524,7 @@ async fn a_descriptor_survives_its_name_when_the_file_has_another() {
 }
 
 /// The client addresses a node by the last name it was reached through. When someone else replaces that name with another file, the node is still the file it was, reachable by its other name, and must not take on the other file's attributes. Two ways there: with the replaced name's directory still held, the client asks by the stale name, is told about another file, and has to notice; with nothing holding it, the kernel forgets the directory and the client has to pass over a name it can no longer spell.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_node_whose_newest_name_was_replaced_is_reached_by_its_other_name() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     for directory_held in [true, false] {
@@ -1577,7 +1577,7 @@ async fn a_node_whose_newest_name_was_replaced_is_reached_by_its_other_name() {
 }
 
 /// Replaced on the export while open here, a file stays what it was for the descriptor, and its name leads to the new file, which is another node.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_file_replaced_on_the_export_is_another_file_by_name_and_the_same_by_descriptor() {
     use std::os::unix::fs::MetadataExt;
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
@@ -1713,7 +1713,7 @@ fn script_foreign_files(files: usize) -> impl Fn(&Request) -> Response + Send + 
 }
 
 /// The reported case: a large directory of files in another subvolume. Its first page comes as readdirplus and the rest as plain pages, since nothing stats in between, and every file must be listed under the number `stat` then reports, its substitute, not the inode number it has in its subvolume.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_plain_page_lists_a_file_in_another_subvolume_as_stat_reports_it() {
     if !fuse_available() {
         return;
@@ -1771,7 +1771,7 @@ async fn a_plain_page_lists_a_file_in_another_subvolume_as_stat_reports_it() {
 }
 
 /// What a directory listing says an entry's inode number is must be what `stat` says, for `.` and `..` too.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn listings_and_stat_agree_on_inode_numbers() {
     use std::os::unix::fs::{DirEntryExt, MetadataExt};
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
@@ -1825,7 +1825,7 @@ fn syncfs(dir: &fs::File) -> Result<(), i32> {
 }
 
 /// The kernel keeps a written file's times itself and flushes them, with a setattr that names no handle, from inside the `unlink(2)` or `rename(2)` that takes the file's name away. A failure there is recorded against the whole mount and reported by the next `syncfs`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn removing_a_written_file_leaves_no_error_for_syncfs() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1860,7 +1860,7 @@ async fn removing_a_written_file_leaves_no_error_for_syncfs() {
 }
 
 /// An `O_PATH` descriptor reaches a file without the daemon ever having a handle for it, so with its name gone the daemon cannot address it; only the kernel's own flush is answered then, and anything else still fails.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_unlinked_file_with_no_handle_takes_nothing_but_the_time_flush() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1906,7 +1906,7 @@ async fn an_unlinked_file_with_no_handle_takes_nothing_but_the_time_flush() {
 }
 
 /// A file with no name left but a descriptor open is still there, and setting its times must reach the server.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn times_set_on_an_unlinked_open_file_reach_the_server() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1944,7 +1944,7 @@ async fn times_set_on_an_unlinked_open_file_reach_the_server() {
 }
 
 /// With the kernel positioning appends and the server's descriptor not appending on its own, re-flushed pages land where they belong.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn appends_through_the_mount_land_once_and_in_order() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -1981,7 +1981,7 @@ async fn appends_through_the_mount_land_once_and_in_order() {
 }
 
 /// The kernel reads the rest of a partially rewritten page through the handle it has, so a write-only open must be readable on the server.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_write_only_handle_can_rewrite_part_of_a_page() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -2006,7 +2006,7 @@ async fn a_write_only_handle_can_rewrite_part_of_a_page() {
 }
 
 /// A write lands in the kernel's cache and returns; it is the flush that learns the server is gone, here through `fsync(2)`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_write_after_the_server_vanished_fails_at_the_fsync() {
     let Some(mut m) = Mounted::start(Duration::from_millis(500), Duration::from_secs(60)).await
     else {
@@ -2030,7 +2030,7 @@ async fn a_write_after_the_server_vanished_fails_at_the_fsync() {
 }
 
 /// The same failure reaches a program that never syncs: `close(2)` writes the cached data back first and reports the loss as `EIO`.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_write_after_the_server_vanished_fails_at_the_close() {
     let Some(mut m) = Mounted::start(Duration::from_millis(500), Duration::from_secs(60)).await
     else {
@@ -2062,7 +2062,7 @@ async fn a_write_after_the_server_vanished_fails_at_the_close() {
 }
 
 /// After the last close of a file written through the mount, the mount shows the server's size and mtime. The kernel does not always push its own mtime at close (a write in the same clock tick as the file's creation leaves the inode clean), so a fresh file written at once is the case that exposes it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_written_file_shows_the_servers_attributes_after_its_last_close() {
     let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(10)).await
     else {
@@ -2098,7 +2098,7 @@ async fn a_written_file_shows_the_servers_attributes_after_its_last_close() {
 }
 
 /// Without any event, a file grown on the export is seen through the mount within the attribute TTL plus one access: the refresh notices the size the kernel would otherwise keep, and the file is taken away from the kernel by name. The probe is a `stat`, which refreshes attributes without opening the file.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_external_size_change_is_seen_within_the_attribute_ttl_without_events() {
     let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(1)).await
     else {
@@ -2139,7 +2139,7 @@ fn interrupted_calls(mount: &Mount) -> u64 {
 }
 
 /// A process blocked in a call while the server is away can be interrupted: the call fails with `EINTR` and the pending signal ends the process. Twice, because a wrong answer to the first interrupt can make the kernel stop sending them for the life of the mount.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_signal_interrupts_a_call_waiting_for_the_server() {
     let Some(mut m) = Mounted::start(Duration::from_secs(60), Duration::from_secs(1)).await else {
         return;
@@ -2160,7 +2160,7 @@ async fn a_signal_interrupts_a_call_waiting_for_the_server() {
 }
 
 /// The reported case: the connection is fine and the server simply does not answer. The call has no deadline, and a signal is what ends the wait.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_signal_interrupts_a_call_blocked_on_a_live_connection() {
     let Some(m) = Mounted::start_stalled().await else {
         return;
@@ -2209,7 +2209,7 @@ fn handle_sigusr2() {
 }
 
 /// Only a pending signal interrupts a call. io_uring hands a completion to the thread that submitted it as task work, which the kernel counts as a pending signal and answers with `FUSE_INTERRUPT`; the call the thread is blocked in must go on. A real signal that comes later still ends it, although the kernel sends no second interrupt.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_io_uring_completion_does_not_interrupt_a_call_but_a_signal_still_does() {
     let Some(m) = Mounted::start_stalled().await else {
         return;
@@ -2301,7 +2301,7 @@ async fn an_io_uring_completion_does_not_interrupt_a_call_but_a_signal_still_doe
 }
 
 /// io_uring stops its own worker threads (a cancellation, a linked timeout, the ring's teardown) with the same notification that is no signal elsewhere, and there it does mean stop: an open the server never answers, linked to a timeout, is cancelled instead of waiting for ever.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_io_uring_timeout_still_cancels_its_worker() {
     let Some(m) = Mounted::start_stalled().await else {
         return;
@@ -2361,7 +2361,7 @@ async fn an_io_uring_timeout_still_cancels_its_worker() {
 }
 
 /// A mount unmounted from outside says so, so the client can end instead of serving nothing, and its own unmount afterwards still succeeds.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_unmount_from_outside_ends_the_mount() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
         return;
@@ -2394,7 +2394,7 @@ async fn an_unmount_from_outside_ends_the_mount() {
 }
 
 /// Aborting the mount's FUSE connection fails every pending request and lets an unmount complete however stuck the server is.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn an_abort_fails_pending_requests_and_frees_the_unmount() {
     let Some(m) = Mounted::start_stalled().await else {
         return;
@@ -2429,7 +2429,7 @@ async fn an_abort_fails_pending_requests_and_frees_the_unmount() {
 }
 
 /// A request the server never answers is in the in-flight table with the call it is making, under the process blocked in it, and leaves the table once a signal ends it. Aborting the connection would not: that fails the request in the kernel, while the call goes on waiting for the server.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_stalled_request_is_listed_in_flight_with_its_call() {
     let Some(m) = Mounted::start_stalled().await else {
         return;

@@ -397,6 +397,24 @@ fn close_all(endpoints: &[Endpoint], reason: &[u8]) {
     }
 }
 
+/// A client endpoint on `wildcard`, as `Endpoint::client` makes one, with its receive buffer sized for the bursts a lone worker leaves waiting.
+fn client_endpoint(wildcard: SocketAddr) -> std::io::Result<Endpoint> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(wildcard),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.bind(&wildcard.into())?;
+    let socket = std::net::UdpSocket::from(socket);
+    jackalopefs_perf::udp_receive_buffer(&socket);
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        None,
+        socket,
+        Arc::new(quinn::TokioRuntime),
+    )
+}
+
 /// A socket for each address family the candidates need, and every candidate paired with the socket that can reach it. Two sockets rather than one dual-stack socket, because whether an IPv6 socket also reaches IPv4 peers is the host's decision (`bindv6only`, a sandboxed setsockopt) and quinn reports losing that argument only at debug level; a family that cannot be bound at all then costs its own candidates rather than every candidate.
 fn bind_candidates(
     addrs: &[SocketAddr],
@@ -407,7 +425,7 @@ fn bind_candidates(
         if !wanted {
             return None;
         }
-        match Endpoint::client(wildcard) {
+        match client_endpoint(wildcard) {
             Ok(mut endpoint) => {
                 endpoint.set_default_client_config(config.clone());
                 Some(endpoint)

@@ -597,6 +597,37 @@ pub fn line_udp(sample: &SampleUdp) -> String {
     )
 }
 
+/// The process's main runtime: one worker, unless `TOKIO_WORKER_THREADS` names a number. A connection's streams all lock quinn's state for that connection to move their data, so more workers serving one connection only contend for that lock and wake each other to steal work: measured on loopback, one worker cuts each request's CPU by about a third on the server and nearly half on the client, for higher throughput, and the filesystem work still runs on the blocking pool beside it. One worker serves every connection, though; the variable is the way past one core of networking until connections get runtimes of their own (`docs/design.md`, "Known limitations").
+pub fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        builder.worker_threads(1);
+    }
+    builder.enable_all().build()
+}
+
+/// What a UDP socket asks the kernel to buffer of what arrives before the runtime reads it. One worker reads the socket only between the tasks it runs, so a burst (a client's writeback, a run of readahead replies) waits there, and the kernel's default of about 200 KiB overflows: measured on loopback with one worker, the sockets dropped about a thousand datagrams a run, packet loss and congestion events roughly doubled and the sender's window fell from about 2 MiB to 200 KiB; with 4 MiB they drop next to none.
+pub const UDP_RECEIVE_BUFFER: usize = 4 << 20;
+
+/// Ask for [`UDP_RECEIVE_BUFFER`] on `socket`, and say so when the kernel grants less: it caps the request at `net.core.rmem_max` without failing it.
+pub fn udp_receive_buffer(socket: &std::net::UdpSocket) {
+    let socket = socket2::SockRef::from(socket);
+    if let Err(e) = socket.set_recv_buffer_size(UDP_RECEIVE_BUFFER) {
+        tracing::warn!("cannot size the UDP receive buffer: {e}; bursts may be dropped");
+        return;
+    }
+    // The kernel reports twice what it grants, the other half being its own bookkeeping.
+    match socket.recv_buffer_size() {
+        Ok(granted) if granted / 2 < UDP_RECEIVE_BUFFER => tracing::warn!(
+            "the UDP receive buffer is {} rather than {}: net.core.rmem_max caps it, and bursts beyond it are dropped (raise it with sysctl net.core.rmem_max={UDP_RECEIVE_BUFFER})",
+            fmt_bytes((granted / 2) as u64),
+            fmt_bytes(UDP_RECEIVE_BUFFER as u64)
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("cannot read back the UDP receive buffer size: {e}"),
+    }
+}
+
 /// The process's resource use so far: its CPU time and context switches from `getrusage`, which counts every thread, exited ones included, and `runtime`'s workers with their busy time and parks.
 pub fn resources(runtime: &tokio::runtime::Handle) -> Resources {
     let metrics = runtime.metrics();

@@ -126,7 +126,7 @@ fn main() -> anyhow::Result<()> {
             "pass --fingerprint sha256:... (the server prints it at startup) or --insecure"
         ),
     };
-    let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
+    let runtime = jackalopefs_perf::runtime().context("tokio runtime")?;
     runtime.block_on(async move {
         let mut signals = Signals::subscribe()?;
         let (host, port) = server_target(&args.server)?;

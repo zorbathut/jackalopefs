@@ -76,6 +76,14 @@ async fn next_signal(signal: &mut tokio::signal::unix::Signal) {
     }
 }
 
+/// The report reads `/proc` and sysfs and writes many lines; on the blocking pool, so the one worker keeps serving meanwhile.
+async fn report_off_worker(server: &Arc<Server>) {
+    let server = server.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || server.report()).await {
+        tracing::error!("the perf report failed: {e}");
+    }
+}
+
 /// Waits for the next report tick, or forever when no interval was asked for.
 async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
     match interval {
@@ -173,12 +181,20 @@ fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("cannot tell what filesystem {} is on: {e}", args.export.display()),
     }
 
-    let runtime = tokio::runtime::Runtime::new().context("tokio runtime")?;
+    let runtime = jackalopefs_perf::runtime().context("tokio runtime")?;
     runtime.block_on(async move {
         let mut signals = Signals::subscribe()?;
         let server_config = tls::server_config(identity, transport_config())?;
-        let endpoint = quinn::Endpoint::server(server_config, args.listen)
+        let socket = std::net::UdpSocket::bind(args.listen)
             .with_context(|| format!("binding {}", args.listen))?;
+        jackalopefs_perf::udp_receive_buffer(&socket);
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .with_context(|| format!("serving on {}", args.listen))?;
         tracing::info!(
             "exporting {} on {} (protocol revision {:016x})",
             args.export.display(),
@@ -256,9 +272,9 @@ fn main() -> anyhow::Result<()> {
                     tokio::select! {
                         _ = next_signal(&mut signals.term) => break,
                         _ = next_signal(&mut signals.int) => break,
-                        _ = next_signal(&mut signals.usr1) => server.report(),
+                        _ = next_signal(&mut signals.usr1) => report_off_worker(&server).await,
                         _ = next_signal(&mut signals.usr2) => usr2_unused(),
-                        _ = next_tick(&mut ticks) => server.report(),
+                        _ = next_tick(&mut ticks) => report_off_worker(&server).await,
                     }
                 }
                 tracing::info!("shutting down");
