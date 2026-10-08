@@ -243,12 +243,18 @@ struct Response {
 }
 
 # One invalidation. entry: the directory entry changed; data: contents or
-# attributes changed; overflow: events were lost, distrust everything cached.
+# attributes changed; overflow: events were lost, distrust everything cached;
+# unwatched: the server has stopped watching this directory, so changes to its
+# entries and to its children's contents and attributes go unreported until a
+# request names it again; drop what is cached under it. The server stops
+# watching first and then says so, and never stops watching a directory a
+# request is in flight in.
 struct EventItem {
   union {
     entry :group { dir @0 :Path; name @1 :Data; }
     data @2 :Path;
     overflow @3 :Void;
+    unwatched @4 :Path;
   }
 }
 

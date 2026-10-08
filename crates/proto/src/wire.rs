@@ -1102,6 +1102,9 @@ impl Message for Event {
                     build_path(w.init_data(path.names().len() as u32), path)
                 }
                 EventItem::Overflow => w.set_overflow(()),
+                EventItem::Unwatched { dir } => {
+                    build_path(w.init_unwatched(dir.names().len() as u32), dir)
+                }
             }
         }
     }
@@ -1121,6 +1124,9 @@ impl Message for Event {
                     path: parse_path(path?)?,
                 },
                 ei::Which::Overflow(()) => EventItem::Overflow,
+                ei::Which::Unwatched(dir) => EventItem::Unwatched {
+                    dir: parse_path(dir?)?,
+                },
             });
         }
         Ok(Event { items })
@@ -1137,6 +1143,7 @@ impl Message for Event {
                     }
                     EventItem::Data { path } => EVENT_ITEM_WORDS + words_for_path(path),
                     EventItem::Overflow => EVENT_ITEM_WORDS,
+                    EventItem::Unwatched { dir } => EVENT_ITEM_WORDS + words_for_path(dir),
                 })
                 .sum::<u32>()
     }

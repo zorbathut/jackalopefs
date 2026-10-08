@@ -87,6 +87,7 @@ async fn server_side_changes_reach_the_client_but_own_changes_do_not() {
             EventItem::Entry { name, .. } => name.as_bytes() == b"mine",
             EventItem::Data { path: p } => p.to_os_string() == "sub/mine",
             EventItem::Overflow => true,
+            EventItem::Unwatched { .. } => false,
         })
         .await;
     assert_eq!(echoed, None, "own changes must not be echoed");

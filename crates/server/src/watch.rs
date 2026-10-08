@@ -206,7 +206,8 @@ fn origin_key(item: &EventItem) -> Option<OsString> {
     match item {
         EventItem::Entry { dir, name } => dir.join(name.clone()).ok().map(|p| p.to_os_string()),
         EventItem::Data { path } => Some(path.to_os_string()),
-        EventItem::Overflow => None,
+        // A notice is the server's own doing, never a session's change to suppress.
+        EventItem::Overflow | EventItem::Unwatched { .. } => None,
     }
 }
 

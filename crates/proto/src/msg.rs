@@ -409,12 +409,13 @@ pub enum Response {
     Xattr(Vec<u8>),
 }
 
-/// One invalidation. `Entry` means the directory entry `dir/name` changed (created, removed, renamed, or its inode replaced); `Data` means the file's contents or attributes changed; `Overflow` means events were dropped and the client should treat everything it caches as suspect.
+/// One invalidation. `Entry` means the directory entry `dir/name` changed (created, removed, renamed, or its inode replaced); `Data` means the file's contents or attributes changed; `Overflow` means events were dropped and the client should treat everything it caches as suspect; `Unwatched` means the server stopped watching the directory `dir`, so changes to its entries and to its children go unreported until a request names it again, and the client should drop what it cached under it.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum EventItem {
     Entry { dir: Path, name: Name },
     Data { path: Path },
     Overflow,
+    Unwatched { dir: Path },
 }
 
 /// One debounce window's worth of events, in order, on the server-to-client event stream.

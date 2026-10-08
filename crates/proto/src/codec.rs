@@ -552,6 +552,9 @@ mod tests {
             round_trip(r);
         }
         round_trip(&event);
+        round_trip(&Event {
+            items: vec![EventItem::Unwatched { dir: path("a/b") }],
+        });
     }
 
     #[tokio::test]

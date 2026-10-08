@@ -764,6 +764,75 @@ async fn a_handle_parked_at_the_end_asks_again_after_an_overflow() {
     m.finish().await;
 }
 
+/// A directory the server stops watching takes with it what the kernel cached beneath it: entries and attributes, the pages of a file held open there, and the end a parked handle recorded. The server here sends no events of its own, so only the notice can have done it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unwatched_notice_drops_what_the_kernel_cached_under_the_directory() {
+    let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(60)).await
+    else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    fs::write(export.join("d/f"), b"v1").unwrap();
+    fs::write(export.join("d/open"), b"old").unwrap();
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    let inject = m.injector();
+    let path = |s: &str| {
+        jackalopefs_proto::Path::from_names(
+            s.split('/')
+                .map(|n| jackalopefs_proto::Name::new(n.as_bytes()).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    };
+    let d = path("d");
+    blocking(move || {
+        let parked = DirStream::open(&mnt.join("d"));
+        assert_eq!(parked.read_names().len(), 4);
+        assert_eq!(fs::metadata(mnt.join("d/f")).unwrap().len(), 2);
+        let mut open = fs::File::open(mnt.join("d/open")).unwrap();
+        let mut read_open = || {
+            let mut buf = Vec::new();
+            open.seek(SeekFrom::Start(0)).unwrap();
+            open.read_to_end(&mut buf).unwrap();
+            buf
+        };
+        assert_eq!(read_open(), b"old");
+
+        fs::write(export.join("d/f"), b"v2 is longer").unwrap();
+        fs::write(export.join("d/open"), b"new").unwrap();
+        fs::write(export.join("d/added"), b"").unwrap();
+        assert_eq!(
+            fs::metadata(mnt.join("d/f")).unwrap().len(),
+            2,
+            "the kernel's cache, before the notice"
+        );
+        assert_eq!(
+            read_open(),
+            b"old",
+            "the open file's pages, before the notice"
+        );
+
+        inject(vec![EventItem::Unwatched { dir: d }]);
+        let started = Instant::now();
+        while fs::metadata(mnt.join("d/f")).unwrap().len() != 12 || read_open() != b"new" {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the notice did not drop the cached attributes and pages"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        read_until_the_server_is_asked(
+            &parked,
+            &perf,
+            "the parked handle answered from its recorded end after the notice",
+        );
+    })
+    .await;
+    m.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failing_test_body_still_leaves_no_mount_behind() {
     let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {

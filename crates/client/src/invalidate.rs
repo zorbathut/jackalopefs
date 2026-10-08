@@ -4,6 +4,7 @@ use crate::conn::ConnState;
 use crate::fuse::{NotifierWork, Shared};
 use fuser::{INodeNo, Notifier};
 use jackalopefs_proto::{Event, EventItem, FileKind, Name};
+use std::collections::HashSet;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,6 +19,8 @@ pub const SWEEP_LIMIT: usize = 4096;
 pub enum Work {
     Entry(u64, Name),
     Inode(u64),
+    /// A handle parked at the end of this directory's listing must ask the server again.
+    DirGrew(u64),
     Sweep,
 }
 
@@ -82,6 +85,12 @@ async fn translate(
         tokio::select! {
             received = events.recv() => {
                 let Some(event) = received else { break };
+                // Taken before the node table, never inside it.
+                let open: HashSet<u64> = if event.items.iter().any(|i| matches!(i, EventItem::Unwatched { .. })) {
+                    shared.client.handles().open_nodeids().into_iter().collect()
+                } else {
+                    HashSet::new()
+                };
                 let nodes = shared.nodes.lock();
                 for item in event.items {
                     match item {
@@ -102,6 +111,18 @@ async fn translate(
                             }
                         }
                         EventItem::Overflow => work.push(Work::Sweep),
+                        // Dropping the directory's own dentry prunes every unused dentry beneath it, and their inodes with them; a file held open there keeps its inode, so its attributes and pages are dropped by name.
+                        EventItem::Unwatched { dir } => {
+                            if let Some((ino, node)) = nodes.resolve_path(&dir).and_then(|ino| Some((ino, nodes.get(ino)?))) {
+                                for (parent, name) in &node.aliases {
+                                    work.push(Work::Entry(*parent, name.clone()));
+                                }
+                                work.push(Work::DirGrew(ino));
+                                for child in node.children.values().filter(|c| open.contains(c)) {
+                                    work.push(Work::Inode(*child));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -152,6 +173,7 @@ fn notifier_loop(rx: Receiver<Work>, notifier: Notifier, shared: Arc<Shared>) {
                 shared.xattr_forget(ino);
                 inval_inode(&notifier, &shared, ino)
             }
+            Work::DirGrew(ino) => shared.dir_grew(ino),
             Work::Sweep => {
                 shared.xattr_clear();
                 shared.dirs_grew_all();
