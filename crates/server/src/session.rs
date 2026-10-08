@@ -5,7 +5,7 @@ use crate::handles::Handles;
 use crate::ids::IdMap;
 use crate::ops::{self, Ops};
 use crate::perf::{Outcome, Perf, Phases, Slowpath, TRACE_TARGET};
-use crate::watch::{ChangeLog, EventBatch};
+use crate::watch::{ChangeLog, EventBatch, Watches};
 use crate::{Limits, SESSION_GRACE};
 use jackalopefs_perf::{
     line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, SampleLink, TrackerQuic,
@@ -186,6 +186,7 @@ pub struct Server {
     pub sessions: Arc<Sessions>,
     pub events: broadcast::Sender<Arc<EventBatch>>,
     pub changes: Arc<ChangeLog>,
+    pub watches: Arc<Watches>,
     /// Which owners cross to clients; its ids are this process's, which the hello tells every client.
     pub ids: IdMap,
     /// Request accounting across every session.
@@ -204,6 +205,7 @@ impl Server {
         token: Option<String>,
         events: broadcast::Sender<Arc<EventBatch>>,
         changes: Arc<ChangeLog>,
+        watches: Arc<Watches>,
         limits: Limits,
         ids: IdMap,
     ) -> Server {
@@ -213,6 +215,7 @@ impl Server {
             sessions: Arc::new(Sessions::new(limits.handles_per_session)),
             events,
             changes,
+            watches,
             perf: Arc::new(Perf::default()),
             connections: Mutex::new(HashMap::new()),
             meters: Mutex::new(Meters {
@@ -241,6 +244,7 @@ impl Server {
     pub fn report(&self) {
         self.perf.report();
         crate::watchdog::report_pending(&self.perf);
+        self.watches.report();
         // The walk holds a descriptor of its own, which is not counted.
         match std::fs::read_dir("/proc/self/fd") {
             Ok(fds) => {
@@ -401,6 +405,7 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         handles: session.handles.clone(),
         session_id: session.id,
         changes: server.changes.clone(),
+        watches: server.watches.clone(),
         ids: server.ids,
     });
     loop {
@@ -661,24 +666,29 @@ async fn handle_request(
     let queued = Instant::now();
     let running = inflight.clone();
     let resp = match tokio::task::spawn_blocking(move || {
-        running.running(nix::unistd::gettid().as_raw());
+        let tid = nix::unistd::gettid().as_raw();
         let started = Instant::now();
+        running.arming(tid);
+        let armed = ops.watches.arm_request(&req);
+        running.running(tid);
         let resp = ops::dispatch(&ops, req);
-        (started, Instant::now(), resp)
+        (started, Instant::now(), resp, armed)
     })
     .await
     {
-        Ok((started, finished, resp)) => {
+        Ok((started, finished, resp, armed)) => {
             phases.wait = started - queued;
             phases.op = finished - started;
-            resp
+            (resp, armed)
         }
         Err(e) => {
             tracing::error!(op, "operation panicked: {e}");
             phases.wait = queued.elapsed();
-            Response::Err(nix::errno::Errno::EIO as i32)
+            (Response::Err(nix::errno::Errno::EIO as i32), Vec::new())
         }
     };
+    // The directories the request named stay watched until its reply is out: a notice that they were dropped must not reach the client ahead of the reply it would cache.
+    let (resp, _armed) = resp;
     let outcome = outcome_of(&resp);
     inflight.sending();
     let sending = Instant::now();

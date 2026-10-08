@@ -374,7 +374,7 @@ impl Request {
 }
 
 /// A path as a log shows it: from the export root, with a leading slash.
-fn shown(path: &Path) -> String {
+pub fn shown(path: &Path) -> String {
     format!("/{}", path.to_os_string().to_string_lossy())
 }
 

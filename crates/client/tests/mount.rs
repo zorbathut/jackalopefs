@@ -42,27 +42,26 @@ struct Mounted {
 
 impl Mounted {
     async fn start(offline_timeout: Duration, ttl: Duration) -> Option<Mounted> {
-        Mounted::start_full(offline_timeout, ttl, true).await
+        Mounted::start_full(offline_timeout, ttl, Some(WATCH_BUDGET)).await
     }
 
     /// A mount whose server sends no change events.
     async fn start_unwatched(offline_timeout: Duration, ttl: Duration) -> Option<Mounted> {
-        Mounted::start_full(offline_timeout, ttl, false).await
+        Mounted::start_full(offline_timeout, ttl, None).await
     }
 
     async fn start_full(
         offline_timeout: Duration,
         ttl: Duration,
-        watched: bool,
+        watch_budget: Option<usize>,
     ) -> Option<Mounted> {
         if !fuse_available() {
             return None;
         }
         let export = tempfile::tempdir().unwrap();
-        let server = if watched {
-            TestServer::start(export.path(), None).await
-        } else {
-            TestServer::start_unwatched(export.path()).await
+        let server = match watch_budget {
+            Some(budget) => TestServer::start_watching(export.path(), budget).await,
+            None => TestServer::start_unwatched(export.path()).await,
         };
         let (mount, mountpoint) = Mounted::mount(server.config(offline_timeout), ttl).await;
         Some(Mounted {
@@ -830,6 +829,114 @@ async fn an_unwatched_notice_drops_what_the_kernel_cached_under_the_directory() 
         );
     })
     .await;
+    m.finish().await;
+}
+
+/// A server that may watch only two directories drops the others as the mount uses more, and tells the client, so whatever changes on the export is seen through the mount within a few seconds despite a minute's TTL, whether its directory is still watched or was dropped; and a directory used again is watched again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directories_beyond_the_watch_budget_are_dropped_with_notice() {
+    let Some(m) =
+        Mounted::start_full(Duration::from_secs(10), Duration::from_secs(60), Some(2)).await
+    else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    let dirs = ["d1", "d2", "d3", "d4", "d5"];
+    for d in dirs {
+        fs::create_dir(export.join(d)).unwrap();
+        fs::write(export.join(d).join("f"), b"v1").unwrap();
+    }
+    let watches = m.server.as_ref().unwrap().server.watches.clone();
+    let mnt = m.mnt();
+    let sizes = move || -> Vec<u64> {
+        dirs.iter()
+            .map(|d| fs::metadata(mnt.join(d).join("f")).unwrap().len())
+            .collect()
+    };
+    let read = sizes.clone();
+    assert_eq!(blocking(read).await, vec![2; 5]);
+    assert!(watches.watched() <= 2, "{} watched", watches.watched());
+    for (round, content) in [b"version two".as_slice(), b"version three!"]
+        .into_iter()
+        .enumerate()
+    {
+        for d in dirs {
+            fs::write(export.join(d).join("f"), content).unwrap();
+        }
+        let read = sizes.clone();
+        let want = content.len() as u64;
+        blocking(move || {
+            let started = Instant::now();
+            loop {
+                let now = read();
+                if now.iter().all(|n| *n == want) {
+                    return;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "round {round}: the mount still shows {now:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .await;
+    }
+    m.finish().await;
+}
+
+/// The kernel trusts what it caches for a file held open, so the server keeps that file's directory watched however many others the mount uses: it is never dropped while the file is open, and every change to the file is pushed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_open_files_directory_stays_watched_beyond_the_budget() {
+    let Some(m) =
+        Mounted::start_full(Duration::from_secs(10), Duration::from_secs(60), Some(1)).await
+    else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    for d in ["held", "d1", "d2", "d3"] {
+        fs::create_dir(export.join(d)).unwrap();
+        fs::write(export.join(d).join("f"), b"v1").unwrap();
+    }
+    let mnt = m.mnt();
+    let mut sent = m.server.as_ref().unwrap().events.subscribe();
+    blocking(move || {
+        let mut open = fs::File::open(mnt.join("held/f")).unwrap();
+        let mut read_open = || {
+            let mut buf = Vec::new();
+            open.seek(SeekFrom::Start(0)).unwrap();
+            open.read_to_end(&mut buf).unwrap();
+            buf
+        };
+        assert_eq!(read_open(), b"v1");
+        for d in ["d1", "d2", "d3"] {
+            fs::metadata(mnt.join(d).join("f")).unwrap();
+        }
+        for content in [b"v2", b"v3"] {
+            fs::write(export.join("held/f"), content).unwrap();
+            let started = Instant::now();
+            while read_open() != content {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "the open file still reads as before {content:?}"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    })
+    .await;
+    let held =
+        jackalopefs_proto::Path::from_names(vec![jackalopefs_proto::Name::new(b"held").unwrap()])
+            .unwrap();
+    let mut dropped = Vec::new();
+    while let Ok(batch) = sent.try_recv() {
+        for (item, _) in batch.items.iter() {
+            if let EventItem::Unwatched { dir } = item {
+                dropped.push(dir.clone());
+            }
+        }
+    }
+    assert!(!dropped.is_empty(), "the other directories were dropped");
+    assert!(!dropped.contains(&held), "{dropped:?}");
     m.finish().await;
 }
 

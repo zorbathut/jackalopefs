@@ -9,7 +9,7 @@ use jackalopefs_server::export::Export;
 use jackalopefs_server::ids::{IdMap, ModeIds};
 use jackalopefs_server::session::{self, Server};
 use jackalopefs_server::tls::{self, Identity};
-use jackalopefs_server::watch::{self, ChangeLog, EventBatch, WatcherHandle};
+use jackalopefs_server::watch::{self, ChangeLog, EventBatch, WatcherHandle, Watches};
 use jackalopefs_server::Limits;
 use parking_lot::Mutex;
 use quinn::{Connection, Endpoint, EndpointConfig, TokioRuntime};
@@ -18,6 +18,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
+
+/// Directories a test server watches at most, besides the export root, unless a test says otherwise.
+pub const WATCH_BUDGET: usize = 1024;
 
 pub struct TestServer {
     pub addr: SocketAddr,
@@ -45,7 +48,20 @@ impl TestServer {
             None,
             UdpSocket::bind("127.0.0.1:0").unwrap(),
             Identity::generate().unwrap(),
-            false,
+            None,
+            ModeIds::Direct,
+        )
+        .await
+    }
+
+    /// A server that watches at most `budget` directories besides the export root.
+    pub async fn start_watching(export: &Path, budget: usize) -> TestServer {
+        TestServer::start_full(
+            export,
+            None,
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            Identity::generate().unwrap(),
+            Some(budget),
             ModeIds::Direct,
         )
         .await
@@ -58,7 +74,7 @@ impl TestServer {
             None,
             UdpSocket::bind("127.0.0.1:0").unwrap(),
             Identity::generate().unwrap(),
-            true,
+            Some(WATCH_BUDGET),
             ids,
         )
         .await
@@ -71,7 +87,15 @@ impl TestServer {
         socket: UdpSocket,
         identity: Identity,
     ) -> TestServer {
-        TestServer::start_full(export, token, socket, identity, true, ModeIds::Direct).await
+        TestServer::start_full(
+            export,
+            token,
+            socket,
+            identity,
+            Some(WATCH_BUDGET),
+            ModeIds::Direct,
+        )
+        .await
     }
 
     async fn start_full(
@@ -79,7 +103,7 @@ impl TestServer {
         token: Option<String>,
         socket: UdpSocket,
         identity: Identity,
-        watched: bool,
+        watch_budget: Option<usize>,
         ids: ModeIds,
     ) -> TestServer {
         // The server binary zeroes its umask so client modes are honoured; the in-process server needs the same.
@@ -95,16 +119,23 @@ impl TestServer {
         .unwrap();
         let (events, _) = broadcast::channel(64);
         let changes = Arc::new(ChangeLog::default());
-        let watcher = if watched {
-            watch::spawn(export, changes.clone(), events.clone())
-        } else {
-            None
+        let opened = Arc::new(Export::open(export).unwrap());
+        let (watches, watcher) = match watch_budget {
+            Some(budget) => watch::spawn(
+                opened.clone(),
+                export,
+                budget,
+                changes.clone(),
+                events.clone(),
+            ),
+            None => (Watches::disabled(), None),
         };
         let server = Arc::new(Server::new(
-            Arc::new(Export::open(export).unwrap()),
+            opened,
             token,
             events.clone(),
             changes,
+            watches,
             Limits {
                 connections: 64,
                 handles_per_session: jackalopefs_server::handles::MAX_HANDLES,

@@ -152,6 +152,8 @@ pub enum PhaseServer {
     Read,
     /// Waiting for a blocking thread to run the operation on.
     Wait,
+    /// Watching the directories the request names, before it runs.
+    Watch,
     /// The filesystem work itself.
     Op,
     /// Writing the reply.
@@ -163,6 +165,7 @@ impl PhaseServer {
         match self {
             PhaseServer::Read => "reading the request",
             PhaseServer::Wait => "waiting for a blocking thread",
+            PhaseServer::Watch => "watching its directories",
             PhaseServer::Op => "in the filesystem",
             PhaseServer::Send => "sending the reply",
         }
@@ -273,6 +276,14 @@ impl InFlight {
         active.op = Some(op);
         active.subject = Some(subject);
         active.phase = PhaseServer::Wait;
+        active.since = Instant::now();
+    }
+
+    /// A blocking thread, `tid`, is watching the directories the request names.
+    pub fn arming(&self, tid: i32) {
+        let mut active = self.active.lock();
+        active.tid = Some(tid);
+        active.phase = PhaseServer::Watch;
         active.since = Instant::now();
     }
 

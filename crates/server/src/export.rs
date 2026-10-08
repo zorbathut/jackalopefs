@@ -141,6 +141,17 @@ impl Export {
         )
     }
 
+    /// `O_PATH` fd for the directory `name` inside `parent`, resolved as every request path is.
+    pub fn resolve_dir_in(&self, parent: BorrowedFd<'_>, name: &Name) -> Result<OwnedFd, Errno> {
+        openat2(
+            parent,
+            name.as_os_str(),
+            OpenHow::new()
+                .flags(OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC)
+                .resolve(RESOLVE),
+        )
+    }
+
     /// The parent directory's fd and the final component, for `*at` calls; the root has no parent (`EPERM`, as for unlinking `/`).
     pub fn resolve_parent<'p>(&self, path: &'p Path) -> Result<(OwnedFd, &'p Name), Errno> {
         let (parent, name) = path.split_last().ok_or(Errno::EPERM)?;

@@ -117,7 +117,7 @@ fn describe(pending: &Pending, age: Duration, now: Instant) -> String {
         fmt_duration(now.saturating_duration_since(pending.since)),
         fmt_duration(age),
     );
-    if let (PhaseServer::Op, Some(tid)) = (pending.phase, pending.tid) {
+    if let (PhaseServer::Op | PhaseServer::Watch, Some(tid)) = (pending.phase, pending.tid) {
         line.push_str(&format!("; {}", thread_doing(tid)));
     }
     line

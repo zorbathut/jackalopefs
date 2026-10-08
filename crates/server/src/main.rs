@@ -37,6 +37,9 @@ struct Args {
     /// Log a per-operation performance summary this often (e.g. `5s`); SIGUSR1 logs one at any time. SIGUSR2 turns trace logging on and off: a line per request and every debug line of its own, written as they happen, which can itself slow a busy process logging to a terminal.
     #[arg(long, value_parser = humantime::parse_duration)]
     perf_interval: Option<Duration>,
+    /// Most directories to watch for changes at once, besides the export root; the least recently used are dropped as others are needed, and clients told to drop what they cached under them. Default: half of fs.inotify.max_user_watches, at most 65536.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    watch_limit: Option<u64>,
 }
 
 /// The signals the server answers, subscribed before it starts serving so none is missed (and so SIGUSR1 and SIGUSR2, whose default disposition is to terminate, never kill it).
@@ -177,9 +180,20 @@ fn main() -> anyhow::Result<()> {
         );
         let (events, _) = broadcast::channel::<Arc<EventBatch>>(256);
         let changes = Arc::new(ChangeLog::default());
-        let _watcher = watch::spawn(&args.export, changes.clone(), events.clone());
+        let budget = args
+            .watch_limit
+            .map_or_else(watch::default_budget, |limit| {
+                usize::try_from(limit).unwrap_or(usize::MAX)
+            });
+        let (watches, _watcher) = watch::spawn(
+            export.clone(),
+            &args.export,
+            budget,
+            changes.clone(),
+            events.clone(),
+        );
         let server = Arc::new(Server::new(
-            export, args.token, events, changes, limits, ids,
+            export, args.token, events, changes, watches, limits, ids,
         ));
         let mut watch = WatchServer::new(server.perf.clone(), tokio::runtime::Handle::current());
         let watchdog = Watchdog::spawn("jfs-watchdog", WATCH_PERIOD, move || watch.tick())

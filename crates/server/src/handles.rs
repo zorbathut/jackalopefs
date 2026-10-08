@@ -1,5 +1,6 @@
 //! Per-session table of open files and directories, keyed by the client-chosen handle id.
 
+use crate::watch::Armed;
 use jackalopefs_proto::Path;
 use nix::errno::Errno;
 use parking_lot::Mutex;
@@ -15,8 +16,14 @@ pub enum Handle {
     File {
         file: Arc<File>,
         path: Path,
+        /// Keeps the directory it was opened in watched while it is open.
+        watch: Option<Arc<Armed>>,
     },
-    Dir(Arc<Mutex<OwnedFd>>),
+    /// `watch` keeps the directory itself watched while it is open.
+    Dir {
+        dir: Arc<Mutex<OwnedFd>>,
+        watch: Option<Arc<Armed>>,
+    },
 }
 
 /// Most open handles one session may hold, however many file descriptors the server has; a client's own kernel keeps honest clients far below this, so hitting it means a leak or an attack, and the answer is `EMFILE`. The cap a server applies is derived from its file descriptor limit at startup ([`per_session`]).
@@ -70,14 +77,14 @@ impl Handles {
 
     pub fn file_and_path(&self, fh: u64) -> Result<(Arc<File>, Path), Errno> {
         match self.map.lock().get(&fh) {
-            Some(Handle::File { file, path }) => Ok((file.clone(), path.clone())),
+            Some(Handle::File { file, path, .. }) => Ok((file.clone(), path.clone())),
             _ => Err(Errno::EBADF),
         }
     }
 
     pub fn dir(&self, fh: u64) -> Result<Arc<Mutex<OwnedFd>>, Errno> {
         match self.map.lock().get(&fh) {
-            Some(Handle::Dir(dir)) => Ok(dir.clone()),
+            Some(Handle::Dir { dir, .. }) => Ok(dir.clone()),
             _ => Err(Errno::EBADF),
         }
     }
@@ -110,6 +117,7 @@ mod tests {
         let handle = || Handle::File {
             file: file.clone(),
             path: Path::root(),
+            watch: None,
         };
         handles.insert(1, handle()).unwrap();
         handles.insert(2, handle()).unwrap();

@@ -48,6 +48,11 @@ async fn server_side_changes_reach_the_client_but_own_changes_do_not() {
     let mut events = Inbox::new(client.take_events().unwrap());
     let mut observer = server.client().await;
     let mut observer_events = Inbox::new(observer.take_events().unwrap());
+    // A directory is watched once a request names it, as any client's does before it caches anything there.
+    client
+        .lookup(path("sub"), name("created"))
+        .await
+        .unwrap_err();
 
     fs::write(export.path().join("sub/created"), b"x").unwrap();
     let item = events
@@ -107,5 +112,42 @@ async fn server_side_changes_reach_the_client_but_own_changes_do_not() {
 
     client.shutdown().await;
     observer.shutdown().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_directory_no_client_has_named_is_not_watched() {
+    let export = tempfile::tempdir().unwrap();
+    fs::create_dir(export.path().join("quiet")).unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let mut client = server.client().await;
+    let mut events = Inbox::new(client.take_events().unwrap());
+    let in_quiet =
+        |i: &EventItem| matches!(i, EventItem::Entry { dir, .. } if *dir == path("quiet"));
+
+    fs::write(export.path().join("quiet/unseen"), b"").unwrap();
+    // The kernel queues events in order: once the root's change has come, anything the first was going to produce has too.
+    fs::write(export.path().join("sentinel"), b"").unwrap();
+    let sentinel = events
+        .find(
+            Duration::from_secs(3),
+            |i| matches!(i, EventItem::Entry { name, .. } if name.as_bytes() == b"sentinel"),
+        )
+        .await;
+    assert!(sentinel.is_some(), "the root is always watched");
+    assert!(!events.items.iter().any(in_quiet), "{:?}", events.items);
+
+    client.lookup(path("quiet"), name("unseen")).await.unwrap();
+    fs::write(export.path().join("quiet/seen"), b"").unwrap();
+    let item = events.find(Duration::from_secs(3), in_quiet).await;
+    assert_eq!(
+        item,
+        Some(EventItem::Entry {
+            dir: path("quiet"),
+            name: name("seen")
+        })
+    );
+
+    client.shutdown().await;
     server.stop().await;
 }

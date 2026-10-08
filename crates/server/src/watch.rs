@@ -1,18 +1,24 @@
-//! Change notification: one inotify watch per directory under the export, placed by a walker thread that skips what it cannot list, folded into short batches and fanned out to sessions. A session is not told about changes it made itself. Each directory's watch also reports that directory's own deletion or move, which its parent's watch reports too; the batch folds the duplicate.
+//! Change notification: an inotify watch on each directory clients use, placed before the request that names it runs, so a client caches only what is watched. The watched directories form a tree under the export root, every one's parent watched too, so a rename or removal of any of them is reported on a watched parent. Events are folded into short batches and fanned out to sessions; a session is not told about changes it made itself.
 //!
-//! This is a latency improvement, not the correctness mechanism: the client's cache TTL is the backstop. inotify misses `mmap` writes, has watch limits, and drops events under load; every such gap surfaces as [`EventItem::Overflow`] or is simply covered by the TTL.
+//! This is a latency improvement, not the correctness mechanism: the client's cache TTL is the backstop. inotify misses `mmap` writes and drops events under load; every such gap surfaces as [`EventItem::Overflow`] or is simply covered by the TTL.
 
-use jackalopefs_proto::{Event, EventItem, Name, Path};
-use notify::event::{CreateKind, ModifyKind, RenameMode};
-use notify::{EventKind, RecursiveMode, Watcher};
-use parking_lot::Mutex;
+use crate::export::{proc_path, Export};
+use crate::perf::TRACE_TARGET;
+use jackalopefs_perf::CountsEvent;
+use jackalopefs_proto::{shown, Event, EventItem, Name, Path, Request};
+use nix::errno::Errno;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+use nix::sys::eventfd::{EfdFlags, EventFd};
+use nix::sys::inotify::{AddWatchFlags, InitFlags, Inotify, WatchDescriptor};
+use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::hash::Hash;
+use std::os::fd::{AsFd, OwnedFd};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 /// How long raw events accumulate before one batch goes out.
 pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(100);
@@ -20,11 +26,34 @@ pub const DEBOUNCE_WINDOW: Duration = Duration::from_millis(100);
 /// Distinct items one batch may hold before it collapses to an overflow.
 const MAX_PENDING: usize = 10_000;
 
-/// Raw events buffered between the inotify thread and the debouncer.
-const RAW_QUEUE: usize = 4096;
-
 /// Upper bound on how long a recorded change waits for its inotify event before it stops counting as the origin.
 const ORIGIN_MEMORY: Duration = Duration::from_secs(1);
+
+/// How long a directory that could not be watched is left alone before a request naming it tries again.
+const UNWATCHABLE_RETRY: Duration = Duration::from_secs(60);
+
+/// Most directories one eviction drops: each removal queues an `IN_IGNORED` in the same inotify queue the changes come through, whose default length is 16384.
+const EVICT_BATCH: usize = 512;
+
+/// Directories watched at most, besides the export root, when `--watch-limit` is not given: half of `fs.inotify.max_user_watches`, which every process of the server's user shares, and at most this many. A watch pins its directory's inode in kernel memory, so this bounds that at some tens of MiB.
+const BUDGET_MAX: usize = 65536;
+
+/// The budget when `fs.inotify.max_user_watches` cannot be read.
+const BUDGET_FALLBACK: usize = 8192;
+
+/// How long the budget stays lowered after the system ran out of watches before it.
+const LIMITED_HOLD: Duration = Duration::from_secs(600);
+
+/// What a directory's watch reports: changes to its entries, its children's contents and attributes (a directory's watch reports those for every child, subdirectories included), and its own removal or move. Opens, reads and closes are left out, so the server's own work never fills the queue.
+const MASK: AddWatchFlags = AddWatchFlags::IN_CREATE
+    .union(AddWatchFlags::IN_DELETE)
+    .union(AddWatchFlags::IN_MOVED_FROM)
+    .union(AddWatchFlags::IN_MOVED_TO)
+    .union(AddWatchFlags::IN_MODIFY)
+    .union(AddWatchFlags::IN_ATTRIB)
+    .union(AddWatchFlags::IN_DELETE_SELF)
+    .union(AddWatchFlags::IN_MOVE_SELF)
+    .union(AddWatchFlags::IN_ONLYDIR);
 
 /// One debounce window of events. Each item carries the session that caused it (when the server did the work itself) so that session is not told about its own change.
 #[derive(Debug, Default)]
@@ -140,68 +169,6 @@ impl Pending {
     }
 }
 
-/// Relative `Path` for an absolute path under `root`; `None` (logged) if it is outside, has a component that isn't a valid name, or is too long. Such a change goes unreported and the client's TTL covers it.
-pub fn relative_path(root: &std::path::Path, abs: &std::path::Path) -> Option<Path> {
-    let Ok(rel) = abs.strip_prefix(root) else {
-        tracing::debug!(path = %abs.display(), "event outside the export root ignored");
-        return None;
-    };
-    let mut names = Vec::new();
-    for component in rel.components() {
-        match component {
-            std::path::Component::Normal(part) => match Name::try_from(part) {
-                Ok(name) => names.push(name),
-                Err(e) => {
-                    tracing::debug!(path = %abs.display(), "event path has an unrepresentable component ({e}); not reported");
-                    return None;
-                }
-            },
-            std::path::Component::CurDir => {}
-            _ => return None,
-        }
-    }
-    match Path::from_names(names) {
-        Ok(path) => Some(path),
-        Err(e) => {
-            tracing::debug!(path = %abs.display(), "event path not reported: {e}");
-            None
-        }
-    }
-}
-
-/// Translate one inotify event into items. Renames and creates/removes are entry changes on the parent; content and attribute changes are data changes on the node; a rescan request is an overflow.
-pub fn items_for(root: &std::path::Path, event: &notify::Event) -> Vec<EventItem> {
-    if event.need_rescan() {
-        return vec![EventItem::Overflow];
-    }
-    let entry = |abs: &PathBuf| -> Option<EventItem> {
-        let path = relative_path(root, abs)?;
-        let (dir, name) = path.split_last()?;
-        Some(EventItem::Entry {
-            dir,
-            name: name.clone(),
-        })
-    };
-    let data = |abs: &PathBuf| -> Option<EventItem> {
-        Some(EventItem::Data {
-            path: relative_path(root, abs)?,
-        })
-    };
-    let mapper: &dyn Fn(&PathBuf) -> Option<EventItem> = match &event.kind {
-        EventKind::Create(_) | EventKind::Remove(_) => &entry,
-        EventKind::Modify(ModifyKind::Name(
-            RenameMode::From
-            | RenameMode::To
-            | RenameMode::Both
-            | RenameMode::Any
-            | RenameMode::Other,
-        )) => &entry,
-        EventKind::Modify(_) | EventKind::Any | EventKind::Other => &data,
-        EventKind::Access(_) => return Vec::new(),
-    };
-    event.paths.iter().filter_map(mapper).collect()
-}
-
 fn origin_key(item: &EventItem) -> Option<OsString> {
     match item {
         EventItem::Entry { dir, name } => dir.join(name.clone()).ok().map(|p| p.to_os_string()),
@@ -211,343 +178,1132 @@ fn origin_key(item: &EventItem) -> Option<OsString> {
     }
 }
 
-/// Directories this event brought into the tree: creates the kernel flagged as directories, and rename destinations that are directories right now (a rename is reported for files too, and the stat here keeps them off the walker's queue). Each needs its own walk, since nothing under a non-recursive watch is watched automatically. `RenameMode::Both` is not consulted: notify emits `To` for every `MOVED_TO` and adds `Both` alongside it only when it paired the cookie, so `To` alone is complete.
-fn arrivals(event: &notify::Event) -> Vec<PathBuf> {
-    match event.kind {
-        EventKind::Create(CreateKind::Folder) => event.paths.clone(),
-        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => event
-            .paths
-            .iter()
-            .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()))
-            .cloned()
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-#[derive(Debug, Default)]
-struct WalkOutcome {
-    watched: usize,
-    skipped: usize,
-    /// The directory at which the inotify watch limit was hit; the walk stopped there and the rest of the tree is unwatched.
-    limit_hit: Option<PathBuf>,
-}
-
-/// The failure behind a watch error, without the path notify appends to its own message.
-fn io_cause(err: notify::Error) -> std::io::Error {
-    match err.kind {
-        notify::ErrorKind::Io(e) => e,
-        notify::ErrorKind::PathNotFound => std::io::ErrorKind::NotFound.into(),
-        other => std::io::Error::other(format!("{other:?}")),
-    }
-}
-
-/// Report a directory the walk is leaving out. An unreadable or vanished directory is routine on an export (snapshot directories, private home directories); anything else deserves attention.
-fn log_skip(dir: &std::path::Path, err: &std::io::Error) {
-    if matches!(
-        err.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+/// The items an inotify event in the directory `dir` about its entry `name` stands for: an entry change for a create, removal or rename, a data change for contents or attributes.
+fn items_for(dir: &Path, mask: AddWatchFlags, name: &Name) -> Vec<EventItem> {
+    let mut items = Vec::new();
+    if mask.intersects(
+        AddWatchFlags::IN_CREATE
+            | AddWatchFlags::IN_DELETE
+            | AddWatchFlags::IN_MOVED_FROM
+            | AddWatchFlags::IN_MOVED_TO,
     ) {
-        tracing::debug!("not watching {}: {err}", dir.display());
-    } else {
-        tracing::warn!("not watching {}: {err}", dir.display());
+        items.push(EventItem::Entry {
+            dir: dir.clone(),
+            name: name.clone(),
+        });
+    }
+    if mask.intersects(AddWatchFlags::IN_MODIFY | AddWatchFlags::IN_ATTRIB) {
+        match dir.join(name.clone()) {
+            Ok(path) => items.push(EventItem::Data { path }),
+            Err(e) => tracing::debug!("a change in {} not reported: {e}", shown(dir)),
+        }
+    }
+    items
+}
+
+/// Whether an event changes which directories the table has where, which takes the table's write lock.
+fn structural<W>(event: &RawEvent<W>) -> bool {
+    event.mask.intersects(
+        AddWatchFlags::IN_Q_OVERFLOW
+            | AddWatchFlags::IN_IGNORED
+            | AddWatchFlags::IN_UNMOUNT
+            | AddWatchFlags::IN_DELETE_SELF,
+    ) || (event.mask.contains(AddWatchFlags::IN_ISDIR)
+        && event.mask.intersects(
+            AddWatchFlags::IN_MOVED_FROM | AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_DELETE,
+        ))
+}
+
+/// The directory `path` is in; the root is its own.
+pub fn parent_of(path: &Path) -> Path {
+    path.split_last()
+        .map_or_else(Path::root, |(parent, _)| parent)
+}
+
+/// The directories `req` reads or changes by path, which must be watched before it runs: the parent of every path it names (whose watch reports the node's entry, contents and attributes) and the directory a listing opens. Watching a directory watches every directory above it too. A request on an open handle names none: its directory is kept watched by the handle ([`Watches::hold`]).
+pub fn dirs_named(req: &Request) -> Vec<Path> {
+    match req {
+        Request::Lookup { parent, .. }
+        | Request::Mknod { parent, .. }
+        | Request::Mkdir { parent, .. }
+        | Request::Unlink { parent, .. }
+        | Request::Rmdir { parent, .. }
+        | Request::Symlink { parent, .. }
+        | Request::Create { parent, .. } => vec![parent.clone()],
+        Request::Rename {
+            parent, newparent, ..
+        } => vec![parent.clone(), newparent.clone()],
+        Request::Link {
+            path, newparent, ..
+        } => vec![parent_of(path), newparent.clone()],
+        Request::Getattr { path, .. } | Request::Setattr { path, .. } => {
+            path.iter().map(parent_of).collect()
+        }
+        Request::Readlink { path }
+        | Request::Open { path, .. }
+        | Request::Setxattr { path, .. }
+        | Request::Getxattr { path, .. }
+        | Request::Listxattr { path }
+        | Request::Removexattr { path, .. }
+        | Request::Access { path, .. } => vec![parent_of(path)],
+        Request::Opendir { path, .. } => vec![path.clone()],
+        Request::Read { .. }
+        | Request::Write { .. }
+        | Request::Release { .. }
+        | Request::Fsync { .. }
+        | Request::Readdir { .. }
+        | Request::Releasedir { .. }
+        | Request::Statfs { .. }
+        | Request::CopyFileRange { .. }
+        | Request::Fallocate { .. }
+        | Request::Lseek { .. } => Vec::new(),
     }
 }
 
-/// Watch `top` and every directory below it, one non-recursive watch each. A directory below `top` that cannot be watched or listed is skipped: the server cannot list it for clients either, and its parent's watch still reports the entry itself. `top` itself failing is the error. Hitting the inotify watch limit ends the walk, keeping the watches placed so far; so does `stopping`. Symlinks are not followed; the server never resolves through them.
-///
-/// Each directory is watched before it is listed, so a subdirectory created meanwhile is found either by the listing or by the fresh watch's own create event (watching a path twice is harmless).
-fn watch_tree(
-    watcher: &mut notify::RecommendedWatcher,
-    top: &std::path::Path,
-    stopping: &AtomicBool,
-) -> Result<WalkOutcome, std::io::Error> {
-    let mut outcome = WalkOutcome::default();
-    let mut stack = vec![top.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        if stopping.load(Ordering::Relaxed) {
-            break;
+/// What the watch table needs from the system. The table is generic over it so its bookkeeping can be tested with events in any order.
+trait Marks {
+    type Wd: Copy + Eq + Hash + std::fmt::Debug;
+    type Dir;
+    /// The directory at `path` under the export root.
+    fn open(&self, path: &Path) -> Result<Self::Dir, Errno>;
+    /// The directory `name` inside `parent`.
+    fn open_child(&self, parent: &Self::Dir, name: &Name) -> Result<Self::Dir, Errno>;
+    /// Watch `dir`; a directory already watched gives the descriptor it has.
+    fn add(&self, dir: &Self::Dir) -> Result<Self::Wd, Errno>;
+    fn rm(&self, wd: Self::Wd);
+}
+
+/// The system's: directories resolved as every request path is, and watched through the descriptor that resolved them, so the watch is on exactly that inode.
+struct Inotified {
+    inotify: Arc<Inotify>,
+    export: Arc<Export>,
+}
+
+impl Marks for Inotified {
+    type Wd = WatchDescriptor;
+    type Dir = OwnedFd;
+
+    fn open(&self, path: &Path) -> Result<OwnedFd, Errno> {
+        self.export.resolve_dir(path)
+    }
+
+    fn open_child(&self, parent: &OwnedFd, name: &Name) -> Result<OwnedFd, Errno> {
+        self.export.resolve_dir_in(parent.as_fd(), name)
+    }
+
+    fn add(&self, dir: &OwnedFd) -> Result<WatchDescriptor, Errno> {
+        self.inotify
+            .add_watch(proc_path(dir.as_fd()).as_path(), MASK)
+    }
+
+    fn rm(&self, wd: WatchDescriptor) {
+        // The kernel has already dropped the watch of a directory that is gone.
+        if let Err(e) = self.inotify.rm_watch(wd) {
+            tracing::debug!(?wd, "removing a watch: {e}");
         }
-        if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-            if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) {
-                outcome.limit_hit = Some(dir);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State<W> {
+    Watched(W),
+    /// Could not be watched; a request naming it tries again from `retry_at`. Nothing below it is watched, since a rename there would go unseen.
+    Unwatchable {
+        retry_at: Instant,
+    },
+}
+
+/// One directory in the table, shared with the requests and handles that keep it watched.
+struct Mark<W> {
+    state: State<W>,
+    /// The eviction round in which a request last named this directory or one below it; eviction takes the oldest first. A directory is never older than one below it, since naming one names every directory above it.
+    used: AtomicU64,
+    /// Requests in flight and handles open in this directory, which keep it watched: a notice that reached the client before a reply would leave the reply cached under a directory nobody watches, and a file held open is what the kernel trusts its own cache for.
+    holds: AtomicU32,
+}
+
+impl<W> Mark<W> {
+    fn new(state: State<W>, round: u64) -> Arc<Mark<W>> {
+        Arc::new(Mark {
+            state,
+            used: AtomicU64::new(round),
+            holds: AtomicU32::new(0),
+        })
+    }
+
+    /// Stored only when it changes, so a busy directory's cache line is not written by every request.
+    fn stamp(&self, round: u64) {
+        if self.used.load(Ordering::Relaxed) != round {
+            self.used.store(round, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Keeps a directory watched while it lives: for a request until its reply is sent, for a handle until it is released.
+pub struct Armed<W = WatchDescriptor>(Arc<Mark<W>>);
+
+impl<W> Armed<W> {
+    fn hold(mark: &Arc<Mark<W>>) -> Armed<W> {
+        mark.holds.fetch_add(1, Ordering::Relaxed);
+        Armed(mark.clone())
+    }
+}
+
+impl<W> Drop for Armed<W> {
+    fn drop(&mut self) {
+        self.0.holds.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct Node<W> {
+    mark: Arc<Mark<W>>,
+    children: HashMap<Name, Node<W>>,
+}
+
+impl<W> Node<W> {
+    fn new(state: State<W>, round: u64) -> Node<W> {
+        Node {
+            mark: Mark::new(state, round),
+            children: HashMap::new(),
+        }
+    }
+}
+
+/// What [`Table::touch`] found.
+enum Touched<W> {
+    /// Nothing more to watch: the deepest watched directory on the path, held (none once the table is dead).
+    Done(Option<Armed<W>>),
+    /// Part of the path still needs watching, which takes the write lock.
+    Missing,
+}
+
+/// One inotify event, as the table needs it.
+#[derive(Debug)]
+struct RawEvent<W> {
+    wd: W,
+    mask: AddWatchFlags,
+    cookie: u32,
+    name: Option<OsString>,
+}
+
+/// A log line the table decided on, written once its lock is released, so a blocked log output never holds up a request.
+enum Note {
+    Warn(String),
+    Info(String),
+    Debug(String),
+}
+
+/// The watched directories, as a tree from the export root mirroring the export: a directory is watched only below a watched parent, so the move or removal of any watched directory is reported on its parent's watch.
+struct Table<M: Marks> {
+    marks: M,
+    root: Node<M::Wd>,
+    by_wd: HashMap<M::Wd, Path>,
+    /// Directories watched besides the root.
+    watched: usize,
+    /// Directories watched at most besides the root.
+    budget: usize,
+    /// A lower budget while the system has no more watches to give, and until when.
+    capped: Option<(usize, Instant)>,
+    /// Advanced by every eviction, so what is used after it is newer than everything it passed over.
+    round: AtomicU64,
+    /// The root's own watch ended: nothing is watched any more.
+    dead: bool,
+    evicted_logged: bool,
+    counts: Mutex<CountsEvent>,
+    notes: Vec<Note>,
+}
+
+fn path_of(names: &[Name]) -> Path {
+    Path::from_names(names.to_vec()).expect("a prefix of a path is no longer than the path")
+}
+
+impl<M: Marks> Table<M> {
+    /// Watch the root, which is never dropped and not counted in `budget`.
+    fn new(marks: M, budget: usize) -> Result<Table<M>, Errno> {
+        let wd = marks.add(&marks.open(&Path::root())?)?;
+        Ok(Table {
+            marks,
+            root: Node::new(State::Watched(wd), 0),
+            by_wd: HashMap::from([(wd, Path::root())]),
+            watched: 0,
+            budget,
+            capped: None,
+            round: AtomicU64::new(0),
+            dead: false,
+            evicted_logged: false,
+            counts: Mutex::new(CountsEvent::default()),
+            notes: Vec::new(),
+        })
+    }
+
+    fn count(&self, event: &'static str) {
+        self.counts.lock().count(event);
+    }
+
+    fn debug(&mut self, line: impl FnOnce() -> String) {
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            self.notes.push(Note::Debug(line()));
+        }
+    }
+
+    /// The budget in force at `now`: the configured one, or a lower one while the system has run out of watches.
+    fn budget_at(&mut self, now: Instant) -> usize {
+        match self.capped {
+            Some((cap, until)) if now < until => cap,
+            Some(_) => {
+                self.capped = None;
+                self.notes.push(Note::Info(format!(
+                    "watching up to {} directories again",
+                    self.budget
+                )));
+                self.budget
+            }
+            None => self.budget,
+        }
+    }
+
+    /// Walk the table along `dir` without changing it.
+    fn touch(&self, dir: &Path, now: Instant) -> Touched<M::Wd> {
+        if self.dead {
+            return Touched::Done(None);
+        }
+        let round = self.round.load(Ordering::Relaxed);
+        let mut node = &self.root;
+        for name in dir.names() {
+            let Some(child) = node.children.get(name) else {
+                return Touched::Missing;
+            };
+            match child.mark.state {
+                State::Watched(_) => {
+                    child.mark.stamp(round);
+                    node = child;
+                }
+                State::Unwatchable { retry_at } if now < retry_at => break,
+                State::Unwatchable { .. } => return Touched::Missing,
+            }
+        }
+        Touched::Done(Some(Armed::hold(&node.mark)))
+    }
+
+    /// Watch `dir` and every directory above it, top-down: each is resolved inside its parent once the parent is watched, so a rename of it from then on is reported. Returns the deepest directory on the path that is watched, held. Notices for directories dropped meanwhile go to `out`.
+    fn arm(&mut self, dir: &Path, now: Instant, out: &mut Vec<EventItem>) -> Option<Armed<M::Wd>> {
+        if let Touched::Done(held) = self.touch(dir, now) {
+            return held;
+        }
+        let names = dir.names();
+        let mut depth = 0;
+        let mut node = &self.root;
+        while let Some(child) = names.get(depth).and_then(|name| node.children.get(name)) {
+            if !matches!(child.mark.state, State::Watched(_)) {
                 break;
             }
-            let e = io_cause(e);
-            if dir == top {
-                return Err(e);
-            }
-            log_skip(&dir, &e);
-            outcome.skipped += 1;
-            continue;
+            node = child;
+            depth += 1;
         }
-        outcome.watched += 1;
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                log_skip(&dir, &e);
-                outcome.skipped += 1;
-                continue;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(e) => {
-                    tracing::warn!("listing {}: {e}", dir.display());
-                    continue;
-                }
-            };
-            match entry.file_type() {
-                Ok(kind) if kind.is_dir() => stack.push(entry.path()),
-                Ok(_) => {}
-                Err(e) => tracing::debug!("not examining {}: {e}", entry.path().display()),
-            }
-        }
+        self.extend(names, depth, now, out);
+        Some(Armed::hold(&self.deepest_watched(names).mark))
     }
-    Ok(outcome)
-}
 
-/// A request to the walker thread.
-enum Walk {
-    /// Watch this directory and everything under it.
-    Tree(PathBuf),
-    Stop,
-}
-
-/// Owns the watcher: walks the root first, then every directory the event handler reports as new, until told to stop. Adding a watch is a round trip through notify's event loop, so this runs on its own thread rather than holding up event handling or the server's startup.
-fn walker(
-    mut watcher: notify::RecommendedWatcher,
-    root: PathBuf,
-    walks: std::sync::mpsc::Receiver<Walk>,
-    stopping: Arc<AtomicBool>,
-) {
-    let mut limit_logged = false;
-    let mut batch = vec![root.clone()];
-    loop {
-        // Take everything queued so far and collapse it: a root walk (a rescan after the kernel dropped events) covers every other request, and a burst of rescans is one walk, not a walk per overflow.
-        for request in walks.try_iter() {
-            match request {
-                Walk::Tree(dir) => batch.push(dir),
-                Walk::Stop => return,
-            }
-        }
-        if batch.contains(&root) {
-            batch = vec![root.clone()];
-        } else {
-            batch.sort();
-            batch.dedup();
-        }
-        for dir in batch.drain(..) {
-            if stopping.load(Ordering::Relaxed) {
+    /// Watch `names[depth..]`, each inside the one before, stopping at the first that cannot be resolved or watched. The directory at `names[..depth]` is checked first: it may have been replaced since its watch was placed, with the event saying so not yet applied.
+    fn extend(&mut self, names: &[Name], depth: usize, now: Instant, out: &mut Vec<EventItem>) {
+        let prefix = path_of(&names[..depth]);
+        let mut dir = match self.marks.open(&prefix) {
+            Ok(dir) => dir,
+            Err(e) => {
+                self.debug(|| format!("not watching under {}: {e}", shown(&prefix)));
                 return;
             }
-            walk_and_report(&mut watcher, &root, &dir, &stopping, &mut limit_logged);
+        };
+        if depth > 0 && !self.verify(&prefix, &dir, now, out) {
+            return;
         }
-        match walks.recv() {
-            Ok(Walk::Tree(dir)) => batch.push(dir),
-            Ok(Walk::Stop) | Err(_) => return,
+        for end in depth + 1..=names.len() {
+            let path = path_of(&names[..end]);
+            let child = match self.marks.open_child(&dir, &names[end - 1]) {
+                Ok(child) => child,
+                Err(e) => {
+                    self.debug(|| format!("not watching {}: {e}", shown(&path)));
+                    return;
+                }
+            };
+            if !self.install(&path, &child, now, out) {
+                return;
+            }
+            dir = child;
+        }
+    }
+
+    /// Whether `dir`, just opened at `path`, is the directory the table watches there. If it is another, what the table had there is dropped and `dir` watched in its place.
+    fn verify(
+        &mut self,
+        path: &Path,
+        dir: &M::Dir,
+        now: Instant,
+        out: &mut Vec<EventItem>,
+    ) -> bool {
+        let Some(State::Watched(wd)) = self.node(path).map(|node| node.mark.state) else {
+            return false;
+        };
+        match self.marks.add(dir) {
+            Ok(found) if found == wd => true,
+            Ok(found) => {
+                if let Some(stale) = self.detach(path) {
+                    self.drop_tree(stale, path.clone(), Some(out));
+                }
+                self.place(path, found, now, out)
+            }
+            Err(e) => {
+                self.debug(|| format!("cannot check {}: {e}", shown(path)));
+                false
+            }
+        }
+    }
+
+    /// Watch `dir`, resolved at `path` inside a directory the table has, and record it there. Returns whether `path` is now watched.
+    fn install(
+        &mut self,
+        path: &Path,
+        dir: &M::Dir,
+        now: Instant,
+        out: &mut Vec<EventItem>,
+    ) -> bool {
+        let mut added = self.marks.add(dir);
+        if added == Err(Errno::ENOSPC) && self.watched > 0 {
+            self.limited(path, now);
+            self.evict(path, now, out);
+            added = self.marks.add(dir);
+        }
+        match added {
+            Ok(wd) => self.place(path, wd, now, out),
+            Err(e) => {
+                self.count("unwatchable");
+                self.debug(|| format!("cannot watch {}: {e}", shown(path)));
+                let round = self.round.load(Ordering::Relaxed);
+                let state = State::Unwatchable {
+                    retry_at: now + UNWATCHABLE_RETRY,
+                };
+                self.put(path, Node::new(state, round), out);
+                false
+            }
+        }
+    }
+
+    /// Record the watch `wd` at `path`. A descriptor the table already has under another path is that directory, renamed before its move was reported, and it moves to `path` with everything below it; a new one may first make room within the budget.
+    fn place(&mut self, path: &Path, wd: M::Wd, now: Instant, out: &mut Vec<EventItem>) -> bool {
+        match self.by_wd.get(&wd).cloned() {
+            Some(old) if old == *path => true,
+            Some(old) => self.reroot(&old, path, out),
+            None => {
+                if self.watched >= self.budget_at(now) {
+                    self.evict(path, now, out);
+                }
+                self.by_wd.insert(wd, path.clone());
+                self.watched += 1;
+                let round = self.round.load(Ordering::Relaxed);
+                self.put(path, Node::new(State::Watched(wd), round), out);
+                true
+            }
+        }
+    }
+
+    /// The system ran out of watches before the budget did, other processes of this user holding the rest: watch no more than now for a while.
+    fn limited(&mut self, path: &Path, now: Instant) {
+        self.count("limited");
+        self.capped = Some((self.watched, now + LIMITED_HOLD));
+        self.notes.push(Note::Warn(format!(
+            "inotify watch limit reached at {} with {} directories watched; watching at most that many for the next {} minutes (raise fs.inotify.max_user_watches)",
+            shown(path),
+            self.watched,
+            LIMITED_HOLD.as_secs() / 60
+        )));
+    }
+
+    /// Make room for one more watch by dropping the directories used longest ago, each announced: a batch, or as many as it takes to get back within the budget. Only directories with nothing watched below them go, so every watched directory's parent stays watched; never the root, one held by a request or handle, or one on `keep`, the path being watched.
+    fn evict(&mut self, keep: &Path, now: Instant, out: &mut Vec<EventItem>) {
+        let budget = self.budget_at(now);
+        let over = (self.watched + 1).saturating_sub(budget);
+        let want = over.max((budget / 16).clamp(1, EVICT_BATCH));
+        // Whatever is used from here on is newer than everything this round considers.
+        self.round.fetch_add(1, Ordering::Relaxed);
+        let mut dropped = 0;
+        while dropped < want {
+            let mut leaves = Vec::new();
+            leaves_of(&self.root, &mut Vec::new(), keep.names(), &mut leaves);
+            if leaves.is_empty() {
+                break;
+            }
+            let take = (want - dropped).min(leaves.len());
+            leaves.select_nth_unstable_by(take - 1, |a, b| {
+                (a.0, std::cmp::Reverse(a.1.len()), &a.1).cmp(&(
+                    b.0,
+                    std::cmp::Reverse(b.1.len()),
+                    &b.1,
+                ))
+            });
+            for (_, names) in leaves.into_iter().take(take) {
+                let victim = path_of(&names);
+                if let Some(node) = self.detach(&victim) {
+                    self.drop_tree(node, victim, Some(out));
+                    self.count("evicted");
+                }
+            }
+            dropped += take;
+        }
+        if dropped == 0 {
+            self.debug(|| {
+                format!(
+                    "nothing could be dropped to watch {}; watching it beyond the budget",
+                    shown(keep)
+                )
+            });
+        } else if !self.evicted_logged {
+            self.notes.push(Note::Info(format!(
+                "{budget} directories watched, the most allowed (--watch-limit): from now on the ones used longest ago are dropped as others are needed, and clients told to drop what they cached under them"
+            )));
+            self.evicted_logged = true;
+        }
+    }
+
+    /// Move the directory at `from`, and everything below it, to `to`. Returns whether it was there to move.
+    fn reroot(&mut self, from: &Path, to: &Path, out: &mut Vec<EventItem>) -> bool {
+        let Some(mut node) = self.detach(from) else {
+            return false;
+        };
+        self.rekey(&mut node, to, out);
+        self.put(to, node, out);
+        true
+    }
+
+    /// Record `node`, and everything below it, under `path`. A directory below whose new path would be too long is dropped.
+    fn rekey(&mut self, node: &mut Node<M::Wd>, path: &Path, out: &mut Vec<EventItem>) {
+        if let State::Watched(wd) = node.mark.state {
+            self.by_wd.insert(wd, path.clone());
+        }
+        let names: Vec<Name> = node.children.keys().cloned().collect();
+        for name in names {
+            match path.join(name.clone()) {
+                Ok(child_path) => {
+                    let mut child = node.children.remove(&name).expect("listed just now");
+                    self.rekey(&mut child, &child_path, out);
+                    node.children.insert(name, child);
+                }
+                Err(_) => {
+                    let child = node.children.remove(&name).expect("listed just now");
+                    self.drop_tree(child, path.clone(), Some(out));
+                }
+            }
+        }
+    }
+
+    /// Record `node` at `path`, whose parent the table has; whatever was there is dropped.
+    fn put(&mut self, path: &Path, node: Node<M::Wd>, out: &mut Vec<EventItem>) {
+        let Some((parent, name)) = path.split_last() else {
+            return;
+        };
+        let displaced = match self.node_mut(&parent) {
+            Some(slot) => slot.children.insert(name.clone(), node),
+            None => Some(node),
+        };
+        if let Some(displaced) = displaced {
+            self.drop_tree(displaced, path.clone(), Some(out));
+        }
+    }
+
+    fn node(&self, path: &Path) -> Option<&Node<M::Wd>> {
+        path.names()
+            .iter()
+            .try_fold(&self.root, |node, name| node.children.get(name))
+    }
+
+    fn node_mut(&mut self, path: &Path) -> Option<&mut Node<M::Wd>> {
+        path.names()
+            .iter()
+            .try_fold(&mut self.root, |node, name| node.children.get_mut(name))
+    }
+
+    fn deepest_watched(&self, names: &[Name]) -> &Node<M::Wd> {
+        let mut node = &self.root;
+        for name in names {
+            match node.children.get(name) {
+                Some(child) if matches!(child.mark.state, State::Watched(_)) => node = child,
+                _ => break,
+            }
+        }
+        node
+    }
+
+    fn detach(&mut self, path: &Path) -> Option<Node<M::Wd>> {
+        let (parent, name) = path.split_last()?;
+        self.node_mut(&parent)?.children.remove(name)
+    }
+
+    /// Stop watching `node`, at `path`, and everything below it, announcing each watched directory in `out` when given. A directory below whose path would be too long is announced as `path`, which covers it.
+    fn drop_tree(&mut self, node: Node<M::Wd>, path: Path, mut out: Option<&mut Vec<EventItem>>) {
+        for (name, child) in node.children {
+            let child_path = path.join(name).unwrap_or_else(|_| path.clone());
+            self.drop_tree(child, child_path, out.as_deref_mut());
+        }
+        if let State::Watched(wd) = node.mark.state {
+            if self.by_wd.remove(&wd).is_some() {
+                self.marks.rm(wd);
+            }
+            self.watched -= 1;
+            if let Some(out) = out {
+                out.push(EventItem::Unwatched { dir: path });
+            }
+        }
+    }
+
+    /// Whether the directory the table has at `path` is still the one there. A request can watch a directory under its new name before the event that moved it away from the old one is applied, so a structural event is checked against the filesystem before it drops anything.
+    fn still_there(&mut self, path: &Path) -> bool {
+        let Some(State::Watched(wd)) = self.node(path).map(|node| node.mark.state) else {
+            return false;
+        };
+        let Ok(dir) = self.marks.open(path) else {
+            return false;
+        };
+        self.is(&dir, wd)
+    }
+
+    /// Whether `dir` is the directory watched as `wd`. Finding out watches it; a directory the table does not have has that watch taken off again.
+    fn is(&mut self, dir: &M::Dir, wd: M::Wd) -> bool {
+        match self.marks.add(dir) {
+            Ok(found) if found == wd => true,
+            Ok(found) => {
+                if !self.by_wd.contains_key(&found) {
+                    self.marks.rm(found);
+                }
+                false
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// After lost events, which may have moved or replaced any directory: keep each watched directory that is still where the table has it, inside a parent that is, and drop the rest, announced.
+    fn recheck(&mut self, out: &mut Vec<EventItem>) {
+        let children = std::mem::take(&mut self.root.children);
+        match self.marks.open(&Path::root()) {
+            Ok(root) => {
+                let kept = self.recheck_below(children, &root, &mut Vec::new(), out);
+                self.root.children = kept;
+            }
+            Err(e) => {
+                self.notes.push(Note::Warn(format!(
+                    "cannot open the export root to check its watches: {e}"
+                )));
+                for (name, node) in children {
+                    self.drop_tree(node, path_of(std::slice::from_ref(&name)), Some(out));
+                }
+            }
+        }
+    }
+
+    fn recheck_below(
+        &mut self,
+        children: HashMap<Name, Node<M::Wd>>,
+        parent: &M::Dir,
+        names: &mut Vec<Name>,
+        out: &mut Vec<EventItem>,
+    ) -> HashMap<Name, Node<M::Wd>> {
+        let mut kept = HashMap::new();
+        for (name, mut node) in children {
+            names.push(name.clone());
+            let here = match node.mark.state {
+                State::Watched(wd) => self
+                    .marks
+                    .open_child(parent, &name)
+                    .ok()
+                    .filter(|dir| self.is(dir, wd)),
+                State::Unwatchable { .. } => None,
+            };
+            match here {
+                Some(dir) => {
+                    node.children =
+                        self.recheck_below(std::mem::take(&mut node.children), &dir, names, out);
+                    kept.insert(name, node);
+                }
+                None => self.drop_tree(node, path_of(names), Some(out)),
+            }
+            names.pop();
+        }
+        kept
+    }
+
+    /// The root's own watch ended (the export was removed or unmounted): nothing is watched from here on. The watches still placed go with the inotify instance.
+    fn die(&mut self, why: AddWatchFlags) {
+        self.notes.push(Note::Warn(format!(
+            "the export root's own watch ended ({why:?}); change notification is off until a restart"
+        )));
+        self.root.children.clear();
+        self.by_wd.clear();
+        self.watched = 0;
+        self.dead = true;
+    }
+
+    /// What a non-structural event reports, into `out`.
+    fn report(&self, event: &RawEvent<M::Wd>, out: &mut Vec<EventItem>) -> Option<(Path, Name)> {
+        let dir = self.by_wd.get(&event.wd)?;
+        let Some(name) = &event.name else {
+            // A directory's own change, which its parent reports, except for the root's.
+            if dir.is_root()
+                && event
+                    .mask
+                    .intersects(AddWatchFlags::IN_MODIFY | AddWatchFlags::IN_ATTRIB)
+            {
+                out.push(EventItem::Data { path: dir.clone() });
+            }
+            return None;
+        };
+        let name = match Name::try_from(name.as_os_str()) {
+            Ok(name) => name,
+            Err(e) => {
+                tracing::debug!("a change in {} not reported: {e}", shown(dir));
+                return None;
+            }
+        };
+        out.extend(items_for(dir, event.mask, &name));
+        Some((dir.clone(), name))
+    }
+
+    /// Apply one read's worth of events, in order, putting what they report in `out`. A directory moved within the export keeps its watches under its new name when both halves of the move are in the batch; one moved out, or whose other half is not there, is dropped and announced.
+    fn apply(&mut self, events: Vec<RawEvent<M::Wd>>, out: &mut Vec<EventItem>) {
+        let mut moving: HashMap<u32, (Path, Node<M::Wd>)> = HashMap::new();
+        for event in events {
+            if self.dead {
+                break;
+            }
+            if event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
+                self.count("overflow");
+                self.notes.push(Note::Warn(
+                    "the inotify queue overflowed; clients will be told to rescan".into(),
+                ));
+                for (_, (path, node)) in moving.drain() {
+                    self.drop_tree(node, path, Some(out));
+                }
+                out.push(EventItem::Overflow);
+                self.recheck(out);
+                continue;
+            }
+            let Some(dir) = self.by_wd.get(&event.wd).cloned() else {
+                continue;
+            };
+            if event.mask.intersects(
+                AddWatchFlags::IN_IGNORED
+                    | AddWatchFlags::IN_UNMOUNT
+                    | AddWatchFlags::IN_DELETE_SELF,
+            ) {
+                if dir.is_root() {
+                    self.die(event.mask);
+                    out.push(EventItem::Overflow);
+                } else if event.mask.contains(AddWatchFlags::IN_IGNORED) {
+                    // The directory is gone; its parent reported that.
+                    if let Some(node) = self.detach(&dir) {
+                        self.drop_tree(node, dir, None);
+                    }
+                }
+                continue;
+            }
+            // A move of a watched directory is acted on from its parent's events; one of the root changes no path below it.
+            if event.mask.contains(AddWatchFlags::IN_MOVE_SELF) {
+                continue;
+            }
+            let Some((dir, name)) = self.report(&event, out) else {
+                continue;
+            };
+            if !event.mask.contains(AddWatchFlags::IN_ISDIR) {
+                continue;
+            }
+            let Ok(path) = dir.join(name) else {
+                continue;
+            };
+            if event.mask.contains(AddWatchFlags::IN_MOVED_FROM) {
+                if !self.still_there(&path) {
+                    if let Some(node) = self.detach(&path) {
+                        moving.insert(event.cookie, (path, node));
+                    }
+                }
+            } else if event.mask.contains(AddWatchFlags::IN_MOVED_TO) {
+                let arrived = moving.remove(&event.cookie);
+                if self.still_there(&path) {
+                    if let Some((from, node)) = arrived {
+                        self.drop_tree(node, from, Some(out));
+                    }
+                } else {
+                    if let Some(old) = self.detach(&path) {
+                        self.drop_tree(old, path.clone(), Some(out));
+                    }
+                    if let Some((_, mut node)) = arrived {
+                        self.rekey(&mut node, &path, out);
+                        self.put(&path, node, out);
+                    }
+                }
+            } else if event.mask.contains(AddWatchFlags::IN_DELETE) && !self.still_there(&path) {
+                if let Some(node) = self.detach(&path) {
+                    self.drop_tree(node, path, Some(out));
+                }
+            }
+        }
+        for (_, (path, node)) in moving {
+            self.drop_tree(node, path, Some(out));
         }
     }
 }
 
-/// One walk and its log lines: a root walk at info, any other at debug, a root that cannot be watched at all as the error it is.
-fn walk_and_report(
-    watcher: &mut notify::RecommendedWatcher,
-    root: &std::path::Path,
-    dir: &std::path::Path,
-    stopping: &AtomicBool,
-    limit_logged: &mut bool,
+/// Every directory below `node` (at `names`) that eviction may take, with when it was last used: watched, with nothing watched below it, not held, and not on `keep`.
+fn leaves_of<W>(
+    node: &Node<W>,
+    names: &mut Vec<Name>,
+    keep: &[Name],
+    leaves: &mut Vec<(u64, Vec<Name>)>,
 ) {
-    let outcome = match watch_tree(watcher, dir, stopping) {
-        // A walk cut short by shutdown has no census worth reporting.
-        Ok(_) if stopping.load(Ordering::Relaxed) => return,
-        Ok(outcome) => outcome,
-        Err(e) if dir == root => {
-            tracing::error!(
-                "cannot watch {}: {e}; change notification disabled",
-                root.display()
-            );
-            return;
+    for (name, child) in &node.children {
+        if !matches!(child.mark.state, State::Watched(_)) {
+            continue;
+        }
+        names.push(name.clone());
+        let watched_below = child
+            .children
+            .values()
+            .any(|c| matches!(c.mark.state, State::Watched(_)));
+        if watched_below {
+            leaves_of(child, names, keep, leaves);
+        } else if child.mark.holds.load(Ordering::Relaxed) == 0 && !keep.starts_with(names) {
+            leaves.push((child.mark.used.load(Ordering::Relaxed), names.clone()));
+        }
+        names.pop();
+    }
+}
+
+/// The budget for a `fs.inotify.max_user_watches` read as `sysctl`.
+fn budget_from(sysctl: std::io::Result<String>) -> usize {
+    match sysctl.map(|text| text.trim().parse::<usize>()) {
+        Ok(Ok(limit)) => (limit / 2).clamp(1, BUDGET_MAX),
+        Ok(Err(e)) => {
+            tracing::warn!("fs.inotify.max_user_watches does not parse ({e}); watching at most {BUDGET_FALLBACK} directories");
+            BUDGET_FALLBACK
         }
         Err(e) => {
-            log_skip(dir, &e);
-            return;
-        }
-    };
-    if dir == root {
-        tracing::info!(
-            "watching {} directories under {} ({} skipped)",
-            outcome.watched,
-            root.display(),
-            outcome.skipped
-        );
-    } else {
-        tracing::debug!(
-            "watching {} directories under {} ({} skipped)",
-            outcome.watched,
-            dir.display(),
-            outcome.skipped
-        );
-    }
-    if let Some(at) = outcome.limit_hit {
-        if *limit_logged {
-            tracing::debug!("inotify watch limit reached at {}", at.display());
-        } else {
-            tracing::error!("inotify watch limit reached at {}; directories beyond it stay unwatched (raise fs.inotify.max_user_watches and restart)", at.display());
-            *limit_logged = true;
+            tracing::warn!("cannot read fs.inotify.max_user_watches ({e}); watching at most {BUDGET_FALLBACK} directories");
+            BUDGET_FALLBACK
         }
     }
 }
 
-/// Keeps change notification alive. Dropping it stops the walker thread, which drops the inotify watcher, and aborts the debounce task.
+/// How many directories to watch at most, besides the export root, when `--watch-limit` does not say.
+pub fn default_budget() -> usize {
+    budget_from(std::fs::read_to_string(
+        "/proc/sys/fs/inotify/max_user_watches",
+    ))
+}
+
+fn write_notes(notes: Vec<Note>) {
+    for note in notes {
+        match note {
+            Note::Warn(line) => tracing::warn!("{line}"),
+            Note::Info(line) => tracing::info!("{line}"),
+            Note::Debug(line) => tracing::debug!("{line}"),
+        }
+    }
+}
+
+/// The watch table, shared by every request and the event thread.
+pub struct Watches {
+    inner: Option<Inner>,
+}
+
+struct Inner {
+    table: RwLock<Table<Inotified>>,
+    pending: Mutex<Pending>,
+    inotify: Arc<Inotify>,
+}
+
+impl Watches {
+    /// A table that watches nothing, for a server without change notification.
+    pub fn disabled() -> Arc<Watches> {
+        Arc::new(Watches { inner: None })
+    }
+
+    /// Watch every directory `req` names ([`dirs_named`]) before it runs. The guards keep them watched until they are dropped, which is to be after the reply is sent.
+    pub fn arm_request(&self, req: &Request) -> Vec<Armed> {
+        if self.inner.is_none() {
+            return Vec::new();
+        }
+        dirs_named(req)
+            .iter()
+            .filter_map(|dir| self.arm(dir))
+            .collect()
+    }
+
+    /// Keep `dir` watched for as long as a handle opened there lives: the kernel trusts what it caches for a file held open, so changes to it must keep coming. The request that opened it has just watched `dir`, so this finds it watched.
+    pub fn hold(&self, dir: &Path) -> Option<Arc<Armed>> {
+        self.arm(dir).map(Arc::new)
+    }
+
+    /// Log how many directories are watched and what the table did since the last report.
+    pub fn report(&self) {
+        let Some(inner) = &self.inner else {
+            tracing::info!(target: TRACE_TARGET, "perf watches: change notification is off");
+            return;
+        };
+        let (watched, budget, line) = {
+            let table = inner.table.read();
+            let line = table.counts.lock().take("watch events").1;
+            let budget = match table.capped {
+                Some((cap, until)) if Instant::now() < until => cap,
+                _ => table.budget,
+            };
+            (table.watched, budget, line)
+        };
+        tracing::info!(target: TRACE_TARGET, "perf watches watched={watched} limit={budget}");
+        if let Some(line) = line {
+            tracing::info!(target: TRACE_TARGET, "{line}");
+        }
+    }
+
+    /// Directories watched besides the export root.
+    pub fn watched(&self) -> usize {
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.table.read().watched)
+    }
+
+    /// Watch `dir` and every directory above it. `None` when nothing on the path is watched, as on a table that watches nothing.
+    pub fn arm(&self, dir: &Path) -> Option<Armed> {
+        let inner = self.inner.as_ref()?;
+        let now = Instant::now();
+        if let Touched::Done(held) = inner.table.read().touch(dir, now) {
+            return held;
+        }
+        let (held, notes) = {
+            let mut table = inner.table.write();
+            let mut out = Vec::new();
+            let held = table.arm(dir, now, &mut out);
+            // Folded while the table is still held, so notices keep their order with the events applied under it.
+            let mut pending = inner.pending.lock();
+            for item in out {
+                pending.fold(item, None);
+            }
+            (held, std::mem::take(&mut table.notes))
+        };
+        write_notes(notes);
+        held
+    }
+}
+
+/// Events read at most before they are applied, so a storm still lets batches go out.
+const READS_PER_APPLY: usize = 64;
+
+fn read_events(inotify: &Inotify) -> Vec<RawEvent<WatchDescriptor>> {
+    let mut events = Vec::new();
+    for _ in 0..READS_PER_APPLY {
+        match inotify.read_events() {
+            Ok(read) => events.extend(read.into_iter().map(|e| RawEvent {
+                wd: e.wd,
+                mask: e.mask,
+                cookie: e.cookie,
+                name: e.name,
+            })),
+            Err(Errno::EAGAIN) => break,
+            Err(Errno::EINTR) => {}
+            Err(e) => {
+                tracing::warn!("reading inotify events: {e}");
+                break;
+            }
+        }
+    }
+    events
+}
+
+/// Read events as they come, apply them to the table, and send what they report every [`DEBOUNCE_WINDOW`], until `stop` is signalled.
+fn run_events(
+    watches: &Watches,
+    stop: &EventFd,
+    changes: &ChangeLog,
+    events: &broadcast::Sender<Arc<EventBatch>>,
+) {
+    let inner = watches
+        .inner
+        .as_ref()
+        .expect("an event thread runs only for a table that watches");
+    let flush = || {
+        let batch = inner.pending.lock().flush();
+        if let Some(batch) = batch {
+            if events.send(Arc::new(batch)).is_err() {
+                tracing::trace!("change batch dropped: no sessions");
+            }
+        }
+    };
+    let mut flush_at = Instant::now() + DEBOUNCE_WINDOW;
+    loop {
+        let wait = PollTimeout::try_from(flush_at.saturating_duration_since(Instant::now()))
+            .unwrap_or(PollTimeout::ZERO);
+        let mut fds = [
+            PollFd::new(inner.inotify.as_fd(), PollFlags::POLLIN),
+            PollFd::new(stop.as_fd(), PollFlags::POLLIN),
+        ];
+        match poll(&mut fds, wait) {
+            Ok(_) | Err(Errno::EINTR) => {}
+            Err(e) => {
+                tracing::error!(
+                    "waiting for inotify events: {e}; change notification is off until a restart"
+                );
+                let notes = {
+                    let mut table = inner.table.write();
+                    table.die(AddWatchFlags::empty());
+                    fold_events(&inner.pending, changes, vec![EventItem::Overflow]);
+                    std::mem::take(&mut table.notes)
+                };
+                write_notes(notes);
+                flush();
+                return;
+            }
+        }
+        let ready = |fd: &PollFd<'_>| fd.revents().is_some_and(|r| !r.is_empty());
+        if ready(&fds[1]) {
+            return;
+        }
+        if ready(&fds[0]) {
+            let raw = read_events(&inner.inotify);
+            let mut out = Vec::new();
+            if raw.iter().any(structural) {
+                let notes = {
+                    let mut table = inner.table.write();
+                    table.apply(raw, &mut out);
+                    fold_events(&inner.pending, changes, out);
+                    std::mem::take(&mut table.notes)
+                };
+                write_notes(notes);
+            } else {
+                let table = inner.table.read();
+                for event in &raw {
+                    table.report(event, &mut out);
+                }
+                fold_events(&inner.pending, changes, out);
+            }
+        }
+        if Instant::now() >= flush_at {
+            flush_at = Instant::now() + DEBOUNCE_WINDOW;
+            flush();
+        }
+    }
+}
+
+fn fold_events(pending: &Mutex<Pending>, changes: &ChangeLog, items: Vec<EventItem>) {
+    let mut pending = pending.lock();
+    for item in items {
+        let origin = origin_key(&item).and_then(|key| changes.take_origin(&key));
+        pending.fold(item, origin);
+    }
+}
+
+/// Keeps change notification running: dropping it stops the event thread. The inotify instance closes with the last [`Watches`].
 pub struct WatcherHandle {
-    walks: std::sync::mpsc::Sender<Walk>,
-    stopping: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<()>,
+    stop: Arc<EventFd>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for WatcherHandle {
     fn drop(&mut self) {
-        // The flag ends a walk in progress; the message wakes the walker if it is idle. Dropping this sender would not: the event handler holds one too, inside the watcher the walker owns.
-        self.stopping.store(true, Ordering::Relaxed);
-        if self.walks.send(Walk::Stop).is_err() {
-            tracing::debug!("watch walker had already stopped");
+        if let Err(e) = self.stop.write(1) {
+            tracing::warn!("cannot stop the watch event thread: {e}");
+            return;
         }
-        self.task.abort();
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                tracing::error!("the watch event thread panicked");
+            }
+        }
     }
 }
 
-/// Start watching `export_dir` and everything under it. Returns `None` (after logging) when no watcher can be created, in which case clients fall back to their cache TTLs; a root that cannot be watched is logged by the walker to the same effect. Watches are placed by a background walk, so the first changes after startup may arrive on a large export before its watch does; the TTL covers those too.
+/// Start change notification for `export`, which logs show as `shown_root`. The root is watched at once and every other directory as requests name it ([`Watches::arm_request`]), `budget` of them at most. Without inotify, or when the root cannot be watched, the table watches nothing (logged) and clients fall back to their cache TTLs.
 pub fn spawn(
-    export_dir: &std::path::Path,
+    export: Arc<Export>,
+    shown_root: &std::path::Path,
+    budget: usize,
     changes: Arc<ChangeLog>,
     events: broadcast::Sender<Arc<EventBatch>>,
-) -> Option<WatcherHandle> {
-    let root = match export_dir.canonicalize() {
-        Ok(root) => root,
-        Err(e) => {
-            tracing::error!(
-                "cannot canonicalize {}: {e}; change notification disabled",
-                export_dir.display()
-            );
-            return None;
-        }
+) -> (Arc<Watches>, Option<WatcherHandle>) {
+    let disabled = |why: String| {
+        tracing::error!("{why}; change notification disabled");
+        (Watches::disabled(), None)
     };
-    let (raw_tx, raw_rx) = mpsc::channel::<notify::Event>(RAW_QUEUE);
-    let (walk_tx, walk_rx) = std::sync::mpsc::channel::<Walk>();
-    let stopping = Arc::new(AtomicBool::new(false));
-    let dropped = Arc::new(AtomicBool::new(false));
-    let dropped_by_handler = dropped.clone();
-    let handler = {
-        let root = root.clone();
-        let walks = walk_tx.clone();
-        // Watches for new directories are requested from here rather than from the debounce task so that a full raw queue can only ever lose client notifications, never watches. The handler cannot add them itself: a watch request waits on the event loop that is running the handler.
-        let request = move |dir: PathBuf| {
-            if walks.send(Walk::Tree(dir)).is_err() {
-                tracing::debug!("watch walker has stopped; new directories go unwatched");
-            }
-        };
-        move |result: notify::Result<notify::Event>| match result {
-            Ok(event) => {
-                // Opens, which the server itself generates in bulk, produce nothing downstream.
-                if matches!(event.kind, EventKind::Access(_)) {
-                    return;
-                }
-                // The kernel dropped events, possibly directory creations: re-walk everything.
-                if event.need_rescan() {
-                    request(root.clone());
-                }
-                for dir in arrivals(&event) {
-                    request(dir);
-                }
-                if raw_tx.try_send(event).is_err() {
-                    dropped_by_handler.store(true, Ordering::Relaxed);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("inotify error: {e}");
-                dropped_by_handler.store(true, Ordering::Relaxed);
-            }
-        }
+    let inotify = match Inotify::init(InitFlags::IN_NONBLOCK | InitFlags::IN_CLOEXEC) {
+        Ok(inotify) => Arc::new(inotify),
+        Err(e) => return disabled(format!("cannot create an inotify instance: {e}")),
     };
-    let watcher = match notify::recommended_watcher(handler) {
-        Ok(watcher) => watcher,
-        Err(e) => {
-            tracing::error!(
-                "cannot create a filesystem watcher: {e}; change notification disabled"
-            );
-            return None;
-        }
+    let table = match Table::new(
+        Inotified {
+            inotify: inotify.clone(),
+            export,
+        },
+        budget,
+    ) {
+        Ok(table) => table,
+        Err(e) => return disabled(format!("cannot watch {}: {e}", shown_root.display())),
     };
+    let stop = match EventFd::from_flags(EfdFlags::EFD_CLOEXEC | EfdFlags::EFD_NONBLOCK) {
+        Ok(stop) => Arc::new(stop),
+        Err(e) => return disabled(format!("cannot create the watch thread's stop signal: {e}")),
+    };
+    let watches = Arc::new(Watches {
+        inner: Some(Inner {
+            table: RwLock::new(table),
+            pending: Mutex::new(Pending::default()),
+            inotify,
+        }),
+    });
     let spawned = std::thread::Builder::new()
-        .name("watch-walker".into())
+        .name("watch-events".into())
         .spawn({
-            let root = root.clone();
-            let stopping = stopping.clone();
-            move || walker(watcher, root, walk_rx, stopping)
+            let watches = watches.clone();
+            let stop = stop.clone();
+            move || run_events(&watches, &stop, &changes, &events)
         });
-    if let Err(e) = spawned {
-        tracing::error!("cannot start the watch walker thread: {e}; change notification disabled");
-        return None;
-    }
-    let task = tokio::spawn(debounce(root, raw_rx, dropped, changes, events));
-    Some(WatcherHandle {
-        walks: walk_tx,
-        stopping,
-        task,
-    })
-}
-
-async fn debounce(
-    root: PathBuf,
-    mut raw: mpsc::Receiver<notify::Event>,
-    dropped: Arc<AtomicBool>,
-    changes: Arc<ChangeLog>,
-    events: broadcast::Sender<Arc<EventBatch>>,
-) {
-    let mut pending = Pending::default();
-    let mut tick = tokio::time::interval(DEBOUNCE_WINDOW);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            received = raw.recv() => {
-                let Some(event) = received else { break };
-                for item in items_for(&root, &event) {
-                    let origin = origin_key(&item).and_then(|key| changes.take_origin(&key));
-                    pending.fold(item, origin);
-                }
-            }
-            _ = tick.tick() => {
-                if dropped.swap(false, Ordering::Relaxed) {
-                    tracing::warn!("raw inotify queue overflowed; clients will be told to rescan");
-                    pending.fold(EventItem::Overflow, None);
-                }
-                if let Some(batch) = pending.flush() {
-                    if events.send(Arc::new(batch)).is_err() {
-                        tracing::trace!("change batch dropped: no sessions");
-                    }
-                }
-            }
+    match spawned {
+        Ok(thread) => {
+            tracing::info!(
+                "watching directories under {} as clients use them, at most {budget}",
+                shown_root.display()
+            );
+            (
+                watches,
+                Some(WatcherHandle {
+                    stop,
+                    thread: Some(thread),
+                }),
+            )
         }
+        Err(e) => disabled(format!("cannot start the watch event thread: {e}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn name(s: &str) -> Name {
         Name::new(s.as_bytes()).unwrap()
     }
 
-    fn entry(dir: &str, n: &str) -> EventItem {
-        let dir = if dir.is_empty() {
+    fn path(s: &str) -> Path {
+        if s.is_empty() {
             Path::root()
         } else {
-            Path::from_names(dir.split('/').map(name).collect()).unwrap()
-        };
-        EventItem::Entry { dir, name: name(n) }
+            Path::from_names(s.split('/').map(name).collect()).unwrap()
+        }
+    }
+
+    fn entry(dir: &str, n: &str) -> EventItem {
+        EventItem::Entry {
+            dir: path(dir),
+            name: name(n),
+        }
+    }
+
+    fn unwatched(dir: &str) -> EventItem {
+        EventItem::Unwatched { dir: path(dir) }
     }
 
     #[test]
@@ -585,91 +1341,6 @@ mod tests {
     }
 
     #[test]
-    fn notify_events_map_to_items() {
-        let root = std::path::Path::new("/export");
-        let ev = |kind: EventKind, paths: &[&str]| notify::Event {
-            kind,
-            paths: paths.iter().map(PathBuf::from).collect(),
-            attrs: Default::default(),
-        };
-        assert_eq!(
-            items_for(
-                root,
-                &ev(
-                    EventKind::Create(notify::event::CreateKind::File),
-                    &["/export/d/new"]
-                )
-            ),
-            vec![entry("d", "new")]
-        );
-        assert_eq!(
-            items_for(
-                root,
-                &ev(
-                    EventKind::Remove(notify::event::RemoveKind::Any),
-                    &["/export/gone"]
-                )
-            ),
-            vec![entry("", "gone")]
-        );
-        assert_eq!(
-            items_for(
-                root,
-                &ev(
-                    EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-                    &["/export/a", "/export/d/b"]
-                )
-            ),
-            vec![entry("", "a"), entry("d", "b")]
-        );
-        assert_eq!(
-            items_for(
-                root,
-                &ev(
-                    EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
-                    &["/export/f"]
-                )
-            ),
-            vec![EventItem::Data {
-                path: Path::from_names(vec![name("f")]).unwrap()
-            }]
-        );
-        assert!(items_for(
-            root,
-            &ev(
-                EventKind::Access(notify::event::AccessKind::Any),
-                &["/export/f"]
-            )
-        )
-        .is_empty());
-        assert!(
-            items_for(
-                root,
-                &ev(
-                    EventKind::Create(notify::event::CreateKind::File),
-                    &["/elsewhere/x"]
-                )
-            )
-            .is_empty(),
-            "paths outside the root are ignored"
-        );
-        assert!(
-            items_for(
-                root,
-                &ev(
-                    EventKind::Create(notify::event::CreateKind::File),
-                    &["/export"]
-                )
-            )
-            .is_empty(),
-            "the root itself has no parent entry"
-        );
-        let mut rescan = ev(EventKind::Other, &[]);
-        rescan.attrs.set_flag(notify::event::Flag::Rescan);
-        assert_eq!(items_for(root, &rescan), vec![EventItem::Overflow]);
-    }
-
-    #[test]
     fn change_log_records_are_consumed_once() {
         let log = ChangeLog::default();
         let p = Path::from_names(vec![name("d"), name("f")]).unwrap();
@@ -702,196 +1373,980 @@ mod tests {
     }
 
     #[test]
-    fn arrivals_are_directory_creates_and_rename_destinations() {
-        let ev = |kind: EventKind, paths: &[&std::path::Path]| notify::Event {
-            kind,
-            paths: paths.iter().map(PathBuf::from).collect(),
-            attrs: Default::default(),
-        };
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("d");
-        let file = tmp.path().join("f");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::write(&file, b"x").unwrap();
-        let gone = tmp.path().join("gone");
-        assert_eq!(
-            arrivals(&ev(EventKind::Create(CreateKind::Folder), &[&gone])),
-            std::slice::from_ref(&gone),
-            "the kernel said directory; no stat needed"
-        );
-        assert_eq!(
-            arrivals(&ev(
-                EventKind::Modify(ModifyKind::Name(RenameMode::To)),
-                &[&dir, &file, &gone]
-            )),
-            std::slice::from_ref(&dir),
-            "only rename destinations that are directories"
-        );
-        for kind in [
-            EventKind::Create(CreateKind::File),
-            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
-            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
-            EventKind::Modify(ModifyKind::Data(notify::event::DataChange::Any)),
-            EventKind::Remove(notify::event::RemoveKind::Folder),
-        ] {
-            assert!(
-                arrivals(&ev(kind, &[&dir])).is_empty(),
-                "{kind:?} brings no directory into the tree"
-            );
-        }
+    fn a_notice_is_never_taken_for_a_sessions_own_change() {
+        assert_eq!(origin_key(&unwatched("d")), None);
+        assert_eq!(origin_key(&entry("d", "f")), Some("d/f".into()));
     }
 
-    /// Restores a directory's mode on drop, so a failed assertion does not leave a tempdir that cannot be removed.
-    struct ModeGuard(PathBuf);
-
-    impl Drop for ModeGuard {
-        fn drop(&mut self) {
-            use std::os::unix::fs::PermissionsExt;
-            // Not unwrapped: a panic here during an assertion failure's unwind would abort the whole test binary.
-            if let Err(e) =
-                std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755))
-            {
-                eprintln!("cannot restore the mode of {}: {e}", self.0.display());
-            }
+    #[test]
+    fn events_map_to_items() {
+        let dir = path("d");
+        assert_eq!(
+            items_for(&dir, AddWatchFlags::IN_CREATE, &name("n")),
+            vec![entry("d", "n")]
+        );
+        for mask in [
+            AddWatchFlags::IN_DELETE,
+            AddWatchFlags::IN_MOVED_FROM,
+            AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_ISDIR,
+        ] {
+            assert_eq!(
+                items_for(&dir, mask, &name("n")),
+                vec![entry("d", "n")],
+                "{mask:?}"
+            );
+        }
+        for mask in [AddWatchFlags::IN_MODIFY, AddWatchFlags::IN_ATTRIB] {
+            assert_eq!(
+                items_for(&dir, mask, &name("n")),
+                vec![EventItem::Data { path: path("d/n") }],
+                "{mask:?}"
+            );
         }
     }
 
     #[test]
-    fn watch_tree_skips_unlistable_directories() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let top = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(top.join("a/b")).unwrap();
-        let c = top.join("c");
-        std::fs::create_dir(&c).unwrap();
-        std::fs::set_permissions(&c, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let _restore = ModeGuard(c.clone());
-        if std::fs::read_dir(&c).is_ok() {
-            eprintln!("mode bits are not enforced for this user; nothing to test");
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher =
-            notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
-                // The receiver is gone once the test has what it needs.
-                let _ = tx.send(result);
-            })
-            .unwrap();
-        let outcome = watch_tree(&mut watcher, &top, &AtomicBool::new(false)).unwrap();
-        assert_eq!(outcome.watched, 3, "top, a and a/b");
-        assert_eq!(outcome.skipped, 1, "c");
-        assert!(outcome.limit_hit.is_none());
-        let err = watch_tree(&mut watcher, &c, &AtomicBool::new(false)).unwrap_err();
+    fn requests_name_the_directories_they_watch() {
+        let named = |req: Request| dirs_named(&req);
         assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::PermissionDenied,
-            "the top itself failing is the error"
+            named(Request::Lookup {
+                parent: path("a/b"),
+                name: name("x")
+            }),
+            vec![path("a/b")]
         );
-        let file = top.join("a/b/f");
-        std::fs::write(&file, b"x").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let event = rx
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .expect("no create event for a/b/f before the deadline")
-                .unwrap();
-            if matches!(event.kind, EventKind::Create(_)) && event.paths.contains(&file) {
-                break;
-            }
+        assert_eq!(
+            named(Request::Rename {
+                parent: path("a"),
+                name: name("x"),
+                newparent: path("b"),
+                newname: name("y"),
+                flags: 0
+            }),
+            vec![path("a"), path("b")]
+        );
+        assert_eq!(
+            named(Request::Link {
+                path: path("a/f"),
+                newparent: path("b"),
+                newname: name("g")
+            }),
+            vec![path("a"), path("b")]
+        );
+        assert_eq!(
+            named(Request::Getattr {
+                path: Some(path("a/f")),
+                fh: None
+            }),
+            vec![path("a")]
+        );
+        assert_eq!(
+            named(Request::Getattr {
+                path: Some(Path::root()),
+                fh: None
+            }),
+            vec![Path::root()],
+            "the root is its own"
+        );
+        assert!(
+            named(Request::Getattr {
+                path: None,
+                fh: Some(1)
+            })
+            .is_empty(),
+            "an unlinked open file is in no directory"
+        );
+        assert_eq!(
+            named(Request::Opendir {
+                fh: 3,
+                path: path("a/d")
+            }),
+            vec![path("a/d")],
+            "a listing watches the directory listed"
+        );
+        for req in [
+            Request::Read {
+                fh: 1,
+                offset: 0,
+                size: 1,
+            },
+            Request::Readdir {
+                fh: 2,
+                offset: 0,
+                max_bytes: 4096,
+            },
+            Request::Release { fh: 1 },
+            Request::Statfs { path: path("a") },
+        ] {
+            assert!(named(req.clone()).is_empty(), "{req:?}");
         }
     }
 
-    /// Create files under `dir` until a batch reports an entry there, failing after 5 s. The walk that watches a new directory runs on its own thread, so the first files may land before the watch does.
-    async fn wait_until_watched(
-        events: &mut broadcast::Receiver<Arc<EventBatch>>,
-        root: &std::path::Path,
-        dir: &str,
-    ) {
-        let target = if dir.is_empty() {
-            Path::root()
-        } else {
-            Path::from_names(dir.split('/').map(name).collect()).unwrap()
-        };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        for i in 0.. {
-            assert!(
-                Instant::now() < deadline,
-                "no entry event under {dir} before the deadline"
-            );
-            std::fs::write(root.join(dir).join(format!("f{i}")), b"x").unwrap();
-            while let Ok(batch) =
-                tokio::time::timeout(Duration::from_millis(50), events.recv()).await
-            {
-                let batch = batch.unwrap();
-                if batch
-                    .items
-                    .iter()
-                    .any(|(item, _)| matches!(item, EventItem::Entry { dir, .. } if *dir == target))
-                {
-                    return;
+    /// A directory tree in memory, watched the way inotify watches: one descriptor per watched directory, the same one for a second `add`, and none once the directory is removed. Inode 1 is the root. The `*_reporting` changes return the events inotify would queue for them.
+    #[derive(Default)]
+    struct Fake {
+        state: Mutex<FakeState>,
+    }
+
+    #[derive(Default)]
+    struct FakeState {
+        dirs: HashMap<u64, HashMap<Name, u64>>,
+        next_ino: u64,
+        watches: HashMap<u64, u32>,
+        next_wd: u32,
+        next_cookie: u32,
+        refused: HashMap<u64, Errno>,
+        calls: Vec<String>,
+    }
+
+    impl FakeState {
+        fn ino_of(&self, p: &Path) -> Option<u64> {
+            p.names()
+                .iter()
+                .try_fold(1, |ino, name| self.dirs.get(&ino)?.get(name).copied())
+        }
+
+        /// Where `ino` is now, for the call log.
+        fn shown(&self, ino: u64) -> String {
+            if ino == 1 {
+                return "/".into();
+            }
+            for (parent, children) in &self.dirs {
+                for (name, child) in children {
+                    if *child == ino {
+                        let above = self.shown(*parent);
+                        return if above == "/" {
+                            name.to_string()
+                        } else {
+                            format!("{above}/{name}")
+                        };
+                    }
                 }
             }
+            format!("#{ino}")
+        }
+
+        fn event(
+            &self,
+            ino: u64,
+            mask: AddWatchFlags,
+            cookie: u32,
+            name: Option<&Name>,
+        ) -> Option<RawEvent<u32>> {
+            Some(RawEvent {
+                wd: *self.watches.get(&ino)?,
+                mask,
+                cookie,
+                name: name.map(|n| n.as_os_str().to_os_string()),
+            })
         }
     }
 
-    #[tokio::test]
-    async fn new_directories_are_watched() {
-        let tmp = tempfile::tempdir().unwrap();
-        let export = tmp.path().join("export");
-        let staging = tmp.path().join("staging");
-        std::fs::create_dir(&export).unwrap();
-        std::fs::create_dir(&staging).unwrap();
-        let export = export.canonicalize().unwrap();
-        let (events, mut rx) = broadcast::channel(256);
-        let _watcher = spawn(&export, Arc::new(ChangeLog::default()), events).expect("watcher");
-        // Until the root walk has listed the (empty) root, a directory created there would be found by that listing rather than by its own create event, which is the path under test. An event from the root takes at least one debounce window to arrive, by which time the listing is long done.
-        wait_until_watched(&mut rx, &export, "").await;
-
-        std::fs::create_dir(export.join("d")).unwrap();
-        wait_until_watched(&mut rx, &export, "d").await;
-
-        std::fs::create_dir_all(staging.join("e/sub")).unwrap();
-        std::fs::rename(staging.join("e"), export.join("e")).unwrap();
-        wait_until_watched(&mut rx, &export, "e/sub").await;
-    }
-
-    #[tokio::test]
-    async fn reads_do_not_fill_the_change_queue() {
-        let tmp = tempfile::tempdir().unwrap();
-        let export = tmp.path().canonicalize().unwrap();
-        let file = export.join("f");
-        std::fs::write(&file, b"x").unwrap();
-        let (events, mut rx) = broadcast::channel(256);
-        let _watcher = spawn(&export, Arc::new(ChangeLog::default()), events).expect("watcher");
-        wait_until_watched(&mut rx, &export, "").await;
-        // Well over RAW_QUEUE opens while the debounce task cannot run (this runtime is single-threaded and we are not awaiting).
-        for _ in 0..(RAW_QUEUE * 5) {
-            std::fs::read(&file).unwrap();
+    impl Fake {
+        fn new(dirs: &[&str]) -> Fake {
+            let fake = Fake::default();
+            {
+                let mut state = fake.state.lock();
+                state.dirs.insert(1, HashMap::new());
+                state.next_ino = 2;
+            }
+            for dir in dirs {
+                fake.mkdir(dir);
+            }
+            fake
         }
-        // Whatever those opens produced is in the next window; a write afterwards proves the pipeline is still live and marks the end.
-        std::fs::write(&file, b"y").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            assert!(
-                Instant::now() < deadline,
-                "no batch for the write before the deadline"
-            );
-            let Ok(batch) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await else {
-                continue;
-            };
-            let batch = batch.unwrap();
-            assert!(
-                !batch
-                    .items
-                    .iter()
-                    .any(|(item, _)| matches!(item, EventItem::Overflow)),
-                "reads must not overflow the queue"
-            );
-            if batch.items.iter().any(
-                |(item, _)| matches!(item, EventItem::Data { path } if path.to_os_string() == "f"),
-            ) {
-                break;
+
+        fn mkdir(&self, p: &str) {
+            let mut state = self.state.lock();
+            let mut ino = 1;
+            for name in path(p).names() {
+                ino = match state.dirs[&ino].get(name) {
+                    Some(child) => *child,
+                    None => {
+                        let child = state.next_ino;
+                        state.next_ino += 1;
+                        state.dirs.insert(child, HashMap::new());
+                        state
+                            .dirs
+                            .get_mut(&ino)
+                            .unwrap()
+                            .insert(name.clone(), child);
+                        child
+                    }
+                };
             }
         }
+
+        /// Take `p` out of its parent; with `to`, put it there instead, replacing what was there.
+        fn mv(&self, p: &str, to: Option<&str>) {
+            self.mv_reporting(&path(p), to.map(path).as_ref());
+        }
+
+        /// As [`Fake::mv`], `to` naming no directory yet.
+        fn mv_reporting(&self, from: &Path, to: Option<&Path>) -> Vec<RawEvent<u32>> {
+            let mut state = self.state.lock();
+            let (parent, last) = from.split_last().unwrap();
+            let parent = state.ino_of(&parent).unwrap();
+            let ino = state.dirs.get_mut(&parent).unwrap().remove(last).unwrap();
+            state.next_cookie += 1;
+            let cookie = state.next_cookie;
+            let mut events = Vec::new();
+            events.extend(state.event(
+                parent,
+                AddWatchFlags::IN_MOVED_FROM | DIR,
+                cookie,
+                Some(last),
+            ));
+            if let Some(to) = to {
+                let (dest, name) = to.split_last().unwrap();
+                let dest = state.ino_of(&dest).unwrap();
+                state.dirs.get_mut(&dest).unwrap().insert(name.clone(), ino);
+                events.extend(state.event(
+                    dest,
+                    AddWatchFlags::IN_MOVED_TO | DIR,
+                    cookie,
+                    Some(name),
+                ));
+            }
+            events.extend(state.event(ino, AddWatchFlags::IN_MOVE_SELF, 0, None));
+            events
+        }
+
+        /// Remove the empty directory `p`.
+        fn rmdir_reporting(&self, p: &Path) -> Vec<RawEvent<u32>> {
+            let mut state = self.state.lock();
+            let (parent, last) = p.split_last().unwrap();
+            let parent = state.ino_of(&parent).unwrap();
+            let ino = state.dirs.get_mut(&parent).unwrap().remove(last).unwrap();
+            let mut events = Vec::new();
+            events.extend(state.event(parent, AddWatchFlags::IN_DELETE | DIR, 0, Some(last)));
+            events.extend(state.event(ino, AddWatchFlags::IN_DELETE_SELF, 0, None));
+            events.extend(state.event(ino, AddWatchFlags::IN_IGNORED, 0, None));
+            state.watches.remove(&ino);
+            events
+        }
+
+        fn mkdir_reporting(&self, p: &Path) -> Vec<RawEvent<u32>> {
+            let (parent, last) = p.split_last().unwrap();
+            self.mkdir(&p.to_os_string().to_string_lossy());
+            let state = self.state.lock();
+            let parent = state.ino_of(&parent).unwrap();
+            state
+                .event(parent, AddWatchFlags::IN_CREATE | DIR, 0, Some(last))
+                .into_iter()
+                .collect()
+        }
+
+        fn refuse(&self, p: &str, errno: Errno) {
+            let mut state = self.state.lock();
+            let ino = state.ino_of(&path(p)).unwrap();
+            state.refused.insert(ino, errno);
+        }
+
+        fn wd_of(&self, p: &str) -> u32 {
+            let state = self.state.lock();
+            state.watches[&state.ino_of(&path(p)).unwrap()]
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::mem::take(&mut self.state.lock().calls)
+        }
+    }
+
+    impl Marks for Fake {
+        type Wd = u32;
+        type Dir = u64;
+
+        fn open(&self, p: &Path) -> Result<u64, Errno> {
+            let mut state = self.state.lock();
+            state.calls.push(format!("open {}", shown(p)));
+            state.ino_of(p).ok_or(Errno::ENOENT)
+        }
+
+        fn open_child(&self, parent: &u64, name: &Name) -> Result<u64, Errno> {
+            let mut state = self.state.lock();
+            state.calls.push(format!("open_child {name}"));
+            state.dirs[parent].get(name).copied().ok_or(Errno::ENOENT)
+        }
+
+        fn add(&self, dir: &u64) -> Result<u32, Errno> {
+            let mut state = self.state.lock();
+            let shown = state.shown(*dir);
+            state.calls.push(format!("add {shown}"));
+            if let Some(errno) = state.refused.get(dir) {
+                return Err(*errno);
+            }
+            if let Some(wd) = state.watches.get(dir) {
+                return Ok(*wd);
+            }
+            state.next_wd += 1;
+            let wd = state.next_wd;
+            state.watches.insert(*dir, wd);
+            Ok(wd)
+        }
+
+        fn rm(&self, wd: u32) {
+            let mut state = self.state.lock();
+            state.calls.push(format!("rm {wd}"));
+            state.watches.retain(|_, w| *w != wd);
+        }
+    }
+
+    fn table(dirs: &[&str]) -> Table<Fake> {
+        table_within(dirs, 64)
+    }
+
+    fn table_within(dirs: &[&str], budget: usize) -> Table<Fake> {
+        let table = Table::new(Fake::new(dirs), budget).unwrap();
+        table.marks.calls();
+        table
+    }
+
+    fn watched(table: &Table<Fake>) -> BTreeSet<String> {
+        table
+            .by_wd
+            .values()
+            .filter(|p| !p.is_root())
+            .map(|p| p.to_os_string().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn set(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// Watch `p` as a request that has already been answered does.
+    fn arm(table: &mut Table<Fake>, p: &str) -> Vec<EventItem> {
+        let mut out = Vec::new();
+        table.arm(&path(p), Instant::now(), &mut out);
+        out
+    }
+
+    fn event(wd: u32, mask: AddWatchFlags, cookie: u32, name: Option<&str>) -> RawEvent<u32> {
+        RawEvent {
+            wd,
+            mask,
+            cookie,
+            name: name.map(OsString::from),
+        }
+    }
+
+    fn apply(table: &mut Table<Fake>, events: Vec<RawEvent<u32>>) -> Vec<EventItem> {
+        let mut out = Vec::new();
+        table.apply(events, &mut out);
+        out
+    }
+
+    const ROOT_WD: u32 = 1;
+    const DIR: AddWatchFlags = AddWatchFlags::IN_ISDIR;
+
+    #[test]
+    fn a_deep_path_is_watched_top_down_each_directory_inside_its_watched_parent() {
+        let mut t = table(&["a/b/c"]);
+        assert!(arm(&mut t, "a/b/c").is_empty());
+        assert_eq!(watched(&t), set(&["a", "a/b", "a/b/c"]));
+        assert_eq!(t.watched, 3);
+        assert_eq!(
+            t.marks.calls(),
+            [
+                "open /",
+                "open_child a",
+                "add a",
+                "open_child b",
+                "add a/b",
+                "open_child c",
+                "add a/b/c"
+            ],
+            "each directory is resolved only once the one above it is watched"
+        );
+    }
+
+    #[test]
+    fn a_watched_path_needs_no_system_call() {
+        let mut t = table(&["a/b/c"]);
+        arm(&mut t, "a/b");
+        t.marks.calls();
+        let now = Instant::now();
+        assert!(matches!(t.touch(&path("a/b"), now), Touched::Done(Some(_))));
+        assert!(matches!(t.touch(&path("a"), now), Touched::Done(Some(_))));
+        assert!(matches!(t.touch(&path("a/b/c"), now), Touched::Missing));
+        assert!(t.marks.calls().is_empty());
+    }
+
+    #[test]
+    fn a_request_holds_the_directory_it_is_in_until_it_is_done() {
+        let mut t = table(&["a/b"]);
+        let first = t
+            .arm(&path("a/b"), Instant::now(), &mut Vec::new())
+            .unwrap();
+        let Touched::Done(Some(second)) = t.touch(&path("a/b"), Instant::now()) else {
+            panic!("a/b is watched");
+        };
+        assert!(Arc::ptr_eq(&first.0, &second.0));
+        assert_eq!(first.0.holds.load(Ordering::Relaxed), 2);
+        drop(second);
+        drop(first);
+        assert_eq!(
+            t.node(&path("a/b"))
+                .unwrap()
+                .mark
+                .holds
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn a_directory_moved_within_the_export_keeps_its_watches_under_its_new_name() {
+        let mut t = table(&["a/b/c"]);
+        arm(&mut t, "a/b/c");
+        let c = t.marks.wd_of("a/b/c");
+        let events = t.marks.mv_reporting(&path("a/b"), Some(&path("x")));
+        t.marks.calls();
+        let out = apply(&mut t, events);
+        assert_eq!(out, vec![entry("a", "b"), entry("", "x")]);
+        assert_eq!(watched(&t), set(&["a", "x", "x/c"]));
+        assert_eq!(t.by_wd[&c], path("x/c"));
+        assert!(
+            !t.marks.calls().iter().any(|c| c.starts_with("rm")),
+            "the watches stay on"
+        );
+    }
+
+    #[test]
+    fn a_directory_watched_under_its_new_name_before_its_move_is_applied_keeps_its_watch() {
+        let mut t = table(&["a/b/c"]);
+        arm(&mut t, "a/b/c");
+        let events = t.marks.mv_reporting(&path("a/b"), Some(&path("x")));
+        assert!(arm(&mut t, "x").is_empty(), "nothing was dropped");
+        assert_eq!(watched(&t), set(&["a", "x", "x/c"]));
+        let out = apply(&mut t, events);
+        assert_eq!(out, vec![entry("a", "b"), entry("", "x")]);
+        assert_eq!(watched(&t), set(&["a", "x", "x/c"]));
+        assert!(!t.marks.calls().iter().any(|c| c.starts_with("rm")));
+    }
+
+    #[test]
+    fn a_directory_replaced_before_its_move_is_applied_is_caught_by_a_request_below_it() {
+        let mut t = table(&["a"]);
+        arm(&mut t, "a");
+        let old = t.marks.wd_of("a");
+        let mut events = t.marks.mv_reporting(&path("a"), Some(&path("a.old")));
+        events.extend(t.marks.mkdir_reporting(&path("a")));
+        t.marks.mkdir("a/b");
+        assert_eq!(
+            arm(&mut t, "a/b"),
+            vec![unwatched("a")],
+            "what the table had at a went with the old directory"
+        );
+        assert_eq!(watched(&t), set(&["a", "a/b"]));
+        assert_eq!(t.by_wd.get(&t.marks.wd_of("a")), Some(&path("a")));
+        assert!(!t.by_wd.contains_key(&old));
+        apply(&mut t, events);
+        assert_eq!(watched(&t), set(&["a", "a/b"]));
+        assert_eq!(t.by_wd.get(&t.marks.wd_of("a/b")), Some(&path("a/b")));
+    }
+
+    #[test]
+    fn a_directory_moved_out_of_sight_is_dropped_and_announced() {
+        let mut t = table(&["a/b/c"]);
+        arm(&mut t, "a/b/c");
+        let events = t.marks.mv_reporting(&path("a/b"), None);
+        let out = apply(&mut t, events);
+        assert_eq!(
+            out.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([entry("a", "b"), unwatched("a/b"), unwatched("a/b/c")])
+        );
+        assert_eq!(watched(&t), set(&["a"]));
+        assert_eq!(t.watched, 1);
+    }
+
+    #[test]
+    fn a_directory_renamed_over_or_removed_is_dropped_without_waiting_for_its_watch_to_end() {
+        let mut t = table(&["d/old/sub", "d/gone", "e"]);
+        arm(&mut t, "d/old/sub");
+        arm(&mut t, "d/gone");
+        let d = t.marks.wd_of("d");
+        t.marks.mv("e", Some("d/old"));
+        t.marks.mv("d/gone", None);
+        let out = apply(
+            &mut t,
+            vec![
+                event(ROOT_WD, AddWatchFlags::IN_MOVED_FROM | DIR, 9, Some("e")),
+                event(d, AddWatchFlags::IN_MOVED_TO | DIR, 9, Some("old")),
+                event(d, AddWatchFlags::IN_DELETE | DIR, 0, Some("gone")),
+            ],
+        );
+        for item in [
+            unwatched("d/old"),
+            unwatched("d/old/sub"),
+            unwatched("d/gone"),
+        ] {
+            assert!(out.contains(&item), "{item:?} in {out:?}");
+        }
+        assert_eq!(watched(&t), set(&["d"]));
+        assert_eq!(
+            t.marks.state.lock().watches.len(),
+            2,
+            "the root and d; the check of what is at d/old took its watch off again"
+        );
+    }
+
+    #[test]
+    fn a_directory_replaced_before_its_removal_is_applied_is_dropped_and_then_watched_afresh() {
+        let mut t = table(&["d/sub"]);
+        arm(&mut t, "d/sub");
+        let old = t.marks.wd_of("d/sub");
+        let mut events = t.marks.rmdir_reporting(&path("d/sub"));
+        events.extend(t.marks.mkdir_reporting(&path("d/sub")));
+        let out = apply(&mut t, events);
+        assert_eq!(
+            out,
+            vec![entry("d", "sub"), unwatched("d/sub"), entry("d", "sub")]
+        );
+        assert_eq!(watched(&t), set(&["d"]));
+        assert_eq!(
+            t.marks.state.lock().watches.len(),
+            2,
+            "the check of what is at d/sub took its watch off again"
+        );
+        arm(&mut t, "d/sub");
+        assert_ne!(t.marks.wd_of("d/sub"), old);
+        assert_eq!(watched(&t), set(&["d", "d/sub"]));
+    }
+
+    #[test]
+    fn an_overflow_keeps_what_is_still_where_the_table_has_it() {
+        let mut t = table(&["a/b", "c/d"]);
+        arm(&mut t, "a/b");
+        arm(&mut t, "c/d");
+        let (c, d) = (t.marks.wd_of("c"), t.marks.wd_of("c/d"));
+        t.marks.mv("c", Some("x"));
+        t.marks.calls();
+        let out = apply(
+            &mut t,
+            vec![event(u32::MAX, AddWatchFlags::IN_Q_OVERFLOW, 0, None)],
+        );
+        assert_eq!(
+            out,
+            vec![EventItem::Overflow, unwatched("c/d"), unwatched("c")]
+        );
+        assert_eq!(watched(&t), set(&["a", "a/b"]));
+        let removed: HashSet<String> = t
+            .marks
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("rm"))
+            .collect();
+        assert_eq!(
+            removed,
+            HashSet::from([format!("rm {c}"), format!("rm {d}")]),
+            "only the moved directories' watches came off"
+        );
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_watched_is_left_alone_until_its_retry() {
+        let mut t = table(&["a/b/c"]);
+        t.marks.refuse("a/b", Errno::EACCES);
+        let now = Instant::now();
+        let held = t.arm(&path("a/b/c"), now, &mut Vec::new()).unwrap();
+        assert!(
+            Arc::ptr_eq(&held.0, &t.node(&path("a")).unwrap().mark),
+            "a is the deepest watched"
+        );
+        assert_eq!(watched(&t), set(&["a"]));
+        assert_eq!(t.watched, 1);
+        assert!(
+            !t.marks.calls().contains(&"open_child c".to_string()),
+            "nothing below it is tried"
+        );
+        assert!(matches!(
+            t.touch(&path("a/b/c"), now + Duration::from_secs(1)),
+            Touched::Done(Some(_))
+        ));
+        let later = now + UNWATCHABLE_RETRY + Duration::from_secs(1);
+        assert!(matches!(t.touch(&path("a/b/c"), later), Touched::Missing));
+        t.marks.state.lock().refused.clear();
+        t.arm(&path("a/b/c"), later, &mut Vec::new());
+        assert_eq!(watched(&t), set(&["a", "a/b", "a/b/c"]));
+    }
+
+    #[test]
+    fn a_directory_gone_on_its_own_is_dropped_quietly_and_the_roots_end_disables_everything() {
+        let mut t = table(&["a/b"]);
+        arm(&mut t, "a/b");
+        let b = t.marks.wd_of("a/b");
+        assert!(apply(&mut t, vec![event(b, AddWatchFlags::IN_IGNORED, 0, None)]).is_empty());
+        assert_eq!(watched(&t), set(&["a"]));
+        assert!(
+            apply(
+                &mut t,
+                vec![event(ROOT_WD, AddWatchFlags::IN_MOVE_SELF, 0, None)]
+            )
+            .is_empty(),
+            "the export root moving changes no path below it"
+        );
+        assert_eq!(watched(&t), set(&["a"]));
+        assert_eq!(
+            apply(
+                &mut t,
+                vec![event(ROOT_WD, AddWatchFlags::IN_IGNORED, 0, None)]
+            ),
+            vec![EventItem::Overflow]
+        );
+        assert!(matches!(
+            t.touch(&path("a"), Instant::now()),
+            Touched::Done(None)
+        ));
+        assert!(t.arm(&path("a"), Instant::now(), &mut Vec::new()).is_none());
+    }
+
+    #[test]
+    fn the_roots_own_attributes_are_reported_and_a_subdirectorys_are_left_to_its_parent() {
+        let mut t = table(&["a"]);
+        arm(&mut t, "a");
+        let a = t.marks.wd_of("a");
+        let out = apply(
+            &mut t,
+            vec![
+                event(ROOT_WD, AddWatchFlags::IN_ATTRIB, 0, None),
+                event(a, AddWatchFlags::IN_ATTRIB, 0, None),
+            ],
+        );
+        assert_eq!(out, vec![EventItem::Data { path: Path::root() }]);
+    }
+
+    #[test]
+    fn the_directory_used_longest_ago_goes_first() {
+        let mut t = table_within(&["a", "b", "c", "d", "e"], 3);
+        arm(&mut t, "a");
+        arm(&mut t, "b");
+        arm(&mut t, "c");
+        assert_eq!(
+            arm(&mut t, "d"),
+            vec![unwatched("a")],
+            "a, b and c tie, and a comes first"
+        );
+        drop(t.touch(&path("b"), Instant::now()));
+        assert_eq!(
+            arm(&mut t, "e"),
+            vec![unwatched("c")],
+            "b was used again since the last drop, c was not"
+        );
+        assert_eq!(watched(&t), set(&["b", "d", "e"]));
+        assert_eq!(
+            t.marks.state.lock().watches.len(),
+            4,
+            "the watches dropped came off"
+        );
+    }
+
+    #[test]
+    fn a_directory_goes_only_once_nothing_below_it_is_watched() {
+        let mut t = table_within(&["a/b", "c", "d"], 3);
+        arm(&mut t, "a/b");
+        arm(&mut t, "c");
+        assert_eq!(
+            arm(&mut t, "d"),
+            vec![unwatched("a/b")],
+            "the deepest of a tie goes first"
+        );
+        assert_eq!(
+            arm(&mut t, "a/b"),
+            vec![unwatched("c")],
+            "a is on the way to a/b"
+        );
+        assert_eq!(watched(&t), set(&["a", "a/b", "d"]));
+    }
+
+    #[test]
+    fn a_held_directory_is_kept_beyond_the_budget() {
+        let mut t = table_within(&["a/b", "c"], 1);
+        let held = t.arm(&path("c"), Instant::now(), &mut Vec::new()).unwrap();
+        assert!(arm(&mut t, "a").is_empty(), "c is held");
+        assert_eq!(watched(&t), set(&["a", "c"]));
+        drop(held);
+        assert_eq!(arm(&mut t, "a/b"), vec![unwatched("c")]);
+        assert_eq!(watched(&t), set(&["a", "a/b"]));
+    }
+
+    #[test]
+    fn running_out_of_watches_first_lowers_the_budget_for_a_while() {
+        let mut t = table_within(&["a", "b", "c"], 64);
+        arm(&mut t, "a");
+        arm(&mut t, "b");
+        t.marks.refuse("c", Errno::ENOSPC);
+        let now = Instant::now();
+        let mut out = Vec::new();
+        t.arm(&path("c"), now, &mut out);
+        assert_eq!(out, vec![unwatched("a")], "one directory made room");
+        assert!(
+            !watched(&t).contains("c"),
+            "still refused, so left unwatched"
+        );
+        assert_eq!(t.budget_at(now), 2);
+        assert_eq!(t.budget_at(now + LIMITED_HOLD), 64);
+        assert!(t.notes.iter().any(|n| matches!(n, Note::Warn(_))));
+        assert!(t.notes.iter().any(|n| matches!(n, Note::Info(_))));
+    }
+
+    #[test]
+    fn the_budget_is_half_the_systems_limit_within_bounds() {
+        assert_eq!(budget_from(Ok("524288\n".into())), BUDGET_MAX);
+        assert_eq!(budget_from(Ok("8192".into())), 4096);
+        assert_eq!(budget_from(Ok("1".into())), 1);
+        assert_eq!(budget_from(Ok("lots".into())), BUDGET_FALLBACK);
+        assert_eq!(
+            budget_from(Err(std::io::ErrorKind::NotFound.into())),
+            BUDGET_FALLBACK
+        );
+    }
+
+    /// Requests, handles, moves, removals and creations in a pseudo-random order, with the events for the changes applied some steps later, as the event thread may: the table never watches a directory whose parent it does not, never holds a watch the system has not or the other way round, keeps to the budget but for what is held, and once every event is applied has each directory where the filesystem has it.
+    #[test]
+    fn the_table_keeps_its_shape_whatever_the_order() {
+        let names = ["a", "b", "x"];
+        let mut candidates = vec![Path::root()];
+        for depth in 1..=3 {
+            let mut next = Vec::new();
+            for p in candidates.iter().filter(|p| p.names().len() == depth - 1) {
+                for n in names {
+                    next.push(p.join(name(n)).unwrap());
+                }
+            }
+            candidates.extend(next);
+        }
+        candidates.remove(0);
+        let mut t = table_within(&["a/a/a", "a/b", "b/a", "b/b/x"], 4);
+        let mut seed: u64 = 0x9e3779b97f4a7c15;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let mut held = Vec::new();
+        let mut queued = Vec::new();
+        let exists = |t: &Table<Fake>, p: &Path| t.marks.state.lock().ino_of(p).is_some();
+        for step in 0..5000 {
+            let p = candidates[next(candidates.len())].clone();
+            match next(100) {
+                0..=29 => {
+                    let before = t.watched;
+                    if let Some(h) = t.arm(&p, Instant::now(), &mut Vec::new()) {
+                        held.push(h);
+                    }
+                    let installed = t.watched > before;
+                    // Right after a directory was watched: a held directory stays, and so does every directory above it, and so does the path just watched.
+                    let mut kept = HashSet::new();
+                    for q in t.by_wd.values() {
+                        if t.node(q)
+                            .is_some_and(|n| n.mark.holds.load(Ordering::Relaxed) > 0)
+                        {
+                            for depth in 1..=q.names().len() {
+                                kept.insert(path_of(&q.names()[..depth]));
+                            }
+                        }
+                    }
+                    assert!(
+                        !installed || t.watched <= t.budget.max(kept.len()) + p.names().len(),
+                        "step {step}: {} watched, budget {}, {} kept",
+                        t.watched,
+                        t.budget,
+                        kept.len()
+                    );
+                }
+                30..=39 => {
+                    if let Touched::Done(Some(h)) = t.touch(&p, Instant::now()) {
+                        held.push(h);
+                    }
+                }
+                40..=69 => {
+                    if !held.is_empty() {
+                        held.swap_remove(next(held.len()));
+                    }
+                }
+                70..=77 => {
+                    let to = candidates[next(candidates.len())].clone();
+                    let to_parent = parent_of(&to);
+                    if exists(&t, &p)
+                        && !exists(&t, &to)
+                        && exists(&t, &to_parent)
+                        && !to.names().starts_with(p.names())
+                    {
+                        queued.extend(t.marks.mv_reporting(&p, Some(&to)));
+                    }
+                }
+                78..=81 => {
+                    if exists(&t, &p) {
+                        let empty = {
+                            let state = t.marks.state.lock();
+                            state
+                                .ino_of(&p)
+                                .is_some_and(|ino| state.dirs[&ino].is_empty())
+                        };
+                        if empty {
+                            queued.extend(t.marks.rmdir_reporting(&p));
+                        }
+                    }
+                }
+                82..=87 => {
+                    if !exists(&t, &p) && exists(&t, &parent_of(&p)) {
+                        queued.extend(t.marks.mkdir_reporting(&p));
+                    }
+                }
+                88..=98 => {
+                    apply(&mut t, std::mem::take(&mut queued));
+                    for (wd, q) in &t.by_wd {
+                        let state = t.marks.state.lock();
+                        let ino = state.ino_of(q);
+                        assert!(
+                            ino.is_some_and(|ino| state.watches.get(&ino) == Some(wd)),
+                            "step {step}: {} is not where the table has it",
+                            shown(q)
+                        );
+                    }
+                }
+                _ => {
+                    // The kernel lost what it had queued.
+                    queued.clear();
+                    let out = apply(
+                        &mut t,
+                        vec![event(u32::MAX, AddWatchFlags::IN_Q_OVERFLOW, 0, None)],
+                    );
+                    assert_eq!(out.first(), Some(&EventItem::Overflow));
+                }
+            }
+            for q in t.by_wd.values() {
+                assert!(
+                    q.is_root() || t.by_wd.values().any(|r| *r == parent_of(q)),
+                    "step {step}: {} watched without its parent",
+                    shown(q)
+                );
+            }
+            assert_eq!(t.by_wd.len(), t.watched + 1, "step {step}");
+            let state = t.marks.state.lock();
+            for wd in state.watches.values() {
+                assert!(
+                    t.by_wd.contains_key(wd),
+                    "step {step}: watch {wd} placed and forgotten"
+                );
+            }
+        }
+        let counts = t.counts.lock().take("watch events").0;
+        assert!(
+            counts.get("evicted").copied().unwrap_or(0) > 100,
+            "{counts:?}"
+        );
+        assert!(
+            counts.get("overflow").copied().unwrap_or(0) > 10,
+            "{counts:?}"
+        );
+    }
+
+    /// Write a file in the root and collect items until its own arrives. The kernel queues events in order, so anything an earlier change was going to produce has come by then.
+    async fn until_sentinel(
+        rx: &mut broadcast::Receiver<Arc<EventBatch>>,
+        root: &std::path::Path,
+        n: usize,
+    ) -> Vec<EventItem> {
+        let sentinel = format!("sentinel-{n}");
+        std::fs::write(root.join(&sentinel), b"").unwrap();
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let batch = tokio::time::timeout(left, rx.recv())
+                .await
+                .expect("the sentinel's event did not come")
+                .unwrap();
+            for (item, _) in batch.items.iter() {
+                if *item == entry("", &sentinel) {
+                    return seen;
+                }
+                seen.push(item.clone());
+            }
+        }
+    }
+
+    fn export_in(dir: &std::path::Path) -> Arc<Export> {
+        Arc::new(Export::open(dir).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_directory_is_reported_once_a_request_names_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("d")).unwrap();
+        let (events, mut rx) = broadcast::channel(256);
+        let (watches, _handle) = spawn(
+            export_in(&root),
+            &root,
+            64,
+            Arc::new(ChangeLog::default()),
+            events,
+        );
+        std::fs::write(root.join("d/early"), b"").unwrap();
+        let seen = until_sentinel(&mut rx, &root, 0).await;
+        assert!(
+            !seen
+                .iter()
+                .any(|item| matches!(item, EventItem::Entry { dir, .. } if *dir == path("d"))),
+            "d is not watched until a request names it: {seen:?}"
+        );
+        assert!(watches.arm(&path("d")).is_some());
+        std::fs::write(root.join("d/late"), b"").unwrap();
+        let seen = until_sentinel(&mut rx, &root, 1).await;
+        assert!(seen.contains(&entry("d", "late")), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_watched_directory_renamed_on_the_export_is_reported_under_its_new_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        let (events, mut rx) = broadcast::channel(256);
+        let (watches, _handle) = spawn(
+            export_in(&root),
+            &root,
+            64,
+            Arc::new(ChangeLog::default()),
+            events,
+        );
+        assert!(watches.arm(&path("a/b")).is_some());
+        std::fs::rename(root.join("a/b"), root.join("x")).unwrap();
+        std::fs::write(root.join("x/f"), b"").unwrap();
+        let seen = until_sentinel(&mut rx, &root, 0).await;
+        assert!(seen.contains(&entry("a", "b")), "{seen:?}");
+        assert!(seen.contains(&entry("", "x")), "{seen:?}");
+        assert!(seen.contains(&entry("x", "f")), "{seen:?}");
+        assert!(
+            !seen
+                .iter()
+                .any(|item| matches!(item, EventItem::Unwatched { .. })),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_stops_the_event_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (events, _rx) = broadcast::channel(256);
+        let (watches, handle) = spawn(
+            export_in(&root),
+            &root,
+            64,
+            Arc::new(ChangeLog::default()),
+            events,
+        );
+        assert_eq!(
+            Arc::strong_count(&watches),
+            2,
+            "the event thread holds the table"
+        );
+        drop(handle);
+        assert_eq!(Arc::strong_count(&watches), 1, "the thread has ended");
     }
 }

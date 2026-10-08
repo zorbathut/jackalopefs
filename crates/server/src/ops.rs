@@ -4,7 +4,7 @@ use crate::dirents::read_dir_fd;
 use crate::export::{kind_from_mode, proc_path, Export};
 use crate::handles::{Handle, Handles};
 use crate::ids::IdMap;
-use crate::watch::ChangeLog;
+use crate::watch::{parent_of, ChangeLog, Watches};
 use jackalopefs_proto::owners::reads_posix_acl;
 use jackalopefs_proto::{
     Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, Whence, MAX_FALLOCATE, MAX_IO,
@@ -56,6 +56,8 @@ pub struct Ops {
     pub handles: Arc<Handles>,
     pub session_id: u64,
     pub changes: Arc<ChangeLog>,
+    /// What a handle holds watched while it is open.
+    pub watches: Arc<Watches>,
     pub ids: IdMap,
 }
 
@@ -169,7 +171,7 @@ impl Ops {
             Request::Getattr { path, fh } => {
                 let attr = match fh.map(|fh| self.handles.get(fh)).transpose()? {
                     Some(Handle::File { file, .. }) => self.attr_of(&file)?,
-                    Some(Handle::Dir(dir)) => self.attr_of(&*dir.lock())?,
+                    Some(Handle::Dir { dir, .. }) => self.attr_of(&*dir.lock())?,
                     None => {
                         self.attr_of(&self.export.resolve(path.as_ref().ok_or(Errno::EINVAL)?)?)?
                     }
@@ -289,11 +291,13 @@ impl Ops {
                 let fd = self.export.open_node(&path, flags)?;
                 let attr = self.attr_of(&fd)?;
                 servable(attr.kind)?;
+                let watch = self.watches.hold(&parent_of(&path));
                 self.handles.insert(
                     fh,
                     Handle::File {
                         file: Arc::new(File::from(fd)),
                         path,
+                        watch,
                     },
                 )?;
                 Ok(Response::Opened { attr })
@@ -314,12 +318,14 @@ impl Ops {
                 )?;
                 let attr = self.attr_of(&fd)?;
                 servable(attr.kind)?;
+                let watch = self.watches.hold(&parent);
                 let path = parent.join(name).map_err(|_| Errno::ENAMETOOLONG)?;
                 self.handles.insert(
                     fh,
                     Handle::File {
                         file: Arc::new(File::from(fd)),
                         path,
+                        watch,
                     },
                 )?;
                 Ok(Response::Opened { attr })
@@ -432,7 +438,7 @@ impl Ops {
             Request::Fsync { fh, datasync } => {
                 match self.handles.get(fh)? {
                     Handle::File { file, .. } => sync(&*file, datasync)?,
-                    Handle::Dir(dir) => sync(&*dir.lock(), datasync)?,
+                    Handle::Dir { dir, .. } => sync(&*dir.lock(), datasync)?,
                 }
                 Ok(Response::Ok)
             }
@@ -442,8 +448,13 @@ impl Ops {
                     .open_node(&path, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
                 let attr = self.attr_of(&fd)?;
                 servable(attr.kind)?;
-                self.handles
-                    .insert(fh, Handle::Dir(Arc::new(Mutex::new(fd))))?;
+                self.handles.insert(
+                    fh,
+                    Handle::Dir {
+                        dir: Arc::new(Mutex::new(fd)),
+                        watch: self.watches.hold(&path),
+                    },
+                )?;
                 Ok(Response::Opened { attr })
             }
             Request::Readdir {
@@ -555,7 +566,7 @@ impl Ops {
             Some(Handle::File { file, .. }) => {
                 Target::Fd(file.as_fd().try_clone_to_owned().map_err(io_errno)?)
             }
-            Some(Handle::Dir(dir)) => {
+            Some(Handle::Dir { dir, .. }) => {
                 Target::Fd(dir.lock().as_fd().try_clone_to_owned().map_err(io_errno)?)
             }
             None => Target::Node(self.export.resolve(path.ok_or(Errno::EINVAL)?)?),
@@ -714,6 +725,7 @@ mod tests {
                 handles: Arc::new(Handles::new(crate::handles::MAX_HANDLES)),
                 session_id: 1,
                 changes: Arc::new(ChangeLog::default()),
+                watches: Watches::disabled(),
                 ids: IdMap::of_process(ModeIds::Direct).unwrap(),
             },
         )
