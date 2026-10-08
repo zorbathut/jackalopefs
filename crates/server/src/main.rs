@@ -3,7 +3,8 @@ use clap::{Parser, ValueEnum};
 use jackalopefs_perf::stall::{Watchdog, WATCH_PERIOD};
 use jackalopefs_server::export::Export;
 use jackalopefs_server::ids::{IdMap, ModeIds};
-use jackalopefs_server::session::{self, Server};
+use jackalopefs_server::perf::Perf;
+use jackalopefs_server::session::{self, Notification, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch};
 use jackalopefs_server::watchdog::WatchServer;
@@ -197,8 +198,19 @@ fn main() -> anyhow::Result<()> {
             changes.clone(),
             events.clone(),
         );
+        let notification = Notification {
+            events,
+            changes,
+            watches,
+        };
+        let perf = Arc::new(Perf::default());
         let server = Arc::new(Server::new(
-            export, args.token, events, changes, watches, limits, ids,
+            export,
+            args.token,
+            notification,
+            perf,
+            limits,
+            ids,
         ));
         let mut watch = WatchServer::new(server.perf.clone(), tokio::runtime::Handle::current());
         let watchdog = Watchdog::spawn("jfs-watchdog", WATCH_PERIOD, move || watch.tick())

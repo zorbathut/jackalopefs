@@ -13,7 +13,9 @@ pub mod wire;
 #[allow(clippy::all, dead_code, unused_imports, unused_qualifications)]
 pub(crate) mod jackalopefs_capnp { include!(concat!(env!("OUT_DIR"), "/jackalopefs_capnp.rs")); }
 
-pub use codec::{decode, encode, read_frame, write_frame, ErrorCodec, MAX_FRAME, MAX_IO};
+pub use codec::{
+    decode, encode, read_frame, read_frame_body, write_frame, ErrorCodec, MAX_FRAME, MAX_IO,
+};
 pub use msg::*;
 pub use types::*;
 pub use wire::{dir_entry_bytes, ErrorDecode, Message};

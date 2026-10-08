@@ -199,13 +199,20 @@ pub struct Server {
     connection_permits: Arc<Semaphore>,
 }
 
+/// What change notification hands the server: the batches to fan out, the record of which session made which change, and the watch table requests arm.
+pub struct Notification {
+    pub events: broadcast::Sender<Arc<EventBatch>>,
+    pub changes: Arc<ChangeLog>,
+    pub watches: Arc<Watches>,
+}
+
 impl Server {
+    /// `perf` is made first because change notification counts into it too.
     pub fn new(
         export: Arc<Export>,
         token: Option<String>,
-        events: broadcast::Sender<Arc<EventBatch>>,
-        changes: Arc<ChangeLog>,
-        watches: Arc<Watches>,
+        notification: Notification,
+        perf: Arc<Perf>,
         limits: Limits,
         ids: IdMap,
     ) -> Server {
@@ -213,10 +220,10 @@ impl Server {
             export,
             ids,
             sessions: Arc::new(Sessions::new(limits.handles_per_session)),
-            events,
-            changes,
-            watches,
-            perf: Arc::new(Perf::default()),
+            events: notification.events,
+            changes: notification.changes,
+            watches: notification.watches,
+            perf,
             connections: Mutex::new(HashMap::new()),
             meters: Mutex::new(Meters {
                 link: MeterLink::system(),

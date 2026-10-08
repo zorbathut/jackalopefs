@@ -7,7 +7,8 @@ use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::{read_frame, write_frame, Auth, Hello, HelloReply, Request, Response};
 use jackalopefs_server::export::Export;
 use jackalopefs_server::ids::{IdMap, ModeIds};
-use jackalopefs_server::session::{self, Server};
+use jackalopefs_server::perf::Perf;
+use jackalopefs_server::session::{self, Notification, Server};
 use jackalopefs_server::tls::{self, Identity};
 use jackalopefs_server::watch::{self, ChangeLog, EventBatch, WatcherHandle, Watches};
 use jackalopefs_server::Limits;
@@ -133,9 +134,12 @@ impl TestServer {
         let server = Arc::new(Server::new(
             opened,
             token,
-            events.clone(),
-            changes,
-            watches,
+            Notification {
+                events: events.clone(),
+                changes,
+                watches,
+            },
+            Arc::new(Perf::default()),
             Limits {
                 connections: 64,
                 handles_per_session: jackalopefs_server::handles::MAX_HANDLES,

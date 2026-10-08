@@ -132,6 +132,17 @@ where
     R: AsyncRead + Unpin,
     T: Message,
 {
+    read_frame_body(reader).await?.1
+}
+
+/// Read exactly one frame and decode it, keeping the body (the message without its length prefix) whether or not it decodes. The outer error is the read's; the inner, the decode's.
+pub async fn read_frame_body<R, T>(
+    reader: &mut R,
+) -> Result<(Vec<u8>, Result<T, ErrorCodec>), ErrorCodec>
+where
+    R: AsyncRead + Unpin,
+    T: Message,
+{
     let mut len_bytes = [0u8; 4];
     reader.read_exact(&mut len_bytes).await?;
     let len = u32::from_le_bytes(len_bytes) as usize;
@@ -144,7 +155,8 @@ where
         body.resize(start + (len - start).min(READ_CHUNK), 0);
         reader.read_exact(&mut body[start..]).await?;
     }
-    decode(&body)
+    let decoded = decode(&body);
+    Ok((body, decoded))
 }
 
 #[cfg(test)]
@@ -578,6 +590,24 @@ mod tests {
         let back: Response = read_frame(&mut b).await.unwrap();
         writer.await.unwrap();
         assert!(matches!(back, Response::Read(data) if data.len() == MAX_IO));
+    }
+
+    #[tokio::test]
+    async fn a_frame_read_keeps_its_body_whether_or_not_it_decodes() {
+        let req = Request::Release { fh: 5 };
+        let frame = encode(&req).unwrap();
+        let (mut a, mut b) = tokio::io::duplex(8192);
+        a.write_all(&frame).await.unwrap();
+        let (body, decoded) = read_frame_body::<_, Request>(&mut b).await.unwrap();
+        assert_eq!(body, frame[4..]);
+        assert_eq!(decoded.unwrap(), req);
+
+        // A reply's bytes read as a request: the body comes back with the decode error.
+        let frame = encode(&Response::Ok).unwrap();
+        a.write_all(&frame).await.unwrap();
+        let (body, decoded) = read_frame_body::<_, Request>(&mut b).await.unwrap();
+        assert_eq!(body, frame[4..]);
+        assert!(decoded.is_err());
     }
 
     #[test]
