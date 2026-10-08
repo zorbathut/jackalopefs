@@ -126,6 +126,7 @@ fn default_state_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     jackalopefs_perf::logging::init();
     let args = Args::parse();
 
@@ -213,6 +214,26 @@ fn main() -> anyhow::Result<()> {
             limits,
             ids,
         ));
+        let source = jackalopefs_server::perf::ControlSource {
+            perf: server.perf.clone(),
+            describe: format!(
+                "{} on {}",
+                args.export.display(),
+                endpoint
+                    .local_addr()
+                    .map_or_else(|e| format!("(address unknown: {e})"), |a| a.to_string())
+            ),
+            started,
+        };
+        let _control = match jackalopefs_perf::control::Control::spawn(Arc::new(source)) {
+            Ok(control) => Some(control),
+            Err(e) => {
+                tracing::warn!(
+                    "no control socket, so jackalopefs-ctl cannot reach this server: {e}"
+                );
+                None
+            }
+        };
         let mut watch = WatchServer::new(server.perf.clone(), tokio::runtime::Handle::current());
         let watchdog = Watchdog::spawn("jfs-watchdog", WATCH_PERIOD, move || watch.tick())
             .context("starting the stall watchdog")?;

@@ -14,6 +14,7 @@ use fuser::{
 use jackalopefs_perf::event;
 use jackalopefs_perf::hub::IdsEvent;
 use jackalopefs_perf::stall::{Ended, ErrorLockHeld, ModeScan, Progress, LOCK_PATIENCE};
+use jackalopefs_proto::control::{Ids, Summary};
 use jackalopefs_proto::{
     Attr, DirEntry, FileKind, Name, Path, SetAttr, TimeOrNow, TimeSpec, Whence, MAX_IO,
 };
@@ -272,6 +273,26 @@ impl Backend {
                     inflight = perf.inflight(),
                     "fuse"
                 );
+            }
+            if perf.hub.wants_requests() {
+                perf.hub.deliver_request(key.op, || Summary {
+                    level: "fuse".into(),
+                    ids: Ids {
+                        unique: Some(key.unique),
+                        op: Some(key.op.into()),
+                        ..Ids::default()
+                    },
+                    fh: key.fh,
+                    offset: key.offset,
+                    size: key.size,
+                    ino: Some(key.ino),
+                    pid: Some(key.pid),
+                    bytes: outcome.bytes,
+                    items: outcome.items,
+                    errno: outcome.errno,
+                    phases: Vec::new(),
+                    total_ns: total.as_nanos() as u64,
+                });
             }
             drop(inflight);
         });

@@ -1,11 +1,13 @@
 //! What the client's and the server's performance reports share: the number formatting, the QUIC statistics line with its per-window delta, meters for the host's physical ports and UDP socket drop counters, and the verdict that names a link that is full and mostly not ours. Each side logs the lines under its own target, so the functions here return text rather than logging it.
 
+pub mod control;
 pub mod events;
 pub mod hub;
 pub mod logging;
 pub mod stall;
 
-use std::collections::HashMap;
+use jackalopefs_proto::control::TotalOp;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -44,6 +46,37 @@ pub fn fmt_bytes(n: u64) -> String {
         format!("{n}B")
     } else {
         format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+/// Every operation's totals since the process started, by level (`fuse`, `call`, `request`) and operation: what `jackalopefs-ctl top` turns into rates. Unlike the report's windows these never reset, so any number of readers can each take differences of their own.
+#[derive(Default)]
+pub struct Totals(BTreeMap<(&'static str, &'static str), TotalOp>);
+
+impl Totals {
+    pub fn add(
+        &mut self,
+        level: &'static str,
+        op: &'static str,
+        bytes: u64,
+        items: u64,
+        errno: i32,
+        took: Duration,
+    ) {
+        let total = self.0.entry((level, op)).or_insert_with(|| TotalOp {
+            level: level.to_owned(),
+            op: op.to_owned(),
+            ..TotalOp::default()
+        });
+        total.count += 1;
+        total.bytes += bytes;
+        total.items += items;
+        total.errors += u64::from(errno != 0);
+        total.total_ns += took.as_nanos() as u64;
+    }
+
+    pub fn list(&self) -> Vec<TotalOp> {
+        self.0.values().cloned().collect()
     }
 }
 

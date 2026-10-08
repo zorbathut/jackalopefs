@@ -7,6 +7,7 @@ use jackalopefs_proto::Auth;
 use jackalopefs_proto::DEFAULT_PORT;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Mount a jackalopefs export.
@@ -110,6 +111,7 @@ async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
 }
 
 fn main() -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     jackalopefs_perf::logging::init();
     let args = Args::parse();
     if args.allow_other && !args.default_permissions {
@@ -176,6 +178,20 @@ fn main() -> anyhow::Result<()> {
         )
         .await?;
         tracing::info!("mounted {} at {}", args.server, args.mountpoint.display());
+        let source = jackalopefs_client::perf::ControlSource {
+            perf: mount.perf().clone(),
+            describe: format!("{} from {}", args.mountpoint.display(), args.server),
+            started,
+        };
+        let _control = match jackalopefs_perf::control::Control::spawn(Arc::new(source)) {
+            Ok(control) => Some(control),
+            Err(e) => {
+                tracing::warn!(
+                    "no control socket, so jackalopefs-ctl cannot reach this client: {e}"
+                );
+                None
+            }
+        };
         // The first tick of an interval is immediate; the first report is due one period from now. A tick delayed by a stalled process is taken late rather than as a burst of near-empty windows.
         let mut ticks = args.perf_interval.map(|every| {
             let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);

@@ -1,7 +1,8 @@
 //! Taps: what a subscriber (`jackalopefs-ctl`) selected, and the records delivered to it. Nothing here costs anything while no tap exists; a tap's queue is bounded in records and in bytes, and what does not fit is dropped and counted rather than held.
 
+use jackalopefs_proto::control::{Happened, Ids, Record, Selection, Summary};
 use parking_lot::{Mutex, RwLock};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::SystemTime;
 use tokio::sync::mpsc;
@@ -16,7 +17,7 @@ const TAP_BYTES: usize = 32 << 20;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IdsEvent {
     pub session: Option<u64>,
-    /// The connection's key, the same on both sides (see the connection key in `docs/design.md`).
+    /// The connection's key ([`conn_key`](crate::conn_key)), the same on both sides.
     pub conn: Option<u64>,
     /// The QUIC stream a request travelled on.
     pub stream: Option<u64>,
@@ -25,52 +26,32 @@ pub struct IdsEvent {
     pub op: Option<&'static str>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Record {
-    /// One occurrence of a named event, with the detail built for it.
-    Event {
-        at: SystemTime,
-        name: &'static str,
-        ids: IdsEvent,
-        detail: String,
-    },
-    /// Records this tap could not take, since the last it was told of.
-    Dropped { records: u64 },
-}
-
-impl Record {
-    /// Roughly what the record holds in memory, for the tap's byte bound.
-    fn size(&self) -> usize {
-        match self {
-            Record::Event { detail, .. } => 128 + detail.len(),
-            Record::Dropped { .. } => 32,
+impl IdsEvent {
+    pub fn to_ids(&self) -> Ids {
+        Ids {
+            session: self.session,
+            conn: self.conn,
+            stream: self.stream,
+            unique: self.unique,
+            op: self.op.map(str::to_owned),
         }
     }
 }
 
-/// Which names a tap wants.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Names {
-    #[default]
-    None,
-    All,
-    Some(Vec<String>),
+/// Unix time in nanoseconds.
+pub fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64)
 }
 
-impl Names {
-    pub fn has(&self, name: &str) -> bool {
-        match self {
-            Names::None => false,
-            Names::All => true,
-            Names::Some(names) => names.iter().any(|n| n == name),
-        }
+/// Roughly what a record holds in memory, for the tap's byte bound.
+fn size(record: &Record) -> usize {
+    match &record.what {
+        Happened::Event { detail, .. } => 128 + detail.len(),
+        Happened::Request(summary) => 192 + 32 * summary.phases.len(),
+        Happened::Dropped(_) => 32,
     }
-}
-
-/// What a tap is for.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Selection {
-    pub events: Names,
 }
 
 /// A set of counted things a tap can select by name; the hub tells it when taps come and go, so it can keep its own cheap check of whether anyone is looking.
@@ -83,6 +64,8 @@ pub(crate) trait Registry: Send + Sync {
 pub struct Hub {
     taps: RwLock<Vec<Arc<Tap>>>,
     registries: Mutex<Vec<Weak<dyn Registry>>>,
+    /// Taps that want request summaries.
+    requests: AtomicU32,
 }
 
 struct Tap {
@@ -96,8 +79,14 @@ impl Tap {
     /// Queue `record` unless that would pass either bound, first telling the subscriber what was dropped since it last heard.
     fn offer(&self, record: Record) {
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
-        if dropped > 0 && !self.send(Record::Dropped { records: dropped }) {
-            self.dropped.fetch_add(dropped, Ordering::Relaxed);
+        if dropped > 0 {
+            let told = Record {
+                at_ns: record.at_ns,
+                what: Happened::Dropped(dropped),
+            };
+            if !self.send(told) {
+                self.dropped.fetch_add(dropped, Ordering::Relaxed);
+            }
         }
         if !self.send(record) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -105,7 +94,7 @@ impl Tap {
     }
 
     fn send(&self, record: Record) -> bool {
-        let size = record.size();
+        let size = size(&record);
         if self.bytes.fetch_add(size, Ordering::Relaxed) + size > TAP_BYTES {
             self.bytes.fetch_sub(size, Ordering::Relaxed);
             return false;
@@ -131,7 +120,7 @@ impl Drop for TapHandle {
             .taps
             .write()
             .retain(|tap| !Arc::ptr_eq(tap, &self.tap));
-        Hub::adjust(&mut registries, &self.tap.selection, -1);
+        self.hub.adjust(&mut registries, &self.tap.selection, -1);
     }
 }
 
@@ -145,14 +134,14 @@ impl TapReceiver {
     /// The next record; `None` once the tap is unsubscribed and drained.
     pub async fn recv(&mut self) -> Option<Record> {
         let record = self.rx.recv().await?;
-        self.bytes.fetch_sub(record.size(), Ordering::Relaxed);
+        self.bytes.fetch_sub(size(&record), Ordering::Relaxed);
         Some(record)
     }
 
     /// The next record if one is queued; `None` when none is, or the tap is gone.
     pub fn try_recv(&mut self) -> Option<Record> {
         let record = self.rx.try_recv().ok()?;
-        self.bytes.fetch_sub(record.size(), Ordering::Relaxed);
+        self.bytes.fetch_sub(size(&record), Ordering::Relaxed);
         Some(record)
     }
 }
@@ -170,7 +159,7 @@ impl Hub {
         let mut registries = self.registries.lock();
         // In the list before anyone's check turns true, so nothing offered for it is missed.
         self.taps.write().push(tap.clone());
-        Hub::adjust(&mut registries, &tap.selection, 1);
+        self.adjust(&mut registries, &tap.selection, 1);
         drop(registries);
         (
             TapHandle {
@@ -192,7 +181,15 @@ impl Hub {
     }
 
     /// Count a tap in or out, with the registries' lock held.
-    fn adjust(registries: &mut Vec<Weak<dyn Registry>>, selection: &Selection, delta: i32) {
+    fn adjust(&self, registries: &mut Vec<Weak<dyn Registry>>, selection: &Selection, delta: i32) {
+        if !selection.ops.is_none() {
+            if delta > 0 {
+                self.requests.fetch_add(delta as u32, Ordering::Relaxed);
+            } else {
+                self.requests
+                    .fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+            }
+        }
         registries.retain(|registry| match registry.upgrade() {
             Some(live) => {
                 live.adjust(selection, delta);
@@ -203,16 +200,42 @@ impl Hub {
     }
 
     pub(crate) fn deliver_event(&self, name: &'static str, ids: &IdsEvent, detail: &str) {
-        let at = SystemTime::now();
+        let at_ns = now_ns();
         for tap in self.taps.read().iter() {
             if tap.selection.events.has(name) {
-                tap.offer(Record::Event {
-                    at,
-                    name,
-                    ids: ids.clone(),
-                    detail: detail.to_owned(),
+                tap.offer(Record {
+                    at_ns,
+                    what: Happened::Event {
+                        name: name.to_owned(),
+                        ids: ids.to_ids(),
+                        detail: detail.to_owned(),
+                    },
                 });
             }
+        }
+    }
+
+    /// Whether any tap wants request summaries: one relaxed load, so a request costs nothing more while nobody looks.
+    pub fn wants_requests(&self) -> bool {
+        self.requests.load(Ordering::Relaxed) > 0
+    }
+
+    /// Hand the summary of a request of operation `op` to the taps that want it, building it only if one does.
+    pub fn deliver_request(&self, op: &str, summary: impl FnOnce() -> Summary) {
+        let taps = self.taps.read();
+        let wanting: Vec<&Arc<Tap>> = taps
+            .iter()
+            .filter(|tap| tap.selection.ops.has(op))
+            .collect();
+        if wanting.is_empty() {
+            return;
+        }
+        let record = Record {
+            at_ns: now_ns(),
+            what: Happened::Request(summary()),
+        };
+        for tap in wanting {
+            tap.offer(record.clone());
         }
     }
 }
@@ -220,10 +243,12 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jackalopefs_proto::control::Names;
 
     fn selecting(names: &[&str]) -> Selection {
         Selection {
             events: Names::Some(names.iter().map(|n| n.to_string()).collect()),
+            ..Selection::default()
         }
     }
 
@@ -233,9 +258,9 @@ mod tests {
         let (_handle, mut rx) = hub.subscribe(selecting(&["a"]));
         hub.deliver_event("b", &IdsEvent::default(), "not wanted");
         hub.deliver_event("a", &IdsEvent::default(), "wanted");
-        match rx.try_recv() {
-            Some(Record::Event { name, detail, .. }) => {
-                assert_eq!((name, detail.as_str()), ("a", "wanted"))
+        match rx.try_recv().map(|r| r.what) {
+            Some(Happened::Event { name, detail, .. }) => {
+                assert_eq!((name.as_str(), detail.as_str()), ("a", "wanted"))
             }
             other => panic!("{other:?}"),
         }
@@ -255,8 +280,11 @@ mod tests {
         }
         assert_eq!(events, TAP_RECORDS);
         hub.deliver_event("a", &IdsEvent::default(), "after");
-        assert_eq!(rx.try_recv(), Some(Record::Dropped { records: 10 }));
-        assert!(matches!(rx.try_recv(), Some(Record::Event { .. })));
+        assert_eq!(rx.try_recv().map(|r| r.what), Some(Happened::Dropped(10)));
+        assert!(matches!(
+            rx.try_recv().map(|r| r.what),
+            Some(Happened::Event { .. })
+        ));
     }
 
     #[test]
@@ -269,11 +297,34 @@ mod tests {
         }
         let mut taken = 0;
         while let Some(record) = rx.try_recv() {
-            if matches!(record, Record::Event { .. }) {
+            if matches!(record.what, Happened::Event { .. }) {
                 taken += 1;
             }
         }
         assert!(taken < 4, "{taken} records of a quarter of the bound each");
         assert!(taken >= 1);
+    }
+
+    #[test]
+    fn request_summaries_are_built_only_for_a_tap_that_wants_their_op() {
+        let hub = Arc::new(Hub::default());
+        assert!(!hub.wants_requests());
+        let (handle, mut rx) = hub.subscribe(Selection {
+            ops: Names::Some(vec!["read".into()]),
+            ..Selection::default()
+        });
+        assert!(hub.wants_requests());
+        hub.deliver_request("write", || panic!("nobody wants writes"));
+        hub.deliver_request("read", || Summary {
+            level: "call".into(),
+            bytes: 7,
+            ..Summary::default()
+        });
+        assert!(matches!(
+            rx.try_recv().map(|r| r.what),
+            Some(Happened::Request(Summary { bytes: 7, .. }))
+        ));
+        drop(handle);
+        assert!(!hub.wants_requests());
     }
 }

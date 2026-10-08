@@ -1,6 +1,7 @@
 //! Named events, after bcachefs's counters: each is counted every time it happens, and its detail (what happened, to which request, why) is built only while a tap selects it or its side's event target is logged at `debug`, so detail costs nothing until someone looks.
 
-use crate::hub::{Hub, IdsEvent, Registry, Selection};
+use crate::hub::{Hub, IdsEvent, Registry};
+use jackalopefs_proto::control::Selection;
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -141,7 +142,7 @@ macro_rules! event {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::{Names, Record};
+    use jackalopefs_proto::control::{Happened, Names};
     use std::sync::atomic::AtomicUsize;
 
     #[derive(Clone, Copy, Debug)]
@@ -183,6 +184,7 @@ mod tests {
     fn selecting(names: &[&str]) -> Selection {
         Selection {
             events: Names::Some(names.iter().map(|n| n.to_string()).collect()),
+            ..Selection::default()
         }
     }
 
@@ -211,8 +213,8 @@ mod tests {
         happen(&events, &built);
         assert_eq!(built.load(Ordering::Relaxed), 1);
         assert!(matches!(
-            rx.try_recv(),
-            Some(Record::Event { name: "first", .. })
+            rx.try_recv().map(|r| r.what),
+            Some(Happened::Event { name, .. }) if name == "first"
         ));
         assert!(rx.try_recv().is_none(), "delivered once");
 

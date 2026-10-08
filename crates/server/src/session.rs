@@ -13,6 +13,7 @@ use jackalopefs_perf::{
     fmt_duration, line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, SampleLink,
     TrackerQuic,
 };
+use jackalopefs_proto::control::Summary;
 use jackalopefs_proto::{
     read_frame, write_frame, Auth, Event, EventItem, Hello, HelloReply, Request, Response,
     PROTO_REVISION,
@@ -794,6 +795,32 @@ async fn handle_request(
             total_us = total.as_micros() as u64,
             "request"
         );
+    }
+    if perf.hub.wants_requests() {
+        perf.hub.deliver_request(op, || {
+            let ns = |d: Duration| d.as_nanos() as u64;
+            Summary {
+                level: "request".into(),
+                ids: jackalopefs_proto::control::Ids {
+                    op: Some(op.into()),
+                    ..ids.to_ids()
+                },
+                fh,
+                offset,
+                size,
+                bytes: outcome.bytes,
+                items: outcome.items,
+                errno: outcome.errno,
+                phases: vec![
+                    ("read".into(), ns(phases.read)),
+                    ("wait".into(), ns(phases.wait)),
+                    ("op".into(), ns(phases.op)),
+                    ("send".into(), ns(phases.send)),
+                ],
+                total_ns: ns(total),
+                ..Summary::default()
+            }
+        });
     }
 }
 

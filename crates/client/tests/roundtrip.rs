@@ -84,6 +84,62 @@ async fn both_ends_name_a_connection_by_the_same_key() {
     server.stop().await;
 }
 
+/// A tap selecting an operation gets a summary of every request of it, on both sides, with the keys that join the two.
+#[tokio::test]
+async fn every_request_of_a_selected_operation_is_summarised_on_both_sides() {
+    use jackalopefs_proto::control::{Happened, Names, Selection, Summary};
+    let export = tempfile::tempdir().unwrap();
+    std::fs::write(export.path().join("f"), b"x").unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = server.client().await;
+    let lookups = || Selection {
+        ops: Names::Some(vec!["lookup".into()]),
+        ..Selection::default()
+    };
+    let (_client_tap, mut on_client) = client.perf().hub.subscribe(lookups());
+    let (_server_tap, mut on_server) = server.server.perf.hub.subscribe(lookups());
+    for _ in 0..5 {
+        client.lookup(Path::root(), name("f")).await.unwrap();
+    }
+    client.getattr(Some(Path::root()), None).await.unwrap();
+    let summaries = |rx: &mut jackalopefs_perf::hub::TapReceiver| {
+        let mut found = Vec::new();
+        while let Some(record) = rx.try_recv() {
+            match record.what {
+                Happened::Request(summary) => found.push(summary),
+                other => panic!("{other:?}"),
+            }
+        }
+        found
+    };
+    let calls: Vec<Summary> = summaries(&mut on_client);
+    assert_eq!(calls.len(), 5, "one per lookup, and the getattr left out");
+    assert!(calls
+        .iter()
+        .all(|s| s.level == "call" && s.ids.conn.is_some() && s.ids.stream.is_some()));
+    // The server's summaries are made after its replies go, so they may trail the client's.
+    let mut served = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while served.len() < 5 {
+        assert!(
+            Instant::now() < deadline,
+            "{} of 5 summaries on the server",
+            served.len()
+        );
+        served.extend(summaries(&mut on_server));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let keys = |found: &[Summary]| {
+        found
+            .iter()
+            .map(|s| (s.ids.conn, s.ids.stream))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(keys(&calls), keys(&served));
+    client.shutdown().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn file_lifecycle() {
     let export = tempfile::tempdir().unwrap();
@@ -1707,7 +1763,7 @@ async fn a_pending_call_fails_when_its_connection_is_lost() {
 /// A reply lost with its connection is an event, and a tap that selects it gets its detail with the call's identifiers.
 #[tokio::test]
 async fn a_lost_reply_is_an_event_naming_its_call() {
-    use jackalopefs_perf::hub::{Names, Record, Selection};
+    use jackalopefs_proto::control::{Happened, Names, Selection};
     let hole = Blackhole::start_handshaking(vec![
         Blackhole::ack(),
         HelloReply::RevisionMismatch {
@@ -1722,6 +1778,7 @@ async fn a_lost_reply_is_an_event_naming_its_call() {
     );
     let (_tap, mut records) = client.perf().hub.subscribe(Selection {
         events: Names::Some(vec!["call_lost_retried".into()]),
+        ..Selection::default()
     });
     let caller = client.clone();
     let pending = tokio::spawn(async move { caller.getattr(Some(Path::root()), None).await });
@@ -1736,18 +1793,12 @@ async fn a_lost_reply_is_an_event_naming_its_call() {
         .await
         .expect("no event for the lost reply")
         .unwrap();
-    let Record::Event {
-        name, ids, detail, ..
-    } = record
-    else {
+    let Happened::Event { name, ids, detail } = record.what else {
         panic!("{record:?}");
     };
     assert_eq!(name, "call_lost_retried");
-    assert_eq!(ids.op, Some("getattr"));
-    assert!(
-        ids.session.is_some() && ids.conn.is_some() && ids.stream.is_some(),
-        "{ids:?}"
-    );
+    assert_eq!(ids.op.as_deref(), Some("getattr"));
+    assert!(ids.session.is_some() && ids.stream.is_some(), "{ids:?}");
     assert!(!detail.is_empty());
     pending.await.unwrap().unwrap_err();
     client.shutdown().await;

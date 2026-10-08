@@ -580,10 +580,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "jackalopefs-ctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "humantime",
+ "jackalopefs-proto",
+ "nix",
+ "tokio",
+]
+
+[[package]]
 name = "jackalopefs-perf"
 version = "0.1.0"
 dependencies = [
+ "jackalopefs-proto",
  "libc",
+ "nix",
  "parking_lot",
  "quinn",
  "tempfile",

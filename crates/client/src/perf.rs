@@ -1,8 +1,10 @@
 //! Per-op accounting at the two levels of the client: what the kernel asked for and how long the answer took (`fuse`), and every request to the server with the time spent in each of its phases (`call`). Counting is always on and costs one mutex lock per op; the report is logged on demand and starts a new window.
 
+use jackalopefs_perf::control::Source;
 use jackalopefs_perf::events::{Events, Kind};
 use jackalopefs_perf::hub::Hub;
-use jackalopefs_perf::{fmt_bytes, fmt_duration};
+use jackalopefs_perf::{fmt_bytes, fmt_duration, Totals};
+use jackalopefs_proto::control::{Counters, TotalOp};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -210,6 +212,7 @@ struct Inner {
     peak: u32,
     /// The event counts at the last report.
     events_seen: Vec<u64>,
+    totals: Totals,
     fuse: BTreeMap<&'static str, Row>,
     call: BTreeMap<&'static str, RowCall>,
 }
@@ -232,6 +235,7 @@ impl Default for Perf {
                 inflight: 0,
                 peak: 0,
                 events_seen: Vec::new(),
+                totals: Totals::default(),
                 fuse: BTreeMap::new(),
                 call: BTreeMap::new(),
             }),
@@ -265,12 +269,16 @@ impl Perf {
     }
 
     pub fn record_fuse(&self, op: &'static str, outcome: &Outcome, total: Duration) {
-        self.inner
-            .lock()
-            .fuse
-            .entry(op)
-            .or_default()
-            .record(outcome, total);
+        let mut inner = self.inner.lock();
+        inner.fuse.entry(op).or_default().record(outcome, total);
+        inner.totals.add(
+            "fuse",
+            op,
+            outcome.bytes,
+            outcome.items,
+            outcome.errno,
+            total,
+        );
     }
 
     pub fn record_call(
@@ -280,12 +288,25 @@ impl Perf {
         total: Duration,
         account: &AccountCall,
     ) {
-        self.inner
-            .lock()
+        let mut inner = self.inner.lock();
+        inner
             .call
             .entry(op)
             .or_default()
             .record(outcome, total, account);
+        inner.totals.add(
+            "call",
+            op,
+            outcome.bytes,
+            outcome.items,
+            outcome.errno,
+            total,
+        );
+    }
+
+    /// Every operation's totals since start, at both levels.
+    pub fn totals(&self) -> Vec<TotalOp> {
+        self.inner.lock().totals.list()
     }
 
     /// Log the window at `info` and start a new one: the counts reset, the in-flight gauge does not, and the peak restarts from the current gauge.
@@ -373,6 +394,47 @@ fn fmt_row(row: &Row, window: Duration) -> String {
         }
     }
     out
+}
+
+/// What this client shows through its control socket.
+pub struct ControlSource {
+    pub perf: Arc<Perf>,
+    pub describe: String,
+    /// When the process started.
+    pub started: Instant,
+}
+
+impl Source for ControlSource {
+    fn side(&self) -> &'static str {
+        "client"
+    }
+
+    fn describe(&self) -> String {
+        self.describe.clone()
+    }
+
+    fn counters(&self) -> Counters {
+        Counters {
+            events: self
+                .perf
+                .events
+                .counts()
+                .into_iter()
+                .map(|(name, n)| (name.to_owned(), n))
+                .collect(),
+            ops: self.perf.totals(),
+            inflight: u64::from(self.perf.inflight()),
+            ..Counters::default()
+        }
+    }
+
+    fn hub(&self) -> Arc<Hub> {
+        self.perf.hub.clone()
+    }
+
+    fn started(&self) -> Instant {
+        self.started
+    }
 }
 
 #[cfg(test)]

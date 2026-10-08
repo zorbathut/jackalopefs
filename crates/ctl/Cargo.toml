@@ -1,0 +1,15 @@
+[package]
+name = "jackalopefs-ctl"
+description = "jackalopefs-ctl: a running client's or server's counters, events and requests, live"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+humantime = { workspace = true }
+jackalopefs-proto = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true }

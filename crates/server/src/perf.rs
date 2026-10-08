@@ -1,9 +1,11 @@
 //! Per-op accounting for every request the server answers, split into reading it off the stream, waiting for a blocking thread, the filesystem work, and sending the reply. Counting is always on and costs one mutex lock per request; the report is logged on demand and starts a new window.
 
+use jackalopefs_perf::control::Source;
 use jackalopefs_perf::events::{Events, Kind};
 use jackalopefs_perf::hub::Hub;
 use jackalopefs_perf::stall::{Ended, ErrorLockHeld, ModeScan, Progress, LOCK_PATIENCE};
-use jackalopefs_perf::{fmt_bytes, fmt_duration};
+use jackalopefs_perf::{fmt_bytes, fmt_duration, Totals};
+use jackalopefs_proto::control::{Counters, TotalOp};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -273,6 +275,7 @@ struct Inner {
     peak: u32,
     /// The event counts at the last report.
     events_seen: Vec<u64>,
+    totals: Totals,
     rows: BTreeMap<&'static str, Row>,
 }
 
@@ -299,6 +302,7 @@ impl Default for Perf {
                 next: 0,
                 peak: 0,
                 events_seen: Vec::new(),
+                totals: Totals::default(),
                 rows: BTreeMap::new(),
             }),
             progress: Progress::default(),
@@ -441,12 +445,25 @@ impl Perf {
     }
 
     pub fn record(&self, op: &'static str, outcome: &Outcome, total: Duration, phases: Phases) {
-        self.inner
-            .lock()
+        let mut inner = self.inner.lock();
+        inner
             .rows
             .entry(op)
             .or_default()
             .record(outcome, total, phases);
+        inner.totals.add(
+            "request",
+            op,
+            outcome.bytes,
+            outcome.items,
+            outcome.errno,
+            total,
+        );
+    }
+
+    /// Every operation's totals since start.
+    pub fn totals(&self) -> Vec<TotalOp> {
+        self.inner.lock().totals.list()
     }
 
     /// Log the window at `info` and start a new one: the counts reset, the in-flight gauge does not, and the peak restarts from the current gauge.
@@ -508,6 +525,47 @@ impl Perf {
             );
         }
         snapshot
+    }
+}
+
+/// What this server shows through its control socket.
+pub struct ControlSource {
+    pub perf: Arc<Perf>,
+    pub describe: String,
+    /// When the process started.
+    pub started: Instant,
+}
+
+impl Source for ControlSource {
+    fn side(&self) -> &'static str {
+        "server"
+    }
+
+    fn describe(&self) -> String {
+        self.describe.clone()
+    }
+
+    fn counters(&self) -> Counters {
+        Counters {
+            events: self
+                .perf
+                .events
+                .counts()
+                .into_iter()
+                .map(|(name, n)| (name.to_owned(), n))
+                .collect(),
+            ops: self.perf.totals(),
+            inflight: u64::from(self.perf.inflight()),
+            ..Counters::default()
+        }
+    }
+
+    fn hub(&self) -> Arc<Hub> {
+        self.perf.hub.clone()
+    }
+
+    fn started(&self) -> Instant {
+        self.started
     }
 }
 

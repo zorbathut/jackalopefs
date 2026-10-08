@@ -3,6 +3,7 @@
 //! Every frame is one single-segment Cap'n Proto message prefixed by a little-endian `u32` length (see [`codec`]). Names and paths are validated as they are parsed, so a server never sees a path component it must not trust.
 
 pub mod codec;
+pub mod control;
 pub mod msg;
 pub mod owners;
 pub mod types;
@@ -12,6 +13,11 @@ pub mod wire;
 #[rustfmt::skip]
 #[allow(clippy::all, dead_code, unused_imports, unused_qualifications)]
 pub(crate) mod jackalopefs_capnp { include!(concat!(env!("OUT_DIR"), "/jackalopefs_capnp.rs")); }
+
+/// Readers and builders generated from the control schema, at the crate root for the same reason.
+#[rustfmt::skip]
+#[allow(clippy::all, dead_code, unused_imports, unused_qualifications)]
+pub(crate) mod control_capnp { include!(concat!(env!("OUT_DIR"), "/control_capnp.rs")); }
 
 pub use codec::{
     decode, encode, read_frame, read_frame_body, write_frame, ErrorCodec, MAX_FRAME, MAX_IO,
@@ -36,6 +42,9 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// The revision of the protocol this build speaks, carried in `Hello` and compared by the server: the hash of the schema file's exact bytes, comments included, so any edit to the file is a new revision and peers built from different ones refuse each other. Shown as 16 hex digits.
 pub const PROTO_REVISION: u64 = fnv1a(include_bytes!("../schema/jackalopefs.capnp"));
+
+/// The revision of the control protocol (`schema/control.capnp`) between a process and `jackalopefs-ctl`, carried in every control request and checked by the process: the hash of that file, independent of [`PROTO_REVISION`].
+pub const CONTROL_REVISION: u64 = fnv1a(include_bytes!("../schema/control.capnp"));
 
 /// UDP port the server listens on and the client connects to unless told otherwise.
 pub const DEFAULT_PORT: u16 = 1933;

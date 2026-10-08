@@ -9,6 +9,7 @@ use crate::transport::ServerTrust;
 use jackalopefs_perf::event;
 use jackalopefs_perf::hub::IdsEvent;
 use jackalopefs_perf::stall::ErrorLockHeld;
+use jackalopefs_proto::control::{Ids, Summary};
 use jackalopefs_proto::{
     read_frame, write_frame, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name, Path,
     Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
@@ -530,6 +531,36 @@ impl Caller {
                 total_us = total.as_micros() as u64,
                 "call"
             );
+        }
+        if self.perf.hub.wants_requests() {
+            self.perf.hub.deliver_request(op, || {
+                let (fh, offset, size) = req.perf_fields();
+                let ns = |d: Duration| d.as_nanos() as u64;
+                Summary {
+                    level: "call".into(),
+                    ids: Ids {
+                        session: account.session,
+                        conn: account.conn,
+                        stream: account.stream,
+                        unique: kernel.as_ref().map(|r| r.unique),
+                        op: Some(op.into()),
+                    },
+                    fh,
+                    offset,
+                    size,
+                    bytes: outcome.bytes,
+                    items: outcome.items,
+                    errno: outcome.errno,
+                    phases: vec![
+                        ("wait".into(), ns(account.phases.wait)),
+                        ("open".into(), ns(account.phases.open)),
+                        ("send".into(), ns(account.phases.send)),
+                        ("reply".into(), ns(account.phases.reply)),
+                    ],
+                    total_ns: ns(total),
+                    ..Summary::default()
+                }
+            });
         }
         result
     }
