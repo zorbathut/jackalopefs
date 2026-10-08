@@ -6,7 +6,8 @@ use common::*;
 use jackalopefs_client::mount::{Mount, MountOptions};
 use jackalopefs_client::perf::Slowpath;
 use jackalopefs_client::PhaseCall;
-use jackalopefs_proto::{Request, Response};
+use jackalopefs_proto::{EventItem, Request, Response};
+use jackalopefs_server::watch::EventBatch;
 use std::ffi::{CString, OsStr};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -117,6 +118,19 @@ impl Mounted {
 
     fn mnt(&self) -> PathBuf {
         self.mountpoint.path().to_path_buf()
+    }
+
+    /// Something that sends items to the client as one server event batch, as the server's watcher would.
+    fn injector(&self) -> impl Fn(Vec<EventItem>) + Send + 'static {
+        let events = self.server.as_ref().unwrap().events.clone();
+        move |items| {
+            let batch = EventBatch {
+                items: items.into_iter().map(|item| (item, None)).collect(),
+            };
+            events
+                .send(std::sync::Arc::new(batch))
+                .expect("the session is subscribed to events");
+        }
     }
 
     async fn finish(mut self) {
@@ -702,6 +716,51 @@ async fn a_handle_parked_at_the_end_reads_like_one_on_the_export() {
     })
     .await;
     let _ = perf;
+    m.finish().await;
+}
+
+/// Read `stream` until the client asks the server for a listing page, failing after 5 s.
+fn read_until_the_server_is_asked(
+    stream: &DirStream,
+    perf: &jackalopefs_client::perf::Perf,
+    why: &str,
+) {
+    let started = Instant::now();
+    perf.report();
+    loop {
+        stream.read_names();
+        if perf.report().call.contains_key("readdir") {
+            return;
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "{why}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// An overflow means the client cannot know what changed, so a handle parked at a listing's end must ask the server again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handle_parked_at_the_end_asks_again_after_an_overflow() {
+    let Some(m) = Mounted::start_unwatched(Duration::from_secs(10), Duration::from_secs(60)).await
+    else {
+        return;
+    };
+    let export = m.export.path().to_path_buf();
+    fs::create_dir(export.join("d")).unwrap();
+    let mnt = m.mnt();
+    let perf = m.mount.as_ref().unwrap().perf().clone();
+    let inject = m.injector();
+    blocking(move || {
+        let through = DirStream::open(&mnt.join("d"));
+        assert_eq!(through.read_names().len(), 2);
+        fs::write(export.join("d/added"), b"").unwrap();
+        inject(vec![EventItem::Overflow]);
+        read_until_the_server_is_asked(
+            &through,
+            &perf,
+            "the parked handle answered from its recorded end after an overflow",
+        )
+    })
+    .await;
     m.finish().await;
 }
 

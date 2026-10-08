@@ -771,6 +771,13 @@ impl Shared {
         }
     }
 
+    /// Anything may have been added anywhere: every parked handle must ask the server again.
+    pub(crate) fn dirs_grew_all(&self) {
+        for state in self.dirs.lock().values_mut() {
+            state.end = None;
+        }
+    }
+
     /// Hand a plain page to the kernel until its buffer is full; what it did not take comes back to be stashed.
     fn add_plain(
         &self,

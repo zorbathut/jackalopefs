@@ -154,6 +154,7 @@ fn notifier_loop(rx: Receiver<Work>, notifier: Notifier, shared: Arc<Shared>) {
             }
             Work::Sweep => {
                 shared.xattr_clear();
+                shared.dirs_grew_all();
                 sweep(&notifier, &shared)
             }
         }
