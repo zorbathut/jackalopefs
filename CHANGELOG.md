@@ -4,6 +4,7 @@
 
 ### Added
 
+- `SIGUSR2` on either binary turns trace logging on and off without a restart: a line per request and every debug line of the binary's own crate, added to the startup filter.
 - `--ids` on both binaries: which file owners the server lets cross (`flatten`, `direct`) and how the client shows them (`owned`, `direct`); see Breaking for the defaults. `scripts/validate/ids.sh` checks the defaults through a mount; every other validation suite runs both sides with `--ids direct`.
 - `scripts/validate/recycle.sh`: a file deleted on the export and replaced by one with the same, recycled inode number is the new file through the mount (skips where the filesystem does not recycle numbers).
 - `lseek(2)` with `SEEK_DATA` and `SEEK_HOLE` is answered by the server's filesystem, so a sparse file on the export is sparse through the mount and `cp`, `tar --sparse` and `qemu-img` no longer read its holes over the network. On a file this client has open for writing the seek fails with `EINVAL` (the kernel may hold data the server has not seen) and callers read the whole file, as they did before. `scripts/validate/sparse.sh` checks it; `docs/sparse-files.md` describes it.

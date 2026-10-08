@@ -53,16 +53,17 @@ struct Args {
     /// Have the kernel enforce mode bits against the attributes the server reports. Without it every request is forwarded and only the server's own access rights apply, so a mount shared through --allow-other enforces nothing.
     #[arg(long)]
     default_permissions: bool,
-    /// Log a per-operation performance summary this often (e.g. `5s`); SIGUSR1 logs one at any time.
+    /// Log a per-operation performance summary this often (e.g. `5s`); SIGUSR1 logs one at any time. SIGUSR2 turns trace logging on and off: a line per request and every debug line of its own, written as they happen, which can itself slow a busy process logging to a terminal.
     #[arg(long, value_parser = humantime::parse_duration)]
     perf_interval: Option<Duration>,
 }
 
-/// The signals the client answers, subscribed before anything that takes time so none is missed (and so SIGUSR1, whose default disposition is to terminate, cannot kill a client that is still connecting).
+/// The signals the client answers, subscribed before anything that takes time so none is missed (and so SIGUSR1 and SIGUSR2, whose default disposition is to terminate, cannot kill a client that is still connecting).
 struct Signals {
     term: tokio::signal::unix::Signal,
     int: tokio::signal::unix::Signal,
     usr1: tokio::signal::unix::Signal,
+    usr2: tokio::signal::unix::Signal,
 }
 
 impl Signals {
@@ -72,6 +73,7 @@ impl Signals {
             term: signal(SignalKind::terminate()).context("listening for SIGTERM")?,
             int: signal(SignalKind::interrupt()).context("listening for SIGINT")?,
             usr1: signal(SignalKind::user_defined1()).context("listening for SIGUSR1")?,
+            usr2: signal(SignalKind::user_defined2()).context("listening for SIGUSR2")?,
         })
     }
 }
@@ -103,7 +105,7 @@ async fn next_tick(interval: &mut Option<tokio::time::Interval>) {
 }
 
 fn main() -> anyhow::Result<()> {
-    jackalopefs_perf::logging::init();
+    let mut logging = jackalopefs_perf::logging::init("jackalopefs_client=trace");
     let args = Args::parse();
     if args.allow_other && !args.default_permissions {
         tracing::warn!("--allow-other without --default-permissions: every local user gets the server user's access to the export");
@@ -180,6 +182,7 @@ fn main() -> anyhow::Result<()> {
                 _ = next_signal(&mut signals.term) => break,
                 _ = next_signal(&mut signals.int) => break,
                 _ = next_signal(&mut signals.usr1) => mount.report(),
+                _ = next_signal(&mut signals.usr2) => logging.toggle_trace(),
                 _ = next_tick(&mut ticks) => mount.report(),
             }
         }
