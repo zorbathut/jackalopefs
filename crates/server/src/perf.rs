@@ -60,6 +60,14 @@ pub enum Slowpath {
     ReplyUndelivered,
     /// A reply was abandoned because the client was not reading it.
     ReplyStalled,
+    /// A watched directory was dropped to stay within the watch limit, and clients told.
+    WatchEvicted,
+    /// A directory could not be watched (no read permission, or the system's limit), and is served unwatched for a while.
+    WatchUnwatchable,
+    /// The system ran out of inotify watches before the watch limit did, and the limit was lowered for a while.
+    WatchLimited,
+    /// The inotify queue overflowed: events were lost, and clients were told to rescan.
+    InotifyOverflow,
 }
 
 impl Slowpath {
@@ -70,6 +78,10 @@ impl Slowpath {
             Slowpath::RequestReadTimeout => "request_read_timeout",
             Slowpath::ReplyUndelivered => "reply_undelivered",
             Slowpath::ReplyStalled => "reply_stalled",
+            Slowpath::WatchEvicted => "watch_evicted",
+            Slowpath::WatchUnwatchable => "watch_unwatchable",
+            Slowpath::WatchLimited => "watch_limited",
+            Slowpath::InotifyOverflow => "inotify_overflow",
         }
     }
 }
@@ -81,6 +93,10 @@ impl Kind for Slowpath {
         Slowpath::RequestReadTimeout,
         Slowpath::ReplyUndelivered,
         Slowpath::ReplyStalled,
+        Slowpath::WatchEvicted,
+        Slowpath::WatchUnwatchable,
+        Slowpath::WatchLimited,
+        Slowpath::InotifyOverflow,
     ];
 
     fn name(self) -> &'static str {

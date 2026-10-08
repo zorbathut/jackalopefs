@@ -3,8 +3,9 @@
 //! This is a latency improvement, not the correctness mechanism: the client's cache TTL is the backstop. inotify misses `mmap` writes and drops events under load; every such gap surfaces as [`EventItem::Overflow`] or is simply covered by the TTL.
 
 use crate::export::{proc_path, Export};
-use crate::perf::TRACE_TARGET;
-use jackalopefs_perf::CountsEvent;
+use crate::perf::{Slowpath, EVENT_TARGET, TRACE_TARGET};
+use jackalopefs_perf::events::Events;
+use jackalopefs_perf::hub::IdsEvent;
 use jackalopefs_proto::{shown, Event, EventItem, Name, Path, Request};
 use nix::errno::Errno;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
@@ -391,6 +392,8 @@ enum Note {
     Warn(String),
     Info(String),
     Debug(String),
+    /// An event's detail, built because someone looks: logged at `debug` under the event target and delivered to the taps.
+    Event(Slowpath, String),
 }
 
 /// The watched directories, as a tree from the export root mirroring the export: a directory is watched only below a watched parent, so the move or removal of any watched directory is reported on its parent's watch.
@@ -409,7 +412,7 @@ struct Table<M: Marks> {
     /// The root's own watch ended: nothing is watched any more.
     dead: bool,
     evicted_logged: bool,
-    counts: Mutex<CountsEvent>,
+    events: Arc<Events<Slowpath>>,
     notes: Vec<Note>,
 }
 
@@ -419,7 +422,7 @@ fn path_of(names: &[Name]) -> Path {
 
 impl<M: Marks> Table<M> {
     /// Watch the root, which is never dropped and not counted in `budget`.
-    fn new(marks: M, budget: usize) -> Result<Table<M>, Errno> {
+    fn new(marks: M, budget: usize, events: Arc<Events<Slowpath>>) -> Result<Table<M>, Errno> {
         let wd = marks.add(&marks.open(&Path::root())?)?;
         Ok(Table {
             marks,
@@ -431,13 +434,19 @@ impl<M: Marks> Table<M> {
             round: AtomicU64::new(0),
             dead: false,
             evicted_logged: false,
-            counts: Mutex::new(CountsEvent::default()),
+            events,
             notes: Vec::new(),
         })
     }
 
-    fn count(&self, event: &'static str) {
-        self.counts.lock().count(event);
+    /// Count one occurrence of `kind`, keeping its detail for after the lock when anyone looks.
+    fn event(&mut self, kind: Slowpath, detail: impl FnOnce() -> String) {
+        self.events.inc(kind);
+        if self.events.traced(kind)
+            || tracing::enabled!(target: EVENT_TARGET, tracing::Level::DEBUG)
+        {
+            self.notes.push(Note::Event(kind, detail()));
+        }
     }
 
     fn debug(&mut self, line: impl FnOnce() -> String) {
@@ -576,8 +585,12 @@ impl<M: Marks> Table<M> {
         match added {
             Ok(wd) => self.place(path, wd, now, out),
             Err(e) => {
-                self.count("unwatchable");
-                self.debug(|| format!("cannot watch {}: {e}", shown(path)));
+                self.event(Slowpath::WatchUnwatchable, || {
+                    format!(
+                        "cannot watch {}: {e}; served unwatched for a while",
+                        shown(path)
+                    )
+                });
                 let round = self.round.load(Ordering::Relaxed);
                 let state = State::Unwatchable {
                     retry_at: now + UNWATCHABLE_RETRY,
@@ -608,7 +621,13 @@ impl<M: Marks> Table<M> {
 
     /// The system ran out of watches before the budget did, other processes of this user holding the rest: watch no more than now for a while.
     fn limited(&mut self, path: &Path, now: Instant) {
-        self.count("limited");
+        let watched = self.watched;
+        self.event(Slowpath::WatchLimited, || {
+            format!(
+                "out of inotify watches at {} with {watched} directories watched",
+                shown(path)
+            )
+        });
         self.capped = Some((self.watched, now + LIMITED_HOLD));
         self.notes.push(Note::Warn(format!(
             "inotify watch limit reached at {} with {} directories watched; watching at most that many for the next {} minutes (raise fs.inotify.max_user_watches)",
@@ -643,8 +662,10 @@ impl<M: Marks> Table<M> {
             for (_, names) in leaves.into_iter().take(take) {
                 let victim = path_of(&names);
                 if let Some(node) = self.detach(&victim) {
+                    self.event(Slowpath::WatchEvicted, || {
+                        format!("{} dropped to stay within the watch limit", shown(&victim))
+                    });
                     self.drop_tree(node, victim, Some(out));
-                    self.count("evicted");
                 }
             }
             dropped += take;
@@ -873,7 +894,9 @@ impl<M: Marks> Table<M> {
                 break;
             }
             if event.mask.contains(AddWatchFlags::IN_Q_OVERFLOW) {
-                self.count("overflow");
+                self.event(Slowpath::InotifyOverflow, || {
+                    "the inotify queue overflowed; the watched directories are checked against the filesystem".into()
+                });
                 self.notes.push(Note::Warn(
                     "the inotify queue overflowed; clients will be told to rescan".into(),
                 ));
@@ -996,12 +1019,16 @@ pub fn default_budget() -> usize {
     ))
 }
 
-fn write_notes(notes: Vec<Note>) {
+fn write_notes(notes: Vec<Note>, events: &Events<Slowpath>) {
     for note in notes {
         match note {
             Note::Warn(line) => tracing::warn!("{line}"),
             Note::Info(line) => tracing::info!("{line}"),
             Note::Debug(line) => tracing::debug!("{line}"),
+            Note::Event(kind, detail) => {
+                tracing::debug!(target: EVENT_TARGET, event = kind.name(), "{detail}");
+                events.deliver(kind, &IdsEvent::default(), &detail);
+            }
         }
     }
 }
@@ -1015,6 +1042,7 @@ struct Inner {
     table: RwLock<Table<Inotified>>,
     pending: Mutex<Pending>,
     inotify: Arc<Inotify>,
+    slowpaths: Arc<Events<Slowpath>>,
 }
 
 impl Watches {
@@ -1039,25 +1067,21 @@ impl Watches {
         self.arm(dir).map(Arc::new)
     }
 
-    /// Log how many directories are watched and what the table did since the last report.
+    /// Log how many directories are watched; what the table did is in the events line.
     pub fn report(&self) {
         let Some(inner) = &self.inner else {
             tracing::info!(target: TRACE_TARGET, "perf watches: change notification is off");
             return;
         };
-        let (watched, budget, line) = {
+        let (watched, budget) = {
             let table = inner.table.read();
-            let line = table.counts.lock().take("watch events").1;
             let budget = match table.capped {
                 Some((cap, until)) if Instant::now() < until => cap,
                 _ => table.budget,
             };
-            (table.watched, budget, line)
+            (table.watched, budget)
         };
         tracing::info!(target: TRACE_TARGET, "perf watches watched={watched} limit={budget}");
-        if let Some(line) = line {
-            tracing::info!(target: TRACE_TARGET, "{line}");
-        }
     }
 
     /// Directories watched besides the export root.
@@ -1085,7 +1109,7 @@ impl Watches {
             }
             (held, std::mem::take(&mut table.notes))
         };
-        write_notes(notes);
+        write_notes(notes, &inner.slowpaths);
         held
     }
 }
@@ -1153,7 +1177,7 @@ fn run_events(
                     fold_events(&inner.pending, changes, vec![EventItem::Overflow]);
                     std::mem::take(&mut table.notes)
                 };
-                write_notes(notes);
+                write_notes(notes, &inner.slowpaths);
                 flush();
                 return;
             }
@@ -1172,7 +1196,7 @@ fn run_events(
                     fold_events(&inner.pending, changes, out);
                     std::mem::take(&mut table.notes)
                 };
-                write_notes(notes);
+                write_notes(notes, &inner.slowpaths);
             } else {
                 let table = inner.table.read();
                 for event in &raw {
@@ -1216,11 +1240,12 @@ impl Drop for WatcherHandle {
     }
 }
 
-/// Start change notification for `export`, which logs show as `shown_root`. The root is watched at once and every other directory as requests name it ([`Watches::arm_request`]), `budget` of them at most. Without inotify, or when the root cannot be watched, the table watches nothing (logged) and clients fall back to their cache TTLs.
+/// Start change notification for `export`, which logs show as `shown_root`, counting its events in `slowpaths`. The root is watched at once and every other directory as requests name it ([`Watches::arm_request`]), `budget` of them at most. Without inotify, or when the root cannot be watched, the table watches nothing (logged) and clients fall back to their cache TTLs.
 pub fn spawn(
     export: Arc<Export>,
     shown_root: &std::path::Path,
     budget: usize,
+    slowpaths: Arc<Events<Slowpath>>,
     changes: Arc<ChangeLog>,
     events: broadcast::Sender<Arc<EventBatch>>,
 ) -> (Arc<Watches>, Option<WatcherHandle>) {
@@ -1238,6 +1263,7 @@ pub fn spawn(
             export,
         },
         budget,
+        slowpaths.clone(),
     ) {
         Ok(table) => table,
         Err(e) => return disabled(format!("cannot watch {}: {e}", shown_root.display())),
@@ -1251,6 +1277,7 @@ pub fn spawn(
             table: RwLock::new(table),
             pending: Mutex::new(Pending::default()),
             inotify,
+            slowpaths,
         }),
     });
     let spawned = std::thread::Builder::new()
@@ -1697,7 +1724,8 @@ mod tests {
     }
 
     fn table_within(dirs: &[&str], budget: usize) -> Table<Fake> {
-        let table = Table::new(Fake::new(dirs), budget).unwrap();
+        let hub = Arc::new(jackalopefs_perf::hub::Hub::default());
+        let table = Table::new(Fake::new(dirs), budget, Events::new(&hub)).unwrap();
         table.marks.calls();
         table
     }
@@ -2234,15 +2262,8 @@ mod tests {
                 );
             }
         }
-        let counts = t.counts.lock().take("watch events").0;
-        assert!(
-            counts.get("evicted").copied().unwrap_or(0) > 100,
-            "{counts:?}"
-        );
-        assert!(
-            counts.get("overflow").copied().unwrap_or(0) > 10,
-            "{counts:?}"
-        );
+        assert!(t.events.count(Slowpath::WatchEvicted) > 100);
+        assert!(t.events.count(Slowpath::InotifyOverflow) > 10);
     }
 
     /// Write a file in the root and collect items until its own arrives. The kernel queues events in order, so anything an earlier change was going to produce has come by then.
@@ -2284,6 +2305,7 @@ mod tests {
             export_in(&root),
             &root,
             64,
+            Events::new(&Arc::new(jackalopefs_perf::hub::Hub::default())),
             Arc::new(ChangeLog::default()),
             events,
         );
@@ -2311,6 +2333,7 @@ mod tests {
             export_in(&root),
             &root,
             64,
+            Events::new(&Arc::new(jackalopefs_perf::hub::Hub::default())),
             Arc::new(ChangeLog::default()),
             events,
         );
@@ -2338,6 +2361,7 @@ mod tests {
             export_in(&root),
             &root,
             64,
+            Events::new(&Arc::new(jackalopefs_perf::hub::Hub::default())),
             Arc::new(ChangeLog::default()),
             events,
         );

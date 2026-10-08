@@ -191,10 +191,12 @@ fn main() -> anyhow::Result<()> {
             .map_or_else(watch::default_budget, |limit| {
                 usize::try_from(limit).unwrap_or(usize::MAX)
             });
+        let perf = Arc::new(Perf::default());
         let (watches, _watcher) = watch::spawn(
             export.clone(),
             &args.export,
             budget,
+            perf.events.clone(),
             changes.clone(),
             events.clone(),
         );
@@ -203,7 +205,6 @@ fn main() -> anyhow::Result<()> {
             changes,
             watches,
         };
-        let perf = Arc::new(Perf::default());
         let server = Arc::new(Server::new(
             export,
             args.token,

@@ -121,11 +121,13 @@ impl TestServer {
         let (events, _) = broadcast::channel(64);
         let changes = Arc::new(ChangeLog::default());
         let opened = Arc::new(Export::open(export).unwrap());
+        let perf = Arc::new(Perf::default());
         let (watches, watcher) = match watch_budget {
             Some(budget) => watch::spawn(
                 opened.clone(),
                 export,
                 budget,
+                perf.events.clone(),
                 changes.clone(),
                 events.clone(),
             ),
@@ -139,7 +141,7 @@ impl TestServer {
                 changes,
                 watches,
             },
-            Arc::new(Perf::default()),
+            perf,
             Limits {
                 connections: 64,
                 handles_per_session: jackalopefs_server::handles::MAX_HANDLES,
