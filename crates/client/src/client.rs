@@ -4,7 +4,7 @@ use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::{HandleKind, HandleTable};
 use crate::ids::{IdMap, ModeIds};
 use crate::inodes::KeyNode;
-use crate::perf::{AccountCall, Outcome, Perf, Phases, TRACE_TARGET};
+use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_proto::{
     read_frame, write_frame, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name, Path,
@@ -422,6 +422,7 @@ impl Caller {
                 Ok(Ok(Response::Err(errno))) => return Err(Error::Remote(errno)),
                 Ok(Ok(resp)) => return Ok(resp),
                 Ok(Err(ErrorExchange::NotSent)) => {
+                    self.perf.count(Slowpath::CallNotSent);
                     min_generation = attached.generation + 1;
                 }
                 Ok(Err(ErrorExchange::Lost)) => {
@@ -432,6 +433,7 @@ impl Caller {
                         op = req.op_name(),
                         "reply lost with the connection; retrying once on the next one"
                     );
+                    self.perf.count(Slowpath::CallLostRetried);
                     lost_once = true;
                     offline_deadline = Instant::now() + self.offline_timeout;
                     min_generation = attached.generation + 1;

@@ -48,6 +48,14 @@ pub enum Slowpath {
     Interrupt,
     /// An interrupt that stood for no signal (`crate::signals`) and was not honoured; a real signal may still end the call later.
     InterruptIgnored,
+    /// The request did not reach the connection: no stream could be opened, or writing the request failed. The call waits for the next connection.
+    CallNotSent,
+    /// The reply was lost with the connection and the call was sent again on the next one.
+    CallLostRetried,
+    /// The path to a node led to another file, and the name it ended in was forgotten.
+    AliasStale,
+    /// The server reported a file changed under the kernel's cache, and the kernel was told to drop it.
+    FileDroppedFromKernel,
 }
 
 impl Slowpath {
@@ -55,6 +63,10 @@ impl Slowpath {
         match self {
             Slowpath::Interrupt => "interrupt",
             Slowpath::InterruptIgnored => "interrupt_ignored",
+            Slowpath::CallNotSent => "call_not_sent",
+            Slowpath::CallLostRetried => "call_lost_retried",
+            Slowpath::AliasStale => "alias_stale",
+            Slowpath::FileDroppedFromKernel => "file_dropped_from_kernel",
         }
     }
 }

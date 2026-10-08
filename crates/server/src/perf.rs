@@ -1,6 +1,6 @@
 //! Per-op accounting for every request the server answers, split into reading it off the stream, waiting for a blocking thread, the filesystem work, and sending the reply. Counting is always on and costs one mutex lock per request; the report is logged on demand and starts a new window.
 
-use jackalopefs_perf::{fmt_bytes, fmt_duration};
+use jackalopefs_perf::{fmt_bytes, fmt_duration, CountsEvent};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -37,6 +37,33 @@ impl Outcome {
         Outcome {
             errno,
             ..Outcome::default()
+        }
+    }
+}
+
+/// Slowpath events, counted whether or not anything logs them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slowpath {
+    /// The client ended or reset a request stream before the request was complete: a call it interrupted or gave up on.
+    RequestCancelled,
+    /// A request stream failed otherwise before the request was read, usually with its connection.
+    RequestStreamFailed,
+    /// A request was not fully sent within the read timeout.
+    RequestReadTimeout,
+    /// A reply could not be written: the client had given up on it, or the connection went.
+    ReplyUndelivered,
+    /// A reply was abandoned because the client was not reading it.
+    ReplyStalled,
+}
+
+impl Slowpath {
+    pub fn name(self) -> &'static str {
+        match self {
+            Slowpath::RequestCancelled => "request_cancelled",
+            Slowpath::RequestStreamFailed => "request_stream_failed",
+            Slowpath::RequestReadTimeout => "request_read_timeout",
+            Slowpath::ReplyUndelivered => "reply_undelivered",
+            Slowpath::ReplyStalled => "reply_stalled",
         }
     }
 }
@@ -112,6 +139,8 @@ pub struct Snapshot {
     pub inflight: u32,
     /// Most requests being answered at once during the window.
     pub peak: u32,
+    /// Slowpath events in the window, by [`Slowpath::name`].
+    pub events: BTreeMap<&'static str, u64>,
     pub rows: BTreeMap<&'static str, Row>,
 }
 
@@ -119,6 +148,7 @@ struct Inner {
     since: Instant,
     inflight: u32,
     peak: u32,
+    events: CountsEvent,
     rows: BTreeMap<&'static str, Row>,
 }
 
@@ -133,6 +163,7 @@ impl Default for Perf {
                 since: Instant::now(),
                 inflight: 0,
                 peak: 0,
+                events: CountsEvent::default(),
                 rows: BTreeMap::new(),
             }),
         }
@@ -163,6 +194,11 @@ impl Perf {
         self.inner.lock().inflight
     }
 
+    /// A slowpath event happened.
+    pub fn count(&self, event: Slowpath) {
+        self.inner.lock().events.count(event.name());
+    }
+
     pub fn record(&self, op: &'static str, outcome: &Outcome, total: Duration, phases: Phases) {
         self.inner
             .lock()
@@ -174,18 +210,20 @@ impl Perf {
 
     /// Log the window at `info` and start a new one: the counts reset, the in-flight gauge does not, and the peak restarts from the current gauge.
     pub fn report(&self) -> Snapshot {
-        let snapshot = {
+        let (snapshot, events) = {
             let mut inner = self.inner.lock();
             let now = Instant::now();
+            let (events, line) = inner.events.take();
             let snapshot = Snapshot {
                 window: now.duration_since(inner.since),
                 inflight: inner.inflight,
                 peak: inner.peak,
+                events,
                 rows: std::mem::take(&mut inner.rows),
             };
             inner.since = now;
             inner.peak = inner.inflight;
-            snapshot
+            (snapshot, line)
         };
         tracing::info!(
             target: TRACE_TARGET,
@@ -194,6 +232,9 @@ impl Perf {
             snapshot.inflight,
             snapshot.peak
         );
+        if let Some(events) = events {
+            tracing::info!(target: TRACE_TARGET, "{events}");
+        }
         for (op, row) in &snapshot.rows {
             // `conc` is the mean number of this op in flight over the window: its summed latency divided by the window length.
             let conc = if snapshot.window.is_zero() {
@@ -285,5 +326,17 @@ mod tests {
         assert_eq!((snap.inflight, snap.peak), (1, 2));
         drop(a);
         assert_eq!(perf.inflight(), 0);
+    }
+
+    #[test]
+    fn events_are_counted_per_window() {
+        let perf = Arc::new(Perf::default());
+        perf.count(Slowpath::ReplyStalled);
+        perf.count(Slowpath::ReplyStalled);
+        assert_eq!(
+            perf.report().events,
+            BTreeMap::from([(Slowpath::ReplyStalled.name(), 2)])
+        );
+        assert!(perf.report().events.is_empty());
     }
 }

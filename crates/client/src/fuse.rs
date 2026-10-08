@@ -405,6 +405,7 @@ impl Shared {
             return true;
         }
         tracing::debug!(node = id, was = ?known, now = ?KeyNode::of(attr), "the path to a node led to another file");
+        self.client.perf().count(Slowpath::AliasStale);
         false
     }
 
@@ -503,6 +504,7 @@ impl Shared {
         }
         // The record moves only once the invalidation is queued; until then it stays behind so the next reply detects the same change again.
         if self.drop_by_name(id) {
+            self.client.perf().count(Slowpath::FileDroppedFromKernel);
             self.reported.lock().insert(id, now);
         }
     }

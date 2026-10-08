@@ -4,7 +4,7 @@ use crate::export::Export;
 use crate::handles::Handles;
 use crate::ids::IdMap;
 use crate::ops::{self, Ops};
-use crate::perf::{Outcome, Perf, Phases, TRACE_TARGET};
+use crate::perf::{Outcome, Perf, Phases, Slowpath, TRACE_TARGET};
 use crate::watch::{ChangeLog, EventBatch};
 use crate::{Limits, SESSION_GRACE};
 use jackalopefs_perf::{
@@ -617,12 +617,18 @@ async fn handle_request(
     let _inflight = perf.start();
     let req: Request = match timeout(REQUEST_READ_TIMEOUT, read_frame(&mut recv)).await {
         Ok(Ok(req)) => req,
-        Ok(Err(e)) if e.is_eof() => {
-            tracing::debug!("request cancelled before it was fully sent");
+        // The client finishes a stream early or resets it when it gives up on a call.
+        Ok(Err(e))
+            if e.is_eof()
+                || matches!(&e, jackalopefs_proto::ErrorCodec::Io(io) if io.kind() == std::io::ErrorKind::ConnectionReset) =>
+        {
+            tracing::debug!("request cancelled before it was fully sent: {e}");
+            perf.count(Slowpath::RequestCancelled);
             return;
         }
         Ok(Err(jackalopefs_proto::ErrorCodec::Io(e))) => {
             tracing::debug!("request stream ended: {e}");
+            perf.count(Slowpath::RequestStreamFailed);
             return;
         }
         Ok(Err(jackalopefs_proto::ErrorCodec::Decode(
@@ -640,6 +646,7 @@ async fn handle_request(
         }
         Err(_) => {
             tracing::debug!("request read timed out");
+            perf.count(Slowpath::RequestReadTimeout);
             return;
         }
     };
@@ -676,9 +683,13 @@ async fn handle_request(
                 tracing::debug!(op, "reply stream already closed: {e}");
             }
         }
-        Ok(Err(e)) => tracing::debug!(op, "reply not delivered: {e}"),
+        Ok(Err(e)) => {
+            tracing::debug!(op, "reply not delivered: {e}");
+            perf.count(Slowpath::ReplyUndelivered);
+        }
         Err(_) => {
             tracing::warn!(op, "client is not reading its reply; abandoning it");
+            perf.count(Slowpath::ReplyStalled);
             if let Err(e) = send.reset(close_code::EVENT_STREAM_STALLED.into()) {
                 tracing::debug!(op, "reset after stalled reply: {e}");
             }
