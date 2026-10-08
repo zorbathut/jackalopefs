@@ -34,7 +34,7 @@ struct Args {
     /// Which file owners clients see and may set. `flatten`: only this process's own uid and gid, every other owner shown as nobody and refused in chown and POSIX ACLs (every other `system.*` attribute, other ACL formats among them, is refused). `direct`: every owner as the filesystem has it, and any id a client asks for, as far as this process's privileges allow.
     #[arg(long, value_enum, default_value_t = ModeIds::Flatten)]
     ids: ModeIds,
-    /// Log a per-operation performance summary this often (e.g. `5s`); SIGUSR1 logs one at any time. SIGUSR2 turns trace logging on and off: a line per request and every debug line of its own, written as they happen, which can itself slow a busy process logging to a terminal.
+    /// Log a per-operation performance summary this often (e.g. `5s`); SIGUSR1 logs one at any time.
     #[arg(long, value_parser = humantime::parse_duration)]
     perf_interval: Option<Duration>,
     /// Most directories to watch for changes at once, besides the export root; the least recently used are dropped as others are needed, and clients told to drop what they cached under them. Default: half of fs.inotify.max_user_watches, at most 65536.
@@ -60,6 +60,11 @@ impl Signals {
             usr2: signal(SignalKind::user_defined2()).context("listening for SIGUSR2")?,
         })
     }
+}
+
+/// `SIGUSR2` once toggled trace logging. It stays subscribed, since its default action would end the process, and says where that went.
+fn usr2_unused() {
+    tracing::info!("SIGUSR2 does nothing; jackalopefs-ctl shows events and requests live");
 }
 
 /// Waits for the next signal; a stream that ends (which tokio documents as not happening in practice) waits forever rather than spinning.
@@ -120,7 +125,7 @@ fn default_state_dir() -> anyhow::Result<PathBuf> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut logging = jackalopefs_perf::logging::init("jackalopefs_server=trace");
+    jackalopefs_perf::logging::init();
     let args = Args::parse();
 
     // The client kernel already applied the caller's umask to every mode it sends; applying ours too would mask modes twice.
@@ -215,7 +220,7 @@ fn main() -> anyhow::Result<()> {
                         _ = next_signal(&mut signals.term) => break,
                         _ = next_signal(&mut signals.int) => break,
                         _ = next_signal(&mut signals.usr1) => server.report(),
-                        _ = next_signal(&mut signals.usr2) => logging.toggle_trace(),
+                        _ = next_signal(&mut signals.usr2) => usr2_unused(),
                         _ = next_tick(&mut ticks) => server.report(),
                     }
                 }
