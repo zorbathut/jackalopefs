@@ -3,7 +3,7 @@
 #
 #   scripts/perf/workload.sh <mountpoint> [client-pid]
 #
-# Run the client (and, where you can, the server) with `--perf-interval 5s`, or give the client's pid here and a report is requested with SIGUSR1 at every step boundary so each report is exactly one workload. Loopback tells you nothing about round trips: run this against the mount you actually use. Verified I/O under load is scripts/validate/fio.sh's job, not this script's.
+# Run the client (and, where you can, the server) with `--perf-interval 5s`, or give the client's pid here and a report is requested with SIGUSR1 at every step boundary so each report is exactly one workload. Loopback tells you nothing about round trips: run this against the mount you actually use; what each request costs in CPU is scripts/perf/bench.sh's job, on loopback. Verified I/O under load is scripts/validate/fio.sh's job, not this script's.
 set -euo pipefail
 
 MNT=${1:?usage: workload.sh <mountpoint> [client-pid]}
