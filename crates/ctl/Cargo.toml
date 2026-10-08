@@ -10,6 +10,7 @@ rust-version.workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true }
 humantime = { workspace = true }
+jackalopefs-perf = { workspace = true }
 jackalopefs-proto = { workspace = true }
 nix = { workspace = true }
 tokio = { workspace = true, features = ["fs"] }

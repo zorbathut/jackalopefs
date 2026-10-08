@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 jackalopefs-proto = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["resource"] }
 parking_lot = { workspace = true }
 quinn = { workspace = true }
 tokio = { workspace = true }

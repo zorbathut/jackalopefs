@@ -43,22 +43,26 @@ pub struct Control {
 }
 
 impl Control {
-    /// Serve `source` on this process's socket name.
-    pub fn spawn(source: Arc<dyn Source>) -> io::Result<Control> {
+    /// Serve `source` on this process's socket name; `runtime` is the process's main runtime, whose workers the counters report.
+    pub fn spawn(source: Arc<dyn Source>, runtime: tokio::runtime::Handle) -> io::Result<Control> {
         let name = socket_name(
             nix::unistd::getuid().as_raw(),
             source.side(),
             std::process::id(),
         );
-        Control::spawn_named(source, name)
+        Control::spawn_named(source, name, runtime)
     }
 
     /// Serve `source` on the abstract socket `name`.
-    pub fn spawn_named(source: Arc<dyn Source>, name: String) -> io::Result<Control> {
+    pub fn spawn_named(
+        source: Arc<dyn Source>,
+        name: String,
+        runtime: tokio::runtime::Handle,
+    ) -> io::Result<Control> {
         let address = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes())?;
         let listener = std::os::unix::net::UnixListener::bind_addr(&address)?;
         listener.set_nonblocking(true)?;
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let own = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let stop = Arc::new(Notify::new());
@@ -67,7 +71,7 @@ impl Control {
             .name("jfs-control".into())
             .spawn({
                 let stop = stop.clone();
-                move || runtime.block_on(serve(listener, source, stop))
+                move || own.block_on(serve(listener, source, runtime, stop))
             })?;
         tracing::info!(
             "control socket @{name}: jackalopefs-ctl shows counters, events and requests live"
@@ -89,6 +93,7 @@ impl Drop for Control {
 async fn serve(
     listener: std::os::unix::net::UnixListener,
     source: Arc<dyn Source>,
+    runtime: tokio::runtime::Handle,
     stop: Arc<Notify>,
 ) {
     let listener = match UnixListener::from_std(listener) {
@@ -121,7 +126,7 @@ async fn serve(
         };
         match stream.peer_cred() {
             Ok(peer) if admits(peer.uid(), ours) => {
-                tokio::spawn(answer(stream, source.clone()));
+                tokio::spawn(answer(stream, source.clone(), runtime.clone()));
             }
             Ok(peer) => {
                 tracing::warn!(uid = peer.uid(), "control socket: refusing another user");
@@ -132,7 +137,7 @@ async fn serve(
 }
 
 /// Answer one connection: counters as often as asked, or one subscription until the peer goes or asks for its census.
-async fn answer(stream: UnixStream, source: Arc<dyn Source>) {
+async fn answer(stream: UnixStream, source: Arc<dyn Source>, runtime: tokio::runtime::Handle) {
     let (mut rx, mut tx) = stream.into_split();
     loop {
         let request: ControlRequest = match read_frame(&mut rx).await {
@@ -160,6 +165,7 @@ async fn answer(stream: UnixStream, source: Arc<dyn Source>) {
                     pid: std::process::id(),
                     describe: source.describe(),
                     uptime_ns: source.started().elapsed().as_nanos() as u64,
+                    resources: crate::resources(&runtime),
                     ..source.counters()
                 };
                 if let Err(e) = write_frame(&mut tx, &ControlReply::Counters(counters)).await {
@@ -283,7 +289,8 @@ mod tests {
             hub,
         });
         let name = format!("jackalopefs-test/{}/{test}", std::process::id());
-        let control = Control::spawn_named(source.clone(), name).unwrap();
+        let control =
+            Control::spawn_named(source.clone(), name, tokio::runtime::Handle::current()).unwrap();
         (source, control)
     }
 
@@ -332,6 +339,12 @@ mod tests {
         assert_eq!(first.side, "test");
         assert_eq!(first.pid, std::process::id());
         assert_eq!(first.events, vec![("only".to_owned(), 1)]);
+        assert!(
+            first.resources.user_ns + first.resources.sys_ns > 0,
+            "a running process has used CPU: {:?}",
+            first.resources
+        );
+        assert!(first.resources.workers >= 1);
         source.events.inc(Only);
         let second = counters(
             ask(

@@ -9,7 +9,8 @@ use anyhow::Context;
 use fuser::{BackgroundSession, MountOption, SessionACL};
 use jackalopefs_perf::stall::{ErrorLockHeld, ModeScan, Watchdog, WATCH_PERIOD};
 use jackalopefs_perf::{
-    line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, TrackerQuic,
+    line_process, line_quic, line_udp, lines_link, verdict, MeterLink, MeterProcess, MeterUdp,
+    TrackerQuic,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -197,6 +198,7 @@ impl Aborter {
 struct Meters {
     link: MeterLink,
     udp: MeterUdp,
+    process: MeterProcess,
     generation: u64,
     quic: TrackerQuic,
 }
@@ -266,6 +268,7 @@ impl Mount {
             meters: Meters {
                 link: MeterLink::system(),
                 udp: MeterUdp::system(),
+                process: MeterProcess::new(tokio::runtime::Handle::current(), 0, 0),
                 generation: 0,
                 quic: TrackerQuic::default(),
             },
@@ -293,6 +296,10 @@ impl Mount {
         report_pending(&self.shared);
         if let Some(waiting) = self.limits.as_ref().and_then(KernelLimits::waiting) {
             tracing::info!(target: TRACE_TARGET, "perf kernel queue waiting={waiting}");
+        }
+        let (served, moved) = self.perf().served();
+        if let Some(process) = self.meters.process.sample(served, moved) {
+            tracing::info!(target: TRACE_TARGET, "{}", line_process(&process));
         }
         let links = self.meters.link.sample();
         for line in lines_link(&links) {

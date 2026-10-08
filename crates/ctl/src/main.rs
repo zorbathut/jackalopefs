@@ -1,8 +1,8 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use jackalopefs_ctl::{
-    fmt_record, fmt_record_long, frame_selection, rates, read_preamble, read_record, render_top,
-    selection, targets, write_preamble, write_record, Target,
+    counter_lines, fmt_record, fmt_record_long, frame_selection, rates, read_preamble, read_record,
+    render_top, resources_between, selection, targets, write_preamble, write_record, Target,
 };
 use jackalopefs_proto::control::{
     Ask, CensusOp, ControlReply, ControlRequest, Counters, Happened, Header, Record, Selection,
@@ -11,7 +11,7 @@ use jackalopefs_proto::{read_frame, write_frame, CONTROL_REVISION, PROTO_REVISIO
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::os::linux::net::SocketAddrExt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
@@ -41,6 +41,12 @@ enum Command {
         /// Stop after this many screens.
         #[arg(short = 'n', long)]
         count: Option<u32>,
+    },
+    /// One process's counters once, as `key value` lines for scripts: its resource use, events and per-operation totals since it started.
+    Counters {
+        /// The process; needed when there is more than one.
+        #[arg(long)]
+        pid: Option<u32>,
     },
     /// One process's events and requests as they happen. A SELECTOR is an event's name, `events` (all of them), `op:NAME` (every request of that operation) or `ops` (every request).
     Trace {
@@ -118,6 +124,10 @@ async fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::List => list().await,
         Command::Top { pid, delay, count } => top(pick(pid)?, delay, count).await,
+        Command::Counters { pid } => {
+            let mut stream = connect(&pick(pid)?).await?;
+            Ok(say(counter_lines(&counters(&mut stream).await?).trim_end())?)
+        }
         Command::Trace {
             pid,
             limit,
@@ -259,7 +269,6 @@ async fn top(target: Target, delay: Duration, count: Option<u32>) -> anyhow::Res
     let mut stream = connect(&target).await?;
     let redraw = std::io::stdout().is_terminal();
     let mut before = counters(&mut stream).await?;
-    let mut then = Instant::now();
     let mut shown = 0;
     while count.is_none_or(|count| shown < count) {
         tokio::select! {
@@ -267,10 +276,11 @@ async fn top(target: Target, delay: Duration, count: Option<u32>) -> anyhow::Res
             _ = interrupt.recv() => return Ok(()),
         }
         let now = counters(&mut stream).await?;
-        let seconds = then.elapsed().as_secs_f64();
-        then = Instant::now();
+        // The process's own clock, so the time a reading spent on its way here does not skew the rates.
+        let seconds = now.uptime_ns.saturating_sub(before.uptime_ns) as f64 / 1e9;
         let (events, ops) = rates(&before, &now, seconds);
-        let screen = render_top(&now, &events, &ops, seconds);
+        let resources = resources_between(&before, &now);
+        let screen = render_top(&now, resources.as_ref(), &events, &ops, seconds);
         if redraw {
             say(&format!("\x1b[H\x1b[2J{}", screen.trim_end()))?;
         } else {

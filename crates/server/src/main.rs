@@ -225,7 +225,10 @@ fn main() -> anyhow::Result<()> {
             ),
             started,
         };
-        let _control = match jackalopefs_perf::control::Control::spawn(Arc::new(source)) {
+        let _control = match jackalopefs_perf::control::Control::spawn(
+            Arc::new(source),
+            tokio::runtime::Handle::current(),
+        ) {
             Ok(control) => Some(control),
             Err(e) => {
                 tracing::warn!(

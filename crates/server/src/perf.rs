@@ -466,6 +466,11 @@ impl Perf {
         self.inner.lock().totals.list()
     }
 
+    /// The requests answered and the bytes they moved, at the `request` level, since the process started.
+    pub fn served(&self) -> (u64, u64) {
+        self.inner.lock().totals.at("request")
+    }
+
     /// Log the window at `info` and start a new one: the counts reset, the in-flight gauge does not, and the peak restarts from the current gauge.
     pub fn report(&self) -> Snapshot {
         let (snapshot, events) = {

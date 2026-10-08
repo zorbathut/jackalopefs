@@ -6,7 +6,7 @@ pub mod hub;
 pub mod logging;
 pub mod stall;
 
-use jackalopefs_proto::control::TotalOp;
+use jackalopefs_proto::control::{Resources, TotalOp};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -51,7 +51,16 @@ pub fn fmt_bytes(n: u64) -> String {
 
 /// Every operation's totals since the process started, by level (`fuse`, `call`, `request`) and operation: what `jackalopefs-ctl top` turns into rates. Unlike the report's windows these never reset, so any number of readers can each take differences of their own.
 #[derive(Default)]
-pub struct Totals(BTreeMap<(&'static str, &'static str), TotalOp>);
+pub struct Totals(BTreeMap<(&'static str, &'static str), TotalsOp>);
+
+#[derive(Default)]
+struct TotalsOp {
+    count: u64,
+    bytes: u64,
+    items: u64,
+    errors: u64,
+    total_ns: u64,
+}
 
 impl Totals {
     pub fn add(
@@ -63,20 +72,36 @@ impl Totals {
         errno: i32,
         took: Duration,
     ) {
-        let total = self.0.entry((level, op)).or_insert_with(|| TotalOp {
-            level: level.to_owned(),
-            op: op.to_owned(),
-            ..TotalOp::default()
-        });
+        let total = self.0.entry((level, op)).or_default();
+        let ns = took.as_nanos() as u64;
         total.count += 1;
         total.bytes += bytes;
         total.items += items;
         total.errors += u64::from(errno != 0);
-        total.total_ns += took.as_nanos() as u64;
+        total.total_ns += ns;
+    }
+
+    /// The requests and bytes of every operation at `level`.
+    pub fn at(&self, level: &str) -> (u64, u64) {
+        self.0
+            .iter()
+            .filter(|((l, _), _)| *l == level)
+            .fold((0, 0), |(n, b), (_, t)| (n + t.count, b + t.bytes))
     }
 
     pub fn list(&self) -> Vec<TotalOp> {
-        self.0.values().cloned().collect()
+        self.0
+            .iter()
+            .map(|((level, op), t)| TotalOp {
+                level: (*level).to_owned(),
+                op: (*op).to_owned(),
+                count: t.count,
+                bytes: t.bytes,
+                items: t.items,
+                errors: t.errors,
+                total_ns: t.total_ns,
+            })
+            .collect()
     }
 }
 
@@ -572,6 +597,163 @@ pub fn line_udp(sample: &SampleUdp) -> String {
     )
 }
 
+/// The process's resource use so far: its CPU time and context switches from `getrusage`, which counts every thread, exited ones included, and `runtime`'s workers with their busy time and parks.
+pub fn resources(runtime: &tokio::runtime::Handle) -> Resources {
+    let metrics = runtime.metrics();
+    let workers = metrics.num_workers();
+    let mut resources = Resources {
+        workers: workers as u32,
+        busy_ns: (0..workers)
+            .map(|w| metrics.worker_total_busy_duration(w).as_nanos() as u64)
+            .sum(),
+        parks: (0..workers).map(|w| metrics.worker_park_count(w)).sum(),
+        ..Resources::default()
+    };
+    match nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_SELF) {
+        Ok(usage) => {
+            let ns = |t: nix::sys::time::TimeVal| {
+                t.tv_sec() as u64 * 1_000_000_000 + t.tv_usec() as u64 * 1_000
+            };
+            resources.user_ns = ns(usage.user_time());
+            resources.sys_ns = ns(usage.system_time());
+            resources.voluntary_switches = usage.voluntary_context_switches() as u64;
+            resources.involuntary_switches = usage.involuntary_context_switches() as u64;
+        }
+        Err(e) => tracing::warn!("getrusage: {e}; CPU time and context switches read as zero"),
+    }
+    resources
+}
+
+/// A process's resource use between two readings, against what it served meanwhile: the requests at its outermost level ([`level_outermost`]) and the bytes they moved.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RateResources {
+    pub seconds: f64,
+    /// CPU time per second of the interval, so 1.0 is one core kept busy.
+    pub user_cores: f64,
+    pub sys_cores: f64,
+    pub switches_per_second: f64,
+    pub workers: u32,
+    /// The main runtime's workers' busy time per second: wall time spent running tasks, which counts a task blocked in a syscall or on a lock as busy, so it is not CPU and can exceed it. With one worker, how close the network thread is to saturation. Tokio publishes a worker's busy time when it parks or does its periodic maintenance, so a worker that never rests reads behind.
+    pub busy_cores: f64,
+    pub parks_per_second: f64,
+    pub requests_per_second: f64,
+    pub cpu_ns_per_request: Option<f64>,
+    pub switches_per_request: Option<f64>,
+    pub cpu_ns_per_mib: Option<f64>,
+}
+
+impl RateResources {
+    /// The rates from `before` to `now`, `seconds` apart, while `requests` were answered and `bytes` moved; `None` for an interval that is not positive.
+    pub fn between(
+        before: &Resources,
+        now: &Resources,
+        seconds: f64,
+        requests: u64,
+        bytes: u64,
+    ) -> Option<RateResources> {
+        if seconds <= 0.0 {
+            return None;
+        }
+        let user = now.user_ns.saturating_sub(before.user_ns) as f64;
+        let sys = now.sys_ns.saturating_sub(before.sys_ns) as f64;
+        let switches = (now.voluntary_switches + now.involuntary_switches)
+            .saturating_sub(before.voluntary_switches + before.involuntary_switches)
+            as f64;
+        let per = |amount: f64, of: u64| (of > 0).then(|| amount / of as f64);
+        Some(RateResources {
+            seconds,
+            user_cores: user / 1e9 / seconds,
+            sys_cores: sys / 1e9 / seconds,
+            switches_per_second: switches / seconds,
+            workers: now.workers,
+            busy_cores: now.busy_ns.saturating_sub(before.busy_ns) as f64 / 1e9 / seconds,
+            parks_per_second: now.parks.saturating_sub(before.parks) as f64 / seconds,
+            requests_per_second: requests as f64 / seconds,
+            cpu_ns_per_request: per(user + sys, requests),
+            switches_per_request: per(switches, requests),
+            cpu_ns_per_mib: (bytes > 0)
+                .then(|| (user + sys) / (bytes as f64 / (1u64 << 20) as f64)),
+        })
+    }
+}
+
+/// The level whose requests a process of `side` answers for someone outside it: the kernel's on a client, the clients' on a server.
+pub fn level_outermost(side: &str) -> &'static str {
+    match side {
+        "client" => "fuse",
+        _ => "request",
+    }
+}
+
+/// The requests and bytes of every operation at `level`.
+pub fn totals_at(ops: &[TotalOp], level: &str) -> (u64, u64) {
+    ops.iter()
+        .filter(|t| t.level == level)
+        .fold((0, 0), |(n, b), t| (n + t.count, b + t.bytes))
+}
+
+/// The process's resource use per report window, against the requests it served and the bytes they moved.
+pub struct MeterProcess {
+    runtime: tokio::runtime::Handle,
+    last: (Instant, Resources, u64, u64),
+}
+
+impl MeterProcess {
+    /// The first window starts here, with what the process has used and served so far.
+    pub fn new(runtime: tokio::runtime::Handle, requests: u64, bytes: u64) -> MeterProcess {
+        let last = (Instant::now(), resources(&runtime), requests, bytes);
+        MeterProcess { runtime, last }
+    }
+
+    /// The rates since the last sample, given the totals of requests served and bytes moved so far.
+    pub fn sample(&mut self, requests: u64, bytes: u64) -> Option<RateResources> {
+        let now = (Instant::now(), resources(&self.runtime), requests, bytes);
+        let (then, before, requests_before, bytes_before) = std::mem::replace(&mut self.last, now);
+        RateResources::between(
+            &before,
+            &now.1,
+            now.0.duration_since(then).as_secs_f64(),
+            requests.saturating_sub(requests_before),
+            bytes.saturating_sub(bytes_before),
+        )
+    }
+}
+
+/// A count per second, short: `56.1k`.
+pub fn fmt_count(n: f64) -> String {
+    if n >= 1e6 {
+        format!("{:.1}M", n / 1e6)
+    } else if n >= 1e3 {
+        format!("{:.1}k", n / 1e3)
+    } else {
+        format!("{n:.1}")
+    }
+}
+
+pub fn line_process(rate: &RateResources) -> String {
+    let ns = |n: Option<f64>| {
+        n.map_or_else(
+            || "-".to_owned(),
+            |n| fmt_duration(Duration::from_nanos(n as u64)),
+        )
+    };
+    format!(
+        "perf process window={} cpu={:.2} user={:.2} sys={:.2} switches={}/s workers={} busy={:.2} parks={}/s requests={}/s per_request: cpu={} switches={} per_mib: cpu={}",
+        fmt_duration(Duration::from_secs_f64(rate.seconds)),
+        rate.user_cores + rate.sys_cores,
+        rate.user_cores,
+        rate.sys_cores,
+        fmt_count(rate.switches_per_second),
+        rate.workers,
+        rate.busy_cores,
+        fmt_count(rate.parks_per_second),
+        fmt_count(rate.requests_per_second),
+        ns(rate.cpu_ns_per_request),
+        rate.switches_per_request.map_or_else(|| "-".to_owned(), |n| format!("{n:.1}")),
+        ns(rate.cpu_ns_per_mib),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
     Rx,
@@ -663,6 +845,103 @@ pub fn verdict(ports: &[SampleLink], this: &SampleQuic) -> Option<Verdict> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn resource_rates_are_per_second_per_request_and_per_mib() {
+        let before = Resources {
+            user_ns: 1_000_000_000,
+            sys_ns: 500_000_000,
+            voluntary_switches: 100,
+            involuntary_switches: 10,
+            workers: 1,
+            busy_ns: 0,
+            parks: 50,
+        };
+        let now = Resources {
+            user_ns: 2_000_000_000,
+            sys_ns: 1_500_000_000,
+            voluntary_switches: 2_100,
+            involuntary_switches: 10,
+            workers: 1,
+            busy_ns: 1_500_000_000,
+            parks: 250,
+        };
+        let r = RateResources::between(&before, &now, 2.0, 1_000, 4 << 20).unwrap();
+        assert_eq!(r.user_cores, 0.5);
+        assert_eq!(r.sys_cores, 0.5);
+        assert_eq!(r.switches_per_second, 1_000.0);
+        assert_eq!(r.busy_cores, 0.75);
+        assert_eq!(r.parks_per_second, 100.0);
+        assert_eq!(r.requests_per_second, 500.0);
+        assert_eq!(r.cpu_ns_per_request, Some(2_000_000.0));
+        assert_eq!(r.switches_per_request, Some(2.0));
+        assert_eq!(r.cpu_ns_per_mib, Some(500_000_000.0));
+        let idle = RateResources::between(&before, &now, 2.0, 0, 0).unwrap();
+        assert_eq!(idle.cpu_ns_per_request, None);
+        assert_eq!(idle.switches_per_request, None);
+        assert_eq!(idle.cpu_ns_per_mib, None);
+        assert_eq!(RateResources::between(&before, &now, 0.0, 1, 1), None);
+    }
+
+    #[test]
+    fn the_outermost_level_counts_what_a_process_serves() {
+        let op = |level: &str, count, bytes| TotalOp {
+            level: level.into(),
+            op: "read".into(),
+            count,
+            bytes,
+            ..TotalOp::default()
+        };
+        let ops = [op("fuse", 3, 30), op("call", 5, 50), op("fuse", 1, 10)];
+        assert_eq!(totals_at(&ops, level_outermost("client")), (4, 40));
+        assert_eq!(totals_at(&ops, level_outermost("server")), (0, 0));
+    }
+
+    #[test]
+    fn totals_count_each_operation_and_sum_a_level() {
+        let mut totals = Totals::default();
+        totals.add("request", "read", 4096, 0, 0, Duration::from_micros(20));
+        totals.add("request", "read", 0, 0, 0, Duration::from_micros(30));
+        totals.add("request", "read", 131072, 0, 5, Duration::from_millis(2));
+        totals.add("request", "getattr", 0, 0, 0, Duration::from_micros(10));
+        totals.add("call", "read", 4096, 0, 0, Duration::from_micros(90));
+        let list = totals.list();
+        let read = list
+            .iter()
+            .find(|t| t.level == "request" && t.op == "read")
+            .unwrap();
+        assert_eq!(read.count, 3);
+        assert_eq!(read.errors, 1);
+        assert_eq!(read.total_ns, 2_050_000);
+        assert_eq!(totals.at("request"), (4, 4096 + 131072));
+        assert_eq!(totals.at("call"), (1, 4096));
+    }
+
+    #[tokio::test]
+    async fn the_process_meter_reports_each_window_against_what_was_served() {
+        let mut meter = MeterProcess::new(tokio::runtime::Handle::current(), 5, 1 << 20);
+        // CPU of its own in the first window, and requests served in it.
+        let spun: u64 = (0..20_000_000u64).map(std::hint::black_box).sum();
+        assert!(spun > 0);
+        let busy = meter.sample(15, 11 << 20).unwrap();
+        assert!(busy.seconds > 0.0);
+        assert_eq!(busy.workers, 1);
+        assert!(busy.user_cores + busy.sys_cores > 0.0);
+        let per_request = busy.cpu_ns_per_request.unwrap();
+        let per_mib = busy.cpu_ns_per_mib.unwrap();
+        assert!(per_request > 0.0);
+        assert!(
+            (per_mib - per_request).abs() < 1e-6 * per_request,
+            "10 requests and 10 MiB since the baseline, not since the start"
+        );
+        let idle = meter.sample(15, 11 << 20).unwrap();
+        assert_eq!(
+            idle.cpu_ns_per_request, None,
+            "nothing served in the second window"
+        );
+        assert_eq!(idle.cpu_ns_per_mib, None);
+        assert!(!line_process(&busy).is_empty());
+    }
 
     #[test]
     fn formatting_helpers() {

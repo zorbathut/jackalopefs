@@ -64,6 +64,18 @@ pub struct TotalOp {
     pub total_ns: u64,
 }
 
+/// What a process has used since it started; see `Resources` in the schema.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resources {
+    pub user_ns: u64,
+    pub sys_ns: u64,
+    pub voluntary_switches: u64,
+    pub involuntary_switches: u64,
+    pub workers: u32,
+    pub busy_ns: u64,
+    pub parks: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
     pub side: String,
@@ -73,6 +85,7 @@ pub struct Counters {
     pub inflight: u64,
     pub events: Vec<(String, u64)>,
     pub ops: Vec<TotalOp>,
+    pub resources: Resources,
 }
 
 /// The identifiers that join a record to the log lines and to the other side's records.
@@ -504,6 +517,14 @@ impl Message for ControlReply {
                     e.set_name(name.as_str());
                     e.set_value(*value);
                 }
+                let mut r = o.reborrow().init_resources();
+                r.set_user_ns(c.resources.user_ns);
+                r.set_sys_ns(c.resources.sys_ns);
+                r.set_voluntary_switches(c.resources.voluntary_switches);
+                r.set_involuntary_switches(c.resources.involuntary_switches);
+                r.set_workers(c.resources.workers);
+                r.set_busy_ns(c.resources.busy_ns);
+                r.set_parks(c.resources.parks);
                 let mut ops = o.init_ops(c.ops.len() as u32);
                 for (i, t) in c.ops.iter().enumerate() {
                     let mut o = ops.reborrow().get(i as u32);
@@ -553,6 +574,18 @@ impl Message for ControlReply {
                             })
                         })
                         .collect::<Result<_, ErrorDecode>>()?,
+                    resources: {
+                        let r = c.get_resources()?;
+                        Resources {
+                            user_ns: r.get_user_ns(),
+                            sys_ns: r.get_sys_ns(),
+                            voluntary_switches: r.get_voluntary_switches(),
+                            involuntary_switches: r.get_involuntary_switches(),
+                            workers: r.get_workers(),
+                            busy_ns: r.get_busy_ns(),
+                            parks: r.get_parks(),
+                        }
+                    },
                 })
             }
             Which::Record(record) => ControlReply::Record(parse_record(record?)?),
@@ -562,7 +595,7 @@ impl Message for ControlReply {
 
     fn size_hint(&self) -> u32 {
         match self {
-            ControlReply::Counters(c) => 32 + 8 * (c.events.len() + 4 * c.ops.len()) as u32,
+            ControlReply::Counters(c) => 48 + 8 * (c.events.len() + 4 * c.ops.len()) as u32,
             ControlReply::Record(Record {
                 what: Happened::Event { detail, .. },
                 ..
@@ -626,6 +659,15 @@ mod tests {
                 errors: 1,
                 total_ns: 1000,
             }],
+            resources: Resources {
+                user_ns: 1,
+                sys_ns: 2,
+                voluntary_switches: 3,
+                involuntary_switches: 4,
+                workers: 5,
+                busy_ns: 6,
+                parks: 7,
+            },
         }));
         round_trip(&ControlReply::Record(Record {
             at_ns: 11,

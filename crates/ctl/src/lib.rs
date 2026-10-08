@@ -1,5 +1,6 @@
 //! What `jackalopefs-ctl` works out without a process to talk to: which processes there are, what a selector asks for, rates between two readings of the counters, and how a record reads.
 
+use jackalopefs_perf::{fmt_count, level_outermost, totals_at, RateResources};
 use jackalopefs_proto::control::{
     ControlReply, Counters, Exchange, Happened, Ids, Names, Record, Selection, Summary,
 };
@@ -196,6 +197,79 @@ pub fn rates(before: &Counters, now: &Counters, seconds: f64) -> (Vec<RateEvent>
     (events, ops)
 }
 
+/// The process's resource use between two readings of its counters, timed by the process's own uptime in each (not when the readings arrived), against the requests it served at its outermost level.
+pub fn resources_between(before: &Counters, now: &Counters) -> Option<RateResources> {
+    let level = level_outermost(&now.side);
+    let (served_before, moved_before) = totals_at(&before.ops, level);
+    let (served, moved) = totals_at(&now.ops, level);
+    RateResources::between(
+        &before.resources,
+        &now.resources,
+        now.uptime_ns.saturating_sub(before.uptime_ns) as f64 / 1e9,
+        served.saturating_sub(served_before),
+        moved.saturating_sub(moved_before),
+    )
+}
+
+/// The resources line of `top`: what the process spends, in all and per request served.
+pub fn fmt_resources(r: &RateResources) -> String {
+    let per_request = match (r.cpu_ns_per_request, r.switches_per_request) {
+        (Some(cpu), Some(switches)) => {
+            format!(
+                "{} CPU and {switches:.1} switches per request",
+                fmt_ns(cpu as u64)
+            )
+        }
+        _ => "no requests".to_owned(),
+    };
+    let per_mib = r.cpu_ns_per_mib.map_or_else(String::new, |cpu| {
+        format!(", {} CPU per MiB", fmt_ns(cpu as u64))
+    });
+    format!(
+        "CPU {:.2} cores (user {:.2}, sys {:.2}), {} switches/s; {} worker{} {:.0}% busy, {} parks/s; {per_request}{per_mib}",
+        r.user_cores + r.sys_cores,
+        r.user_cores,
+        r.sys_cores,
+        fmt_count(r.switches_per_second),
+        r.workers,
+        if r.workers == 1 { "" } else { "s" },
+        100.0 * r.busy_cores / f64::from(r.workers.max(1)),
+        fmt_count(r.parks_per_second),
+    )
+}
+
+/// The counters as `key value` lines, one figure each, for scripts: names are stable, values raw.
+pub fn counter_lines(c: &Counters) -> String {
+    let mut out = String::new();
+    let mut put = |key: &str, value: &dyn std::fmt::Display| {
+        writeln!(out, "{key} {value}").expect("a String takes any write");
+    };
+    put("side", &clean(&c.side));
+    put("pid", &c.pid);
+    put("uptime_ns", &c.uptime_ns);
+    put("inflight", &c.inflight);
+    let r = &c.resources;
+    put("resources.user_ns", &r.user_ns);
+    put("resources.sys_ns", &r.sys_ns);
+    put("resources.voluntary_switches", &r.voluntary_switches);
+    put("resources.involuntary_switches", &r.involuntary_switches);
+    put("resources.workers", &r.workers);
+    put("resources.busy_ns", &r.busy_ns);
+    put("resources.parks", &r.parks);
+    for (name, value) in &c.events {
+        put(&format!("event.{}", clean(name)), value);
+    }
+    for t in &c.ops {
+        let key = format!("op.{}.{}", clean(&t.level), clean(&t.op));
+        put(&format!("{key}.count"), &t.count);
+        put(&format!("{key}.bytes"), &t.bytes);
+        put(&format!("{key}.items"), &t.items);
+        put(&format!("{key}.errors"), &t.errors);
+        put(&format!("{key}.total_ns"), &t.total_ns);
+    }
+    out
+}
+
 /// A duration in nanoseconds, as a person reads it.
 pub fn fmt_ns(ns: u64) -> String {
     match ns {
@@ -223,7 +297,13 @@ pub fn fmt_bytes(bytes: f64) -> String {
 }
 
 /// The `top` screen for reading `now` and the rates since the last.
-pub fn render_top(now: &Counters, events: &[RateEvent], ops: &[RateOp], seconds: f64) -> String {
+pub fn render_top(
+    now: &Counters,
+    resources: Option<&RateResources>,
+    events: &[RateEvent],
+    ops: &[RateOp],
+    seconds: f64,
+) -> String {
     let mut out = String::new();
     writeln!(
         out,
@@ -235,6 +315,9 @@ pub fn render_top(now: &Counters, events: &[RateEvent], ops: &[RateOp], seconds:
         now.inflight
     )
     .expect("a String takes any write");
+    if let Some(resources) = resources {
+        writeln!(out, "{}", fmt_resources(resources)).expect("a String takes any write");
+    }
     writeln!(
         out,
         "\n{:<8} {:<16} {:>9} {:>11} {:>10} {:>8} {:>10}",
@@ -638,6 +721,70 @@ mod tests {
         );
         let (_, idle) = rates(&now, &now, 1.0);
         assert_eq!(idle[0].mean_ns, None);
+    }
+
+    #[test]
+    fn resources_are_timed_by_the_process_and_counted_against_its_outermost_requests() {
+        let reading = |uptime_s: u64, cpu_s: u64, fuse: u64, call: u64| Counters {
+            side: "client".into(),
+            uptime_ns: uptime_s * 1_000_000_000,
+            ops: vec![
+                total("fuse", "read", fuse, fuse * 4096, 0, 0),
+                total("call", "read", call, call * 4096, 0, 0),
+            ],
+            resources: jackalopefs_proto::control::Resources {
+                user_ns: cpu_s * 1_000_000_000,
+                workers: 1,
+                ..Default::default()
+            },
+            ..Counters::default()
+        };
+        let r = resources_between(&reading(10, 1, 100, 300), &reading(12, 3, 1100, 2300)).unwrap();
+        assert_eq!(r.seconds, 2.0);
+        assert_eq!(r.user_cores, 1.0);
+        assert_eq!(
+            r.requests_per_second, 500.0,
+            "the kernel's requests, not the calls made for them"
+        );
+        assert_eq!(r.cpu_ns_per_request, Some(2_000_000.0));
+        let busy = fmt_resources(&r);
+        let idle = fmt_resources(
+            &resources_between(&reading(12, 3, 1100, 2300), &reading(14, 3, 1100, 2300)).unwrap(),
+        );
+        assert!(!busy.is_empty());
+        assert_ne!(
+            busy, idle,
+            "a process at work reads differently from one at rest"
+        );
+    }
+
+    #[test]
+    fn counter_lines_name_every_figure_once() {
+        let c = Counters {
+            side: "server".into(),
+            pid: 7,
+            events: vec![("reply_stalled".into(), 2)],
+            ops: vec![total("request", "read", 3, 12288, 0, 300)],
+            ..Counters::default()
+        };
+        let text = counter_lines(&c);
+        let keys: Vec<&str> = text.lines().map(|l| l.split_once(' ').unwrap().0).collect();
+        let mut unique = keys.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(keys.len(), unique.len());
+        for (key, value) in [
+            ("pid", "7"),
+            ("resources.user_ns", "0"),
+            ("event.reply_stalled", "2"),
+            ("op.request.read.count", "3"),
+            ("op.request.read.bytes", "12288"),
+        ] {
+            assert!(
+                text.lines().any(|l| l == format!("{key} {value}")),
+                "{key} in {text}"
+            );
+        }
     }
 
     #[test]

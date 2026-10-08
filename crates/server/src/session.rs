@@ -10,8 +10,8 @@ use crate::{Limits, SESSION_GRACE};
 use jackalopefs_perf::event;
 use jackalopefs_perf::hub::{elided, Hub, IdsEvent, Side};
 use jackalopefs_perf::{
-    fmt_duration, line_quic, line_udp, lines_link, verdict, MeterLink, MeterUdp, SampleLink,
-    TrackerQuic,
+    fmt_duration, line_process, line_quic, line_udp, lines_link, verdict, MeterLink, MeterProcess,
+    MeterUdp, SampleLink, TrackerQuic,
 };
 use jackalopefs_proto::control::Summary;
 use jackalopefs_proto::{
@@ -211,7 +211,7 @@ pub struct Notification {
 }
 
 impl Server {
-    /// `perf` is made first because change notification counts into it too.
+    /// `perf` is made first because change notification counts into it too. Called from within the runtime that serves, whose workers the reports measure.
     pub fn new(
         export: Arc<Export>,
         token: Option<String>,
@@ -232,6 +232,7 @@ impl Server {
             meters: Mutex::new(Meters {
                 link: MeterLink::system(),
                 udp: MeterUdp::system(),
+                process: MeterProcess::new(tokio::runtime::Handle::current(), 0, 0),
             }),
             token,
             connection_permits: Arc::new(Semaphore::new(limits.connections)),
@@ -275,10 +276,18 @@ impl Server {
             let state = if detached { "detached" } else { "attached" };
             tracing::info!(target: TRACE_TARGET, "perf handles session={session} open={open} state={state}");
         }
-        let (links, udp) = {
+        let (served, moved) = self.perf.served();
+        let (process, links, udp) = {
             let mut meters = self.meters.lock();
-            (meters.link.sample(), meters.udp.sample())
+            (
+                meters.process.sample(served, moved),
+                meters.link.sample(),
+                meters.udp.sample(),
+            )
         };
+        if let Some(process) = process {
+            tracing::info!(target: TRACE_TARGET, "{}", line_process(&process));
+        }
         for line in lines_link(&links) {
             tracing::info!(target: TRACE_TARGET, "{line}");
         }
@@ -303,6 +312,7 @@ impl Server {
 struct Meters {
     link: MeterLink,
     udp: MeterUdp,
+    process: MeterProcess,
 }
 
 /// One connection's QUIC line for the window since its last sample, and the verdict against the ports when there is one to give.

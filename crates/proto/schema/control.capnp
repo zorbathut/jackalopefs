@@ -72,6 +72,17 @@ struct TotalOp {
   totalNs @6 :UInt64;
 }
 
+# What the process has used since it started: its CPU time and context switches (every thread's, exited ones included), and its main runtime's workers, the time they spent busy (summed) and how often they parked.
+struct Resources {
+  userNs @0 :UInt64;
+  sysNs @1 :UInt64;
+  voluntarySwitches @2 :UInt64;
+  involuntarySwitches @3 :UInt64;
+  workers @4 :UInt32;
+  busyNs @5 :UInt64;
+  parks @6 :UInt64;
+}
+
 struct Counters {
   # `client` or `server`.
   side @0 :Text;
@@ -82,6 +93,7 @@ struct Counters {
   inflight @4 :UInt64;
   events @5 :List(Count);
   ops @6 :List(TotalOp);
+  resources @7 :Resources;
 }
 
 # The identifiers that join a record to the log lines and to the other side's
