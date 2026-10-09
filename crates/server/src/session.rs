@@ -16,7 +16,7 @@ use jackalopefs_perf::{
 use jackalopefs_proto::control::{HandlesSession, HandlesTotals, Summary};
 use jackalopefs_proto::{
     encode, read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply,
-    Request, Response, PROTO_REVISION,
+    NoticeHandles, Request, Response, PROTO_REVISION,
 };
 use parking_lot::Mutex;
 use quinn::{Connection, RecvStream, SendStream};
@@ -458,6 +458,7 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     let events = tokio::spawn(forward_events(
         conn.clone(),
         server.events.subscribe(),
+        session.handles.notice(),
         session.id,
         conn_key,
         server.perf.hub.clone(),
@@ -609,77 +610,147 @@ async fn handshake(
     }
 }
 
-/// Copy event batches to this session's uni stream, dropping its own echoes; a lagging receiver tells the client to distrust everything instead of silently losing events.
+/// Copy event batches to this session's uni stream, dropping its own echoes; a lagging receiver tells the client to distrust everything instead of silently losing events. The session's notice that it holds many handles goes on the same stream: one still pending when the connection attaches first (its last connection went before it was written), then each new one as it is set, and each is cleared once written.
 async fn forward_events(
     conn: Connection,
     mut events: broadcast::Receiver<Arc<EventBatch>>,
+    notice: tokio::sync::watch::Sender<Option<NoticeHandles>>,
     session_id: u64,
     conn_key: Option<u64>,
     hub: Arc<Hub>,
 ) {
-    let mut send = match conn.open_uni().await {
+    let send = match conn.open_uni().await {
         Ok(send) => send,
         Err(e) => {
             tracing::debug!(session_id, "could not open event stream: {e}");
             return;
         }
     };
-    let tap_ids = IdsEvent {
-        session: Some(session_id),
-        conn: conn_key,
-        stream: Some(u64::from(send.id())),
-        op: Some("event"),
-        ..IdsEvent::default()
+    let mut stream = StreamEvents {
+        tap_ids: IdsEvent {
+            session: Some(session_id),
+            conn: conn_key,
+            stream: Some(u64::from(send.id())),
+            op: Some("event"),
+            ..IdsEvent::default()
+        },
+        send,
+        seq: 0,
+        session_id,
+        conn,
+        hub,
     };
-    // Batches written so far; the client counts the ones it reads, so the two agree on which `every`th is which.
-    let mut seq = 0u64;
+    let mut notices = notice.subscribe();
+    let pending = *notices.borrow_and_update();
+    if let Some(pending) = pending {
+        if stream.send(&notice_event(pending)).await.is_break() {
+            return;
+        }
+        delivered(&notice, pending);
+    }
+    // Once the session is gone its notices are too, and only batches remain.
+    let mut noticing = true;
     loop {
-        let event = match events.recv().await {
-            Ok(batch) => batch.for_session(session_id),
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!(
-                    session_id,
-                    dropped = n,
-                    "event stream lagged; sending overflow"
-                );
-                Some(Event {
-                    items: vec![EventItem::Overflow],
-                })
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+        let event = tokio::select! {
+            batch = events.recv() => match batch {
+                Ok(batch) => batch.for_session(session_id),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(
+                        session_id,
+                        dropped = n,
+                        "event stream lagged; sending overflow"
+                    );
+                    Some(Event {
+                        items: vec![EventItem::Overflow],
+                        handles: None,
+                    })
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            changed = notices.changed(), if noticing => match changed {
+                Ok(()) => (*notices.borrow_and_update()).map(notice_event),
+                Err(_) => {
+                    noticing = false;
+                    None
+                }
+            },
         };
         let Some(event) = event else { continue };
-        match timeout(EVENT_WRITE_TIMEOUT, write_frame(&mut send, &event)).await {
+        if stream.send(&event).await.is_break() {
+            break;
+        }
+        if let Some(sent) = event.handles {
+            delivered(&notice, sent);
+        }
+    }
+}
+
+/// Clear a notice once written, unless a newer one has replaced it; clearing it wakes nobody.
+fn delivered(notice: &tokio::sync::watch::Sender<Option<NoticeHandles>>, sent: NoticeHandles) {
+    notice.send_if_modified(|pending| {
+        if *pending == Some(sent) {
+            *pending = None;
+        }
+        false
+    });
+}
+
+fn notice_event(notice: NoticeHandles) -> Event {
+    Event {
+        items: vec![],
+        handles: Some(notice),
+    }
+}
+
+/// A session's event stream on one connection, and how many frames it has carried.
+struct StreamEvents {
+    send: SendStream,
+    tap_ids: IdsEvent,
+    /// Frames written so far, batches and notices alike; the client counts the ones it reads, so the two agree on which `every`th is which.
+    seq: u64,
+    session_id: u64,
+    conn: Connection,
+    hub: Arc<Hub>,
+}
+
+impl StreamEvents {
+    /// Write one frame; a break means the stream is finished with.
+    async fn send(&mut self, event: &Event) -> std::ops::ControlFlow<()> {
+        use std::ops::ControlFlow;
+        let session_id = self.session_id;
+        match timeout(EVENT_WRITE_TIMEOUT, write_frame(&mut self.send, event)).await {
             Ok(Ok(())) => {
-                if hub.wants_frames() {
-                    // The batch encoded for the write just made, so it encodes again.
-                    hub.event_frame(Side::Server, &tap_ids, seq, || {
-                        encode(&event).ok().map(|frame| frame[4..].to_vec())
-                    });
+                if self.hub.wants_frames() {
+                    // The frame encoded for the write just made, so it encodes again.
+                    self.hub
+                        .event_frame(Side::Server, &self.tap_ids, self.seq, || {
+                            encode(event).ok().map(|frame| frame[4..].to_vec())
+                        });
                 }
-                seq += 1;
+                self.seq += 1;
+                ControlFlow::Continue(())
             }
             Ok(Err(e @ jackalopefs_proto::ErrorCodec::TooLarge(_))) => {
                 tracing::warn!(
                     session_id,
                     "event batch could not be sent: {e}; the client falls back to its cache TTL"
                 );
-                break;
+                ControlFlow::Break(())
             }
             Ok(Err(e)) => {
                 tracing::debug!(session_id, "event stream closed: {e}");
-                break;
+                ControlFlow::Break(())
             }
             Err(_) => {
                 tracing::warn!(
                     session_id,
                     "client stopped draining the event stream; closing connection"
                 );
-                conn.close(
+                self.conn.close(
                     close_code::EVENT_STREAM_STALLED.into(),
                     b"event stream stalled",
                 );
-                break;
+                ControlFlow::Break(())
             }
         }
     }

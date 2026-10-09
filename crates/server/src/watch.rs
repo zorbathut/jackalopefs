@@ -74,7 +74,10 @@ impl EventBatch {
         if items.is_empty() {
             None
         } else {
-            Some(Event { items })
+            Some(Event {
+                items,
+                handles: None,
+            })
         }
     }
 }

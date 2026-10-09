@@ -259,6 +259,15 @@ struct EventItem {
 }
 
 # One debounce window of events, in order, on the server-to-client stream.
+# handles, when set, is for this session alone and carries no change: it holds
+# `held` handles, past the server's per-session share of `share`, and the
+# client is asked to report what holds them. A frame may carry it with no items.
 struct Event {
   items @0 :List(EventItem);
+  handles @1 :NoticeHandles;
+}
+
+struct NoticeHandles {
+  held @0 :UInt64;
+  share @1 :UInt64;
 }

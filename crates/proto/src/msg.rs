@@ -462,10 +462,18 @@ pub enum EventItem {
     Unwatched { dir: Path },
 }
 
-/// One debounce window's worth of events, in order, on the server-to-client event stream.
+/// One debounce window's worth of events, in order, on the server-to-client event stream, and, for the one session it is sent to, a notice that it holds many handles.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Event {
     pub items: Vec<EventItem>,
+    pub handles: Option<NoticeHandles>,
+}
+
+/// The session holds `held` handles, past the server's per-session share of `share`; the client is asked to report what holds them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NoticeHandles {
+    pub held: u64,
+    pub share: u64,
 }
 
 #[cfg(test)]

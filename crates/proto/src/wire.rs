@@ -1,7 +1,9 @@
 //! Conversions between the Rust message types and the generated Cap'n Proto readers and builders. Parsing is the trust boundary: every name, path and token is validated here, and anything the schema version on the other side knows but this one doesn't is a decode error rather than a guess.
 
 use crate::jackalopefs_capnp as schema;
-use crate::msg::{Auth, Event, EventItem, Hello, HelloReply, Request, Response, Resume};
+use crate::msg::{
+    Auth, Event, EventItem, Hello, HelloReply, NoticeHandles, Request, Response, Resume,
+};
 use crate::types::{
     Attr, DirEntry, ErrorName, ErrorPathTooLong, FileKind, Identity, Name, Path, SetAttr, Statfs,
     TimeOrNow, TimeSpec, Whence, HANDLE_MAX, PATH_MAX,
@@ -1088,7 +1090,12 @@ impl Message for Response {
 
 impl Message for Event {
     fn build(&self, message: &mut message::Builder<HeapAllocator>) {
-        let b = message.init_root::<schema::event::Builder<'_>>();
+        let mut b = message.init_root::<schema::event::Builder<'_>>();
+        if let Some(notice) = self.handles {
+            let mut n = b.reborrow().init_handles();
+            n.set_held(notice.held);
+            n.set_share(notice.share);
+        }
         let mut list = b.init_items(self.items.len() as u32);
         for (i, item) in self.items.iter().enumerate() {
             let mut w = list.reborrow().get(i as u32);
@@ -1129,11 +1136,21 @@ impl Message for Event {
                 },
             });
         }
-        Ok(Event { items })
+        let handles = if r.has_handles() {
+            let n = r.get_handles()?;
+            Some(NoticeHandles {
+                held: n.get_held(),
+                share: n.get_share(),
+            })
+        } else {
+            None
+        };
+        Ok(Event { items, handles })
     }
 
     fn size_hint(&self) -> u32 {
         BASE_WORDS
+            + 3
             + self
                 .items
                 .iter()

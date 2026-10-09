@@ -2,6 +2,7 @@
 
 use crate::watch::Armed;
 use jackalopefs_proto::control::HandlesTotals;
+use jackalopefs_proto::NoticeHandles;
 use jackalopefs_proto::Path;
 use nix::errno::Errno;
 use parking_lot::Mutex;
@@ -10,6 +11,7 @@ use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use tokio::sync::watch;
 
 /// Files are shared freely because every access that depends on a position carries its own offset (`pread`/`pwrite`); an `lseek` for data or a hole moves the descriptor's position, which nothing reads. A directory's read position is shared state and so carries its own lock.
 #[derive(Clone)]
@@ -114,7 +116,14 @@ impl Slot<'_> {
         let mut reported = handles.reported.load(Ordering::Relaxed);
         let due = jackalopefs_perf::doubling_due(held, handles.share.max(1) as u64, &mut reported);
         handles.reported.store(reported, Ordering::Relaxed);
-        due.then_some(held)
+        if !due {
+            return None;
+        }
+        handles.notice.send_replace(Some(NoticeHandles {
+            held,
+            share: handles.share as u64,
+        }));
+        Some(held)
     }
 }
 
@@ -141,6 +150,8 @@ pub struct Handles {
     /// The handles in `map` of each kind, changed under its lock.
     files: AtomicU64,
     dirs: AtomicU64,
+    /// What the session's client is asked to report: set at each threshold crossed, and cleared once it has been written to the session's connection or the session is back under half its share.
+    notice: watch::Sender<Option<NoticeHandles>>,
 }
 
 impl Handle {
@@ -158,7 +169,13 @@ impl Handles {
             reported: AtomicU64::new(0),
             files: AtomicU64::new(0),
             dirs: AtomicU64::new(0),
+            notice: watch::Sender::new(None),
         }
+    }
+
+    /// The notice for the session's client, which its connection's event stream sends and then clears.
+    pub fn notice(&self) -> watch::Sender<Option<NoticeHandles>> {
+        self.notice.clone()
     }
 
     pub fn share(&self) -> usize {
@@ -234,6 +251,8 @@ impl Handles {
         // Back under half its share, a session is reported afresh when it next crosses it; a session hovering at its share is not.
         if 2 * map.len() < self.share {
             self.reported.store(0, Ordering::Relaxed);
+            self.notice
+                .send_if_modified(|notice| notice.take().is_some());
         }
         Some(handle)
     }
@@ -342,6 +361,12 @@ mod tests {
             }
         }
         assert_eq!(due, [4, 8, 16]);
+        let notices = handles.notice().subscribe();
+        assert_eq!(
+            *notices.borrow(),
+            Some(NoticeHandles { held: 16, share: 4 }),
+            "the last crossing waits for the client"
+        );
         for fh in 3..=20 {
             handles.remove(fh);
         }
@@ -354,6 +379,7 @@ mod tests {
         handles.remove(30);
         handles.remove(2);
         assert_eq!(handles.len(), 1, "under half its share");
+        assert_eq!(*notices.borrow(), None, "nothing left to report");
         let again: Vec<u64> = (40..43)
             .filter_map(|fh| handles.insert(fh, file_handle()).unwrap())
             .collect();

@@ -3,11 +3,13 @@
 use crate::client::{exchange, Error, KeyRoot, Tapping, Timing};
 use crate::handles::{HandleKind, HandleTable};
 use crate::ids::{IdMap, ModeIds};
+use crate::perf::{Perf, Slowpath};
 use crate::transport::{client_config, ServerTrust};
-use jackalopefs_perf::hub::{Hub, IdsEvent, Side};
+use jackalopefs_perf::hub::{IdsEvent, Side};
+use jackalopefs_proto::control::{HandlesProcess, HandlesTotals};
 use jackalopefs_proto::{
-    read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply, Resume,
-    PROTO_REVISION,
+    read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply,
+    NoticeHandles, Resume, PROTO_REVISION,
 };
 use quinn::{Connection, Endpoint};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -108,11 +110,11 @@ impl ErrorConnectKind {
 
 impl ConnManager {
     /// Establish the first connection (failing loudly if it can't be made) and start the reconnect loop.
-    /// `hub` is where the frames of reconnects, releases and events go when a tap captures them.
+    /// `perf` is where the frames of reconnects, releases and events go when a tap captures them, and where the server's notices are counted.
     pub async fn start(
         cfg: ConfigConn,
         handles: Arc<HandleTable>,
-        hub: Arc<Hub>,
+        perf: Arc<Perf>,
     ) -> anyhow::Result<ConnManager> {
         anyhow::ensure!(
             !cfg.server_addrs.is_empty(),
@@ -128,7 +130,7 @@ impl ConnManager {
         let (first_tx, first_rx) = oneshot::channel();
         let offline_timeout = cfg.offline_timeout;
         let task = tokio::spawn(run(
-            cfg, candidates, handles, hub, state_tx, events_tx, stop_rx, first_tx,
+            cfg, candidates, handles, perf, state_tx, events_tx, stop_rx, first_tx,
         ));
         match first_rx.await {
             Ok(Ok(())) => {
@@ -192,12 +194,13 @@ async fn run(
     cfg: ConfigConn,
     mut candidates: Vec<Candidate>,
     handles: Arc<HandleTable>,
-    hub: Arc<Hub>,
+    perf: Arc<Perf>,
     state: watch::Sender<ConnState>,
     events: mpsc::Sender<Event>,
     mut stop: watch::Receiver<bool>,
     first: oneshot::Sender<Result<(), ErrorConnect>>,
 ) {
+    let hub = perf.hub.clone();
     let mut first = Some(first);
     let mut resume: Option<Resume> = None;
     let mut generation = 0u64;
@@ -331,7 +334,8 @@ async fn run(
         let reader = tokio::spawn(read_events(
             conn.clone(),
             events.clone(),
-            hub.clone(),
+            perf.clone(),
+            handles.clone(),
             tapping.session,
             conn_key,
         ));
@@ -673,14 +677,63 @@ async fn send_releases(
     }
 }
 
+/// Most processes a report of the handles names one by one.
+const REPORT_PROCESSES: usize = 10;
+
+/// What a report of the handles says, for the server's `notice`: what the server counts and what this client counts, which differ by handles the server holds that this client has not recorded yet (an open whose reply is on its way, the one that crossed the threshold among them), has forgotten, or is still releasing; then the processes that opened them, the largest first.
+pub fn lines_handles(
+    notice: NoticeHandles,
+    totals: HandlesTotals,
+    rows: &[HandlesProcess],
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "the server reports this mount holds {} handles, past its share of {}; this client holds {} ({} files, {} dirs), by the process that opened them:",
+        notice.held,
+        notice.share,
+        totals.files + totals.dirs,
+        totals.files,
+        totals.dirs
+    )];
+    for row in rows.iter().take(REPORT_PROCESSES) {
+        let who = if row.pid == 0 {
+            "(unattributed)".to_owned()
+        } else {
+            format!("{}[{}]", row.name, row.pid)
+        };
+        lines.push(format!(
+            "  {who} {} files, {} dirs, within {}",
+            row.files, row.dirs, row.within
+        ));
+    }
+    if rows.len() > REPORT_PROCESSES {
+        let rest = &rows[REPORT_PROCESSES..];
+        lines.push(format!(
+            "  and {} more processes holding {}",
+            rest.len(),
+            rest.iter().map(|r| r.files + r.dirs).sum::<u64>()
+        ));
+    }
+    lines
+}
+
+fn report_handles(perf: &Perf, handles: &HandleTable, notice: NoticeHandles) {
+    let lines = lines_handles(notice, handles.totals(), &handles.processes());
+    perf.events.inc(Slowpath::HandlesReported);
+    for line in lines {
+        tracing::warn!("{line}");
+    }
+}
+
 /// Reads the server's uni event stream into the bounded queue. When the consumer falls behind, batches are dropped and a single `Overflow` is queued as soon as there is room, so the consumer knows to distrust its cache rather than miss changes silently.
 async fn read_events(
     conn: Connection,
     events: mpsc::Sender<Event>,
-    hub: Arc<Hub>,
+    perf: Arc<Perf>,
+    handles: Arc<HandleTable>,
     session: u64,
     conn_key: Option<u64>,
 ) {
+    let hub = perf.hub.clone();
     let mut recv = match conn.accept_uni().await {
         Ok(recv) => recv,
         Err(e) => {
@@ -717,9 +770,19 @@ async fn read_events(
         if hub.wants_frames() {
             hub.event_frame(Side::Client, &tap_ids, seq, || Some(body));
         }
+        let mut event = event;
+        if let Some(notice) = event.handles.take() {
+            let (perf, handles) = (perf.clone(), handles.clone());
+            // The report walks every handle, which is no work for the runtime's one worker.
+            tokio::task::spawn_blocking(move || report_handles(&perf, &handles, notice));
+            if event.items.is_empty() {
+                continue;
+            }
+        }
         if overflow_pending {
             match events.try_send(Event {
                 items: vec![EventItem::Overflow],
+                handles: None,
             }) {
                 Ok(()) => overflow_pending = false,
                 Err(_) => continue,
@@ -733,5 +796,60 @@ async fn read_events(
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(pid: u32, held: u64) -> HandlesProcess {
+        HandlesProcess {
+            pid,
+            name: format!("p{pid}"),
+            files: 0,
+            dirs: held,
+            within: format!("/w{pid}"),
+        }
+    }
+
+    #[test]
+    fn a_report_of_the_handles_names_the_largest_openers_and_counts_the_rest() {
+        let notice = NoticeHandles {
+            held: 4100,
+            share: 4080,
+        };
+        let totals = HandlesTotals {
+            files: 7,
+            dirs: 4093,
+        };
+        let rows: Vec<HandlesProcess> = (1..=REPORT_PROCESSES as u32 + 3)
+            .map(|pid| row(pid, 100 - u64::from(pid)))
+            .chain([HandlesProcess {
+                files: 1,
+                ..HandlesProcess::default()
+            }])
+            .collect();
+        let lines = lines_handles(notice, totals, &rows);
+        assert!(
+            lines[0].contains("4100") && lines[0].contains("4080") && lines[0].contains("4093")
+        );
+        for pid in 1..=REPORT_PROCESSES as u32 {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&format!("p{pid}[{pid}]"))
+                        && l.contains(&format!("/w{pid}"))),
+                "{pid} in {lines:?}"
+            );
+        }
+        assert!(!lines.iter().any(|l| l.contains("p11[")));
+        assert_eq!(lines.len(), 1 + REPORT_PROCESSES + 1, "{lines:?}");
+        let few = lines_handles(notice, totals, &rows[..2]);
+        assert_eq!(
+            few.len(),
+            3,
+            "no tail line when every opener is named: {few:?}"
+        );
     }
 }

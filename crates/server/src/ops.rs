@@ -266,7 +266,7 @@ impl Ops {
             share,
             pool_used = pool.used(),
             pool_capacity = pool.capacity(),
-            "client {} holds {held} handles, past its share of {share}",
+            "client {} holds {held} handles, past its share of {share}; it is asked to log what holds them",
             self.remote
         );
     }

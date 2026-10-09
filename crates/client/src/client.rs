@@ -795,7 +795,7 @@ impl Client {
                 ids: cfg.ids,
             },
             handles.clone(),
-            perf.hub.clone(),
+            perf.clone(),
         )
         .await?;
         Ok(Client {

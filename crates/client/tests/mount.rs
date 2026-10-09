@@ -73,6 +73,27 @@ impl Mounted {
         })
     }
 
+    /// A mount whose server reports a session past `share` handles.
+    async fn start_sharing(share: usize) -> Option<Mounted> {
+        if !fuse_available() {
+            return None;
+        }
+        let export = tempfile::tempdir().unwrap();
+        let server = TestServer::start_sharing(export.path(), share).await;
+        let (mount, mountpoint) = Mounted::mount(
+            server.config(Duration::from_secs(10)),
+            Duration::from_secs(1),
+        )
+        .await;
+        Some(Mounted {
+            mount: Some(mount),
+            server: Some(server),
+            _blackhole: None,
+            export,
+            mountpoint,
+        })
+    }
+
     /// A mount whose server completes the handshake and then never answers a request: a live connection to a server that has stalled.
     async fn start_stalled() -> Option<Mounted> {
         if !fuse_available() {
@@ -2519,6 +2540,72 @@ async fn handles_are_put_down_to_the_process_that_opened_them() {
     assert_eq!(row.name, "sh");
     let totals = m.mount.as_ref().unwrap().client().handles().totals();
     assert!(totals.dirs >= 2 && totals.files >= 1, "{totals:?}");
+    let mut stdin = child.stdin.take().unwrap();
+    let status = blocking(move || {
+        stdin.write_all(b"\n").unwrap();
+        drop(stdin);
+        child.wait().unwrap()
+    })
+    .await;
+    assert!(status.success());
+    m.finish().await;
+}
+
+/// A client past its share of the server's handles still opens, the server reports it, and asks the client, which logs what holds them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_client_past_its_share_keeps_opening_and_is_asked_to_report() {
+    let Some(m) = Mounted::start_sharing(3).await else {
+        return;
+    };
+    for dir in ["a", "b", "c", "d"] {
+        fs::create_dir(m.export.path().join(dir)).unwrap();
+    }
+    fs::write(m.export.path().join("f"), b"x").unwrap();
+    let mnt = m.mnt();
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"exec 3<"$1" 4<"$2" 5<"$3" 6<"$4" 7<"$5"; echo ready; read x"#)
+        .arg("sh")
+        .args(["a", "b", "c", "d", "f"].map(|name| mnt.join(name)))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let ready = blocking(move || {
+        let mut line = [0u8; 6];
+        stdout.read_exact(&mut line).map(|()| line)
+    })
+    .await
+    .expect("every open past the share succeeds");
+    assert_eq!(&ready, b"ready\n");
+    let count = |counts: Vec<(&'static str, u64)>, name: &str| {
+        counts
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .map_or(0, |(_, v)| v)
+    };
+    let server = m.server.as_ref().unwrap();
+    assert!(
+        count(server.server.perf.events.counts(), "handle_share_exceeded") >= 1,
+        "the server reported the session"
+    );
+    let reported = async {
+        loop {
+            let counts = m.mount.as_ref().unwrap().perf().events.counts();
+            if count(counts, "handles_reported") >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), reported)
+        .await
+        .expect("the client was asked to report and did");
+    assert_eq!(
+        count(server.server.perf.events.counts(), "handle_pool_full"),
+        0
+    );
     let mut stdin = child.stdin.take().unwrap();
     let status = blocking(move || {
         stdin.write_all(b"\n").unwrap();

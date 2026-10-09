@@ -4,6 +4,7 @@
 
 ### Added
 
+- A server that warns about a session past its share of handles also asks its client to report, and the client logs which processes opened its handles, with how many files and directories each holds and the directory most of them are in, beside the server's count and its own. The server never learns about processes; the client event `handles_reported` counts the reports.
 - `jackalopefs-ctl handles` lists the handles a process holds open: on a client one row per process that opened them, with its files, directories and the deepest directory holding at least half of them, and on a server one row per session with its client's address. `top` and `counters` show the handles open by kind. The client finds a handle's process from `/proc` on its blocking pool, remembering each thread's for 100 ms, and none of it leaves the client.
 - `jackalopefs-ctl top` shows each operation's median size and its median and 99th-percentile latency over the interval, from latency and size histograms each process keeps per operation (`counters` lists their buckets).
 - `jackalopefs-ctl top` shows the process's CPU (user and system), context switches, and its runtime's workers with their busy time and parks, each as a rate and per request served, with CPU per MiB moved; `jackalopefs-ctl counters` prints the raw totals as `key value` lines for scripts; the periodic report (`--perf-interval`, `SIGUSR1`) has the same figures as its `perf process` line. Rates in `top` are timed by the process's own clock, so a slow reading no longer skews them.
@@ -33,6 +34,7 @@
 
 ### Breaking
 
+- Protocol revision: an event stream frame can carry a notice that the session holds many handles (`Event.handles`), which a client logs its handles for. Client and server must be rebuilt together.
 - Protocol revision: an `unwatched` event item, with which the server says it stopped watching a directory; the client then drops what it cached under it. Client and server must be rebuilt together.
 - Protocol revision: a listing always carries attributes. The `readdir` request loses its `plus` flag, the plain `readdir` reply is gone, and a listing entry is its name, its cookie and its attributes (absent for `.` and `..`), without the raw inode number and type; a listed entry with a one-byte name and ext4's 8-byte file handle is 176 bytes, not 200. Ordinals after the removed fields are renumbered, which the schema's evolution contract now allows a new revision to do for everything but `Hello`, `HelloReply` and the structs they reach. Client and server must be rebuilt together.
 - `jackalopefs-server --ids flatten` is the default: only the server's own uid and gid reach clients, every other owner goes out as nobody (65534) in attributes and in POSIX ACLs, and a chown or ACL naming another id is refused with `EPERM`, an ACL that does not parse with `EINVAL`, and any other `system.*` attribute (other ACL formats among them) with `EOPNOTSUPP`. It refuses to start as uid or gid 65534. `--ids direct` is the previous behaviour, owners passed through both ways.

@@ -51,6 +51,7 @@ impl TestServer {
             Identity::generate().unwrap(),
             None,
             ModeIds::Direct,
+            jackalopefs_server::handles::SHARE_MAX,
         )
         .await
     }
@@ -64,6 +65,21 @@ impl TestServer {
             Identity::generate().unwrap(),
             Some(budget),
             ModeIds::Direct,
+            jackalopefs_server::handles::SHARE_MAX,
+        )
+        .await
+    }
+
+    /// A server that reports a session past `share` handles, with a pool that never runs out.
+    pub async fn start_sharing(export: &Path, share: usize) -> TestServer {
+        TestServer::start_full(
+            export,
+            None,
+            UdpSocket::bind("127.0.0.1:0").unwrap(),
+            Identity::generate().unwrap(),
+            Some(WATCH_BUDGET),
+            ModeIds::Direct,
+            share,
         )
         .await
     }
@@ -77,6 +93,7 @@ impl TestServer {
             Identity::generate().unwrap(),
             Some(WATCH_BUDGET),
             ids,
+            jackalopefs_server::handles::SHARE_MAX,
         )
         .await
     }
@@ -95,6 +112,7 @@ impl TestServer {
             identity,
             Some(WATCH_BUDGET),
             ModeIds::Direct,
+            jackalopefs_server::handles::SHARE_MAX,
         )
         .await
     }
@@ -106,6 +124,7 @@ impl TestServer {
         identity: Identity,
         watch_budget: Option<usize>,
         ids: ModeIds,
+        handle_share: usize,
     ) -> TestServer {
         // The server binary zeroes its umask so client modes are honoured; the in-process server needs the same.
         unsafe { libc::umask(0) };
@@ -144,7 +163,7 @@ impl TestServer {
             perf,
             Limits {
                 connections: 64,
-                handle_share: jackalopefs_server::handles::SHARE_MAX,
+                handle_share,
                 handle_pool: usize::MAX,
             },
             IdMap::of_process(ids).unwrap(),

@@ -1,7 +1,8 @@
 mod common;
 
 use common::*;
-use jackalopefs_proto::{Event, EventItem, Path};
+use jackalopefs_proto::control::{Happened, Selection};
+use jackalopefs_proto::{decode, Event, EventItem, Path};
 use std::fs;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -154,5 +155,139 @@ async fn a_directory_no_client_has_named_is_not_watched() {
     );
 
     client.shutdown().await;
+    server.stop().await;
+}
+
+/// Wait until `client` is connected again to the session it had.
+async fn wait_for_resume(client: &jackalopefs_client::Client) {
+    wait_for(
+        Duration::from_secs(10),
+        "the session to resume",
+        || match &*client.state().borrow() {
+            jackalopefs_client::conn::ConnState::Connected(attached) => (attached.generation >= 2)
+                .then(|| {
+                    assert!(
+                        attached.resumed,
+                        "the session was resumed, not opened afresh"
+                    )
+                }),
+            _ => None,
+        },
+    )
+    .await;
+}
+
+fn handles_reported(client: &jackalopefs_client::Client) -> u64 {
+    client
+        .perf()
+        .events
+        .counts()
+        .into_iter()
+        .find(|(name, _)| *name == "handles_reported")
+        .map_or(0, |(_, n)| n)
+}
+
+/// A session past its share of the server's handles is told so on its own event stream, which goes on carrying changes, and told again on the connection it resumes on; another client is told nothing.
+#[tokio::test]
+async fn a_notice_of_many_handles_reaches_its_own_session_and_again_on_resume() {
+    let export = tempfile::tempdir().unwrap();
+    for dir in ["a", "b", "c", "d"] {
+        fs::create_dir(export.path().join(dir)).unwrap();
+    }
+    let server = TestServer::start_sharing(export.path(), 2).await;
+    let mut client = server.client().await;
+    let mut events = Inbox::new(client.take_events().unwrap());
+    let frames = Selection {
+        frames: true,
+        every: 1,
+        ..Selection::default()
+    };
+    let (_server_tap, mut server_frames) = server.server.perf.hub.subscribe(frames.clone());
+    let (_client_tap, mut client_frames) = client.perf().hub.subscribe(frames);
+    let other = server.client().await;
+    for dir in ["a", "b"] {
+        client
+            .opendir(path(dir), None, |attr| Ok(attr.ino))
+            .await
+            .unwrap();
+    }
+    wait_for(Duration::from_secs(5), "the notice", || {
+        (handles_reported(&client) == 1).then_some(())
+    })
+    .await;
+
+    fs::write(export.path().join("a/new"), b"x").unwrap();
+    let item = events
+        .find(
+            Duration::from_secs(3),
+            |i| matches!(i, EventItem::Entry { name, .. } if name.as_bytes() == b"new"),
+        )
+        .await;
+    assert!(item.is_some(), "changes still arrive after a notice");
+    // Notices are numbered with the batches alike at both ends, so a sample of one in `every` picks the same frames.
+    let session = match &*client.state().borrow() {
+        jackalopefs_client::conn::ConnState::Connected(attached) => attached.session_id,
+        other => panic!("not connected: {other:?}"),
+    };
+    // Each session's stream is numbered on its own, and the server carries the other client's too.
+    let numbered = |frames: &mut jackalopefs_perf::hub::TapReceiver| {
+        let mut seen = std::collections::BTreeMap::new();
+        while let Some(record) = frames.try_recv() {
+            if let Happened::EventFrame { seq, body, ids, .. } = record.what {
+                if ids.session == Some(session) {
+                    seen.insert(seq, body);
+                }
+            }
+        }
+        seen
+    };
+    let at_server = numbered(&mut server_frames);
+    let at_client = numbered(&mut client_frames);
+    assert!(
+        at_client
+            .values()
+            .any(|body| decode::<Event>(body).unwrap().handles.is_some()),
+        "the notice is among the frames: {at_client:?}"
+    );
+    // Either end may have recorded a frame the other has not yet; those both saw must agree.
+    let both: Vec<u64> = at_client
+        .keys()
+        .filter(|seq| at_server.contains_key(seq))
+        .copied()
+        .collect();
+    for seq in &both {
+        assert_eq!(
+            at_server[seq], at_client[seq],
+            "frame {seq} differs between the ends"
+        );
+    }
+    assert!(
+        both.iter()
+            .any(|seq| decode::<Event>(&at_client[seq]).unwrap().handles.is_some()),
+        "the notice was seen at both ends: {both:?}"
+    );
+    assert_eq!(handles_reported(&other), 0);
+
+    let (_, conn) = client.connection().unwrap();
+    conn.close(9u32.into(), b"simulated outage");
+    wait_for_resume(&client).await;
+    // A notice already written is not repeated on the next connection; the next threshold is told on it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(handles_reported(&client), 1);
+    for dir in ["c", "d"] {
+        client
+            .opendir(path(dir), None, |attr| Ok(attr.ino))
+            .await
+            .unwrap();
+    }
+    wait_for(
+        Duration::from_secs(5),
+        "the next notice on the resumed connection",
+        || (handles_reported(&client) == 2).then_some(()),
+    )
+    .await;
+    assert_eq!(handles_reported(&other), 0);
+    client.shutdown().await;
+    other.shutdown().await;
     server.stop().await;
 }

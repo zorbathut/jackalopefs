@@ -63,6 +63,8 @@ pub enum Slowpath {
     AliasStale,
     /// The server reported a file changed under the kernel's cache, and the kernel was told to drop it.
     FileDroppedFromKernel,
+    /// The server said this client holds many handles, and the client logged what holds them.
+    HandlesReported,
 }
 
 impl Slowpath {
@@ -74,6 +76,7 @@ impl Slowpath {
             Slowpath::CallLostRetried => "call_lost_retried",
             Slowpath::AliasStale => "alias_stale",
             Slowpath::FileDroppedFromKernel => "file_dropped_from_kernel",
+            Slowpath::HandlesReported => "handles_reported",
         }
     }
 }
@@ -86,6 +89,7 @@ impl Kind for Slowpath {
         Slowpath::CallLostRetried,
         Slowpath::AliasStale,
         Slowpath::FileDroppedFromKernel,
+        Slowpath::HandlesReported,
     ];
 
     fn name(self) -> &'static str {
