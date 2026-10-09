@@ -25,6 +25,23 @@ const SHARE_OURS: f64 = 0.5;
 /// A connection cannot move more than its port does, so a share beyond this (link-layer framing and window skew allowed for) means the connection is not on that port and no verdict can be given.
 const SHARE_IMPOSSIBLE: f64 = 1.1;
 
+/// Whether `value` is due a report, given the threshold it was `reported` at last (zero if never) and the `first` threshold (at least 1): the thresholds are `first` and its doublings, and a value seen late is reported once, at the highest threshold it has crossed, which `reported` becomes.
+pub fn doubling_due(value: u64, first: u64, reported: &mut u64) -> bool {
+    // Past the last threshold that doubles within range, nothing more is due.
+    let Some(next) = reported.checked_mul(2) else {
+        return false;
+    };
+    if value < first.max(next) {
+        return false;
+    }
+    let mut threshold = first;
+    while threshold.checked_mul(2).is_some_and(|next| next <= value) {
+        threshold *= 2;
+    }
+    *reported = threshold;
+    true
+}
+
 pub fn fmt_duration(d: Duration) -> String {
     let us = d.as_micros();
     if us < 1_000 {

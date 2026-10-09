@@ -31,15 +31,14 @@ pub const WATCH_PERIOD: Duration = Duration::from_secs(1);
 
 /// Whether a request in flight for `age` is due a stall report, given the threshold it was `reported` at last (zero if never). The thresholds are [`STALL_FIRST`] and its doublings (5 s, 10 s, 20 s, …); a scan that comes late reports once, at the highest threshold it finds crossed.
 pub fn stall_due(age: Duration, reported: &mut Duration) -> bool {
-    if age < STALL_FIRST.max(*reported * 2) {
-        return false;
-    }
-    let mut threshold = STALL_FIRST;
-    while threshold * 2 <= age {
-        threshold *= 2;
-    }
-    *reported = threshold;
-    true
+    let mut at = duration_ns(*reported);
+    let due = crate::doubling_due(duration_ns(age), duration_ns(STALL_FIRST), &mut at);
+    *reported = Duration::from_nanos(at);
+    due
+}
+
+fn duration_ns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Which requests in flight a scan returns.
@@ -342,6 +341,27 @@ mod tests {
         assert!(stall_due(late(5), &mut reported));
         assert!(!stall_due(late(9), &mut reported));
         assert!(stall_due(s(10), &mut reported));
+    }
+
+    #[test]
+    fn counts_are_reported_at_the_first_threshold_and_each_doubling() {
+        let mut reported = 0;
+        let due: Vec<u64> = (0..=100)
+            .filter(|&n| crate::doubling_due(n, 7, &mut reported))
+            .collect();
+        assert_eq!(due, [7, 14, 28, 56]);
+        let mut reported = 0;
+        assert!(
+            crate::doubling_due(60, 7, &mut reported),
+            "a late look reports once"
+        );
+        assert_eq!(reported, 56);
+        assert!(!crate::doubling_due(100, 7, &mut reported));
+        assert!(crate::doubling_due(u64::MAX, 7, &mut reported));
+        assert!(
+            !crate::doubling_due(u64::MAX, 7, &mut reported),
+            "the top threshold is reported once"
+        );
     }
 
     #[test]
