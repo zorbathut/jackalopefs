@@ -9,6 +9,7 @@ pub mod inodes;
 pub mod invalidate;
 pub mod mount;
 pub mod perf;
+pub mod procs;
 pub mod signals;
 pub mod transport;
 pub mod watchdog;

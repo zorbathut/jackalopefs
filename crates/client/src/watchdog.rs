@@ -260,7 +260,7 @@ fn describe(p: &Pending, proc_ours: bool) -> String {
     line
 }
 
-/// The thread blocked in a request and its process, by name, from `/proc`; never `cmdline` or anything else that takes the target's mmap lock (`crate::signals`).
+/// The thread blocked in a request and its process, by name, from `/proc` ([`crate::procs`]).
 fn caller(tid: u32, proc_ours: bool) -> String {
     if tid == 0 {
         return "outside this pid namespace".into();
@@ -268,20 +268,14 @@ fn caller(tid: u32, proc_ours: bool) -> String {
     if !proc_ours {
         return format!("thread {tid} (/proc is not this pid namespace's)");
     }
-    let status = match std::fs::read_to_string(format!("/proc/{tid}/status")) {
+    let status = match crate::procs::status_of(tid) {
         Ok(status) => status,
         Err(e) => return format!("thread {tid} ({e})"),
     };
-    let field = |name: &str| {
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .map(|value| value.trim().to_string())
-    };
-    let thread = field("Name:").unwrap_or_else(|| "?".into());
-    let state = field("State:").unwrap_or_else(|| "?".into());
-    let process = match field("Tgid:") {
-        Some(tgid) => match std::fs::read_to_string(format!("/proc/{tgid}/comm")) {
+    let thread = status.name.unwrap_or_else(|| "?".into());
+    let state = status.state.unwrap_or_else(|| "?".into());
+    let process = match status.tgid {
+        Some(tgid) => match crate::procs::comm_of(tgid) {
             Ok(comm) => format!("{} {tgid}", comm.trim()),
             Err(e) => format!("{tgid} ({e})"),
         },
