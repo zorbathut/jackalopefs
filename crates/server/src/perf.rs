@@ -70,6 +70,12 @@ pub enum Slowpath {
     WatchLimited,
     /// The inotify queue overflowed: events were lost, and clients were told to rescan.
     InotifyOverflow,
+    /// A session crossed a report threshold of its handles: its share of the pool, or a doubling of it.
+    HandleShareExceeded,
+    /// An open was refused because every handle the server can spare is held.
+    HandlePoolFull,
+    /// An open was refused because the process ran out of file descriptors (`EMFILE`, `ENFILE`) before the pool did.
+    HandleFdsExhausted,
 }
 
 impl Slowpath {
@@ -84,6 +90,9 @@ impl Slowpath {
             Slowpath::WatchUnwatchable => "watch_unwatchable",
             Slowpath::WatchLimited => "watch_limited",
             Slowpath::InotifyOverflow => "inotify_overflow",
+            Slowpath::HandleShareExceeded => "handle_share_exceeded",
+            Slowpath::HandlePoolFull => "handle_pool_full",
+            Slowpath::HandleFdsExhausted => "handle_fds_exhausted",
         }
     }
 }
@@ -99,6 +108,9 @@ impl Kind for Slowpath {
         Slowpath::WatchUnwatchable,
         Slowpath::WatchLimited,
         Slowpath::InotifyOverflow,
+        Slowpath::HandleShareExceeded,
+        Slowpath::HandlePoolFull,
+        Slowpath::HandleFdsExhausted,
     ];
 
     fn name(self) -> &'static str {

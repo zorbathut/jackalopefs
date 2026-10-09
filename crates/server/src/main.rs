@@ -144,17 +144,19 @@ fn main() -> anyhow::Result<()> {
     let (open_files, hard) = raise_open_file_limit()?;
     let limits = Limits {
         connections: MAX_CONNECTIONS,
-        handles_per_session: handles::per_session(open_files),
+        handle_share: handles::per_session(open_files),
+        handle_pool: handles::pool_capacity(open_files),
     };
-    if limits.handles_per_session == 0 {
+    if limits.handle_share == 0 {
         if open_files < hard {
             anyhow::bail!("open file limit {open_files} leaves no room for client handles; raise it with ulimit -n, up to the hard limit of {}", limit_text(hard));
         }
         anyhow::bail!("open file limit {open_files} leaves no room for client handles; raise the hard limit (LimitNOFILE= under systemd, ulimit -Hn as root)");
     }
     tracing::info!(
-        "up to {} open handles per session",
-        limits.handles_per_session
+        "up to {} open handles in all; a session past {} is reported",
+        limits.handle_pool,
+        limits.handle_share
     );
 
     let ids = IdMap::of_process(args.ids).map_err(anyhow::Error::msg)?;

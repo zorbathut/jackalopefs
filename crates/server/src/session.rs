@@ -1,7 +1,7 @@
 //! Connection handling: the hello handshake, session resumption, the event stream, and one task per request stream.
 
 use crate::export::Export;
-use crate::handles::Handles;
+use crate::handles::{HandlePool, Handles};
 use crate::ids::IdMap;
 use crate::ops::{self, Ops};
 use crate::perf::{Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TRACE_TARGET};
@@ -72,16 +72,24 @@ struct Attachment {
 pub struct Sessions {
     map: Mutex<HashMap<u64, Arc<SessionState>>>,
     next_id: AtomicU64,
-    max_handles: usize,
+    /// The handles a session holds before it is reported.
+    handle_share: usize,
+    /// The handles every session draws on.
+    pool: Arc<HandlePool>,
 }
 
 impl Sessions {
-    pub fn new(max_handles: usize) -> Sessions {
+    pub fn new(handle_share: usize, pool: Arc<HandlePool>) -> Sessions {
         Sessions {
             map: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
-            max_handles,
+            handle_share,
+            pool,
         }
+    }
+
+    pub fn pool(&self) -> &HandlePool {
+        &self.pool
     }
 
     /// A brand-new session, attached to the caller. Makes room by dropping the longest-detached session when too many are waiting for a resume that may never come.
@@ -90,7 +98,7 @@ impl Sessions {
         let state = Arc::new(SessionState {
             id,
             resume_token: rand::random(),
-            handles: Arc::new(Handles::new(self.max_handles)),
+            handles: Arc::new(Handles::new(self.handle_share, self.pool.clone())),
             attachment: Mutex::new(Attachment {
                 epoch: 1,
                 ..Attachment::default()
@@ -242,7 +250,10 @@ impl Server {
         Server {
             export,
             ids,
-            sessions: Arc::new(Sessions::new(limits.handles_per_session)),
+            sessions: Arc::new(Sessions::new(
+                limits.handle_share,
+                Arc::new(HandlePool::new(limits.handle_pool)),
+            )),
             events: notification.events,
             changes: notification.changes,
             watches: notification.watches,
@@ -295,6 +306,8 @@ impl Server {
             let state = if row.detached { "detached" } else { "attached" };
             tracing::info!(target: TRACE_TARGET, "perf handles session={} open={} files={} dirs={} state={state} remote={}", row.session, row.files + row.dirs, row.files, row.dirs, row.remote);
         }
+        let pool = self.sessions.pool();
+        tracing::info!(target: TRACE_TARGET, "perf handles pool used={} capacity={}", pool.used(), pool.capacity());
         let (served, moved) = self.perf.served();
         let (process, links, udp) = {
             let mut meters = self.meters.lock();
@@ -457,6 +470,9 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         changes: server.changes.clone(),
         watches: server.watches.clone(),
         ids: server.ids,
+        remote,
+        events: server.perf.events.clone(),
+        refusals: Mutex::new(ops::Refusals::default()),
     });
     loop {
         match conn.accept_bi().await {
@@ -928,9 +944,44 @@ async fn handle_request(
 mod tests {
     use super::*;
 
+    fn sessions_unlimited() -> Sessions {
+        Sessions::new(
+            crate::handles::SHARE_MAX,
+            Arc::new(HandlePool::new(usize::MAX)),
+        )
+    }
+
+    #[test]
+    fn a_session_dropped_gives_its_handles_back_to_the_pool() {
+        let sessions = sessions_unlimited();
+        let (state, epoch) = sessions.create();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        state
+            .handles
+            .insert(
+                1,
+                crate::handles::Handle::File {
+                    file: Arc::new(file),
+                    path: jackalopefs_proto::Path::root(),
+                    watch: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(sessions.pool().used(), 1);
+        sessions.detach(state.id, epoch);
+        assert_eq!(sessions.reap(Duration::ZERO), 1);
+        assert_eq!(
+            sessions.pool().used(),
+            1,
+            "the request holding it still runs"
+        );
+        drop(state);
+        assert_eq!(sessions.pool().used(), 0);
+    }
+
     #[test]
     fn sessions_resume_detach_and_reap() {
-        let sessions = Sessions::new(crate::handles::MAX_HANDLES);
+        let sessions = sessions_unlimited();
         let (state, epoch) = sessions.create();
         assert!(
             sessions.resume(state.id, &[0u8; 16]).is_none(),
@@ -963,7 +1014,7 @@ mod tests {
 
     #[test]
     fn detached_sessions_are_capped() {
-        let sessions = Sessions::new(crate::handles::MAX_HANDLES);
+        let sessions = sessions_unlimited();
         let mut ids = Vec::new();
         for _ in 0..MAX_DETACHED_SESSIONS {
             let (state, epoch) = sessions.create();

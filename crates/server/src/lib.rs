@@ -37,7 +37,10 @@ pub const MAX_CONNECTIONS: usize = 64;
 /// What one server admits.
 pub struct Limits {
     pub connections: usize,
-    pub handles_per_session: usize,
+    /// The handles a session holds before it is reported ([`handles::per_session`]).
+    pub handle_share: usize,
+    /// The handles every session together may hold ([`handles::pool_capacity`]).
+    pub handle_pool: usize,
 }
 
 /// QUIC transport parameters for the server side of a jackalopefs connection.

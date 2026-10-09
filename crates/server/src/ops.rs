@@ -2,9 +2,13 @@
 
 use crate::dirents::read_dir_fd;
 use crate::export::{kind_from_mode, proc_path, Export};
-use crate::handles::{Handle, Handles};
+use crate::handles::{ErrorPoolFull, Handle, Handles};
 use crate::ids::IdMap;
+use crate::perf::{Slowpath, EVENT_TARGET};
 use crate::watch::{parent_of, ChangeLog, Watches};
+use jackalopefs_perf::events::Events;
+use jackalopefs_perf::hub::IdsEvent;
+use jackalopefs_perf::{event, fmt_duration};
 use jackalopefs_proto::owners::reads_posix_acl;
 use jackalopefs_proto::{
     Attr, Name, Path, Request, Response, SetAttr, Statfs, TimeOrNow, Whence, MAX_FALLOCATE, MAX_IO,
@@ -23,10 +27,12 @@ use nix::unistd::{
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
+use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Open flags accepted from a client. `openat2` rejects unknown bits with `EINVAL`, and some (`O_DIRECT`) belong to the client kernel's side of the mount, so anything else is dropped. Creation flags are accepted only from `Create`.
 const OPEN_FLAGS_ALLOWED: i32 = libc::O_ACCMODE
@@ -61,9 +67,81 @@ pub struct Ops {
     /// What a handle holds watched while it is open.
     pub watches: Arc<Watches>,
     pub ids: IdMap,
+    /// The client's address, which the lines about its handles name it by.
+    pub remote: SocketAddr,
+    pub events: Arc<Events<Slowpath>>,
+    /// Opens refused for want of a handle or a descriptor, logged a few lines per burst.
+    pub refusals: Mutex<Refusals>,
 }
 
-/// Run one request; every failure becomes an errno for the client. The owner policy (`--ids`) is checked before anything is touched and applied to what goes back. Running out of file descriptors, whether the session's cap or the process's limit, is logged with what this session holds, since the handles of every session share that limit.
+/// How often opens refused one after another are logged: the first, then a line at most this often with how many were refused since.
+const REFUSALS_LOGGED_EVERY: Duration = Duration::from_secs(10);
+
+/// When refused opens were last logged, and how many have been refused since and from when.
+#[derive(Default)]
+pub struct Refusals {
+    logged_at: Option<Instant>,
+    since: u64,
+    since_at: Option<Instant>,
+}
+
+impl Refusals {
+    /// Count a refusal at `now`: the refusals to log, this one included, and when the first of them was, or `None` within [`REFUSALS_LOGGED_EVERY`] of the last line.
+    fn refused(&mut self, now: Instant) -> Option<(u64, Instant)> {
+        self.since += 1;
+        let first = *self.since_at.get_or_insert(now);
+        if self
+            .logged_at
+            .is_some_and(|at| now.duration_since(at) < REFUSALS_LOGGED_EVERY)
+        {
+            return None;
+        }
+        self.logged_at = Some(now);
+        self.since_at = None;
+        Some((std::mem::take(&mut self.since), first))
+    }
+
+    /// The refusals not logged yet, and when the first of them was.
+    fn pending(&mut self) -> Option<(u64, Instant)> {
+        let first = self.since_at.take()?;
+        Some((std::mem::take(&mut self.since), first))
+    }
+}
+
+/// Why a request failed: an errno from the work itself, or no slot left in the server's handle pool.
+#[derive(Debug)]
+enum Failure {
+    Errno(Errno),
+    PoolFull,
+}
+
+impl Drop for Ops {
+    fn drop(&mut self) {
+        if let Some((refused, first)) = self.refusals.get_mut().pending() {
+            tracing::warn!(
+                session = self.session_id,
+                remote = %self.remote,
+                refused,
+                over = %fmt_duration(first.elapsed()),
+                "the connection ended with opens refused since the last line"
+            );
+        }
+    }
+}
+
+impl From<ErrorPoolFull> for Failure {
+    fn from(_: ErrorPoolFull) -> Failure {
+        Failure::PoolFull
+    }
+}
+
+impl From<Errno> for Failure {
+    fn from(errno: Errno) -> Failure {
+        Failure::Errno(errno)
+    }
+}
+
+/// Run one request; every failure becomes an errno for the client. The owner policy (`--ids`) is checked before anything is touched and applied to what goes back. Running out of handles or file descriptors, whether the server's pool or the process's limit, is logged with what this session holds, since the handles of every session share both.
 pub fn dispatch(ops: &Ops, req: Request) -> Response {
     let op = req.op_name();
     if let Err(errno) = ops.ids.admit(&req) {
@@ -75,27 +153,15 @@ pub fn dispatch(ops: &Ops, req: Request) -> Response {
             ops.ids.reply(posix_acl_read, &mut resp);
             resp
         }
-        Err(errno @ (Errno::EMFILE | Errno::ENFILE)) => {
-            let open_handles = ops.handles.len();
-            if open_handles >= ops.handles.max() {
-                tracing::warn!(
-                    op,
-                    session = ops.session_id,
-                    open_handles,
-                    limit = ops.handles.max(),
-                    "session holds too many open handles"
-                );
-            } else {
-                tracing::warn!(
-                    op,
-                    session = ops.session_id,
-                    open_handles,
-                    "out of file descriptors: {errno}"
-                );
-            }
+        Err(Failure::PoolFull) => {
+            ops.refused(op, None);
+            Response::Err(Errno::EMFILE as i32)
+        }
+        Err(Failure::Errno(errno @ (Errno::EMFILE | Errno::ENFILE))) => {
+            ops.refused(op, Some(errno));
             Response::Err(errno as i32)
         }
-        Err(errno) => Response::Err(errno as i32),
+        Err(Failure::Errno(errno)) => Response::Err(errno as i32),
     }
 }
 
@@ -164,7 +230,88 @@ impl Ops {
         self.export.attr_in(dir.as_fd(), name)
     }
 
-    fn run(&self, req: Request) -> Result<Response, Errno> {
+    fn ids_event(&self, op: &'static str) -> IdsEvent {
+        IdsEvent {
+            session: Some(self.session_id),
+            conn: self.conn,
+            op: Some(op),
+            ..IdsEvent::default()
+        }
+    }
+
+    /// Report a session whose newly kept handle crossed a threshold of its share ([`Slot::insert`](crate::handles::Slot::insert)).
+    fn kept(&self, op: &'static str, crossed: Option<u64>) {
+        if let Some(held) = crossed {
+            self.share_exceeded(op, held);
+        }
+    }
+
+    fn share_exceeded(&self, op: &'static str, held: u64) {
+        let share = self.handles.share();
+        let totals = self.handles.totals();
+        let pool = self.handles.pool();
+        event!(
+            target: EVENT_TARGET,
+            self.events,
+            Slowpath::HandleShareExceeded,
+            self.ids_event(op),
+            format!("{} holds {held} handles, past its share of {share}", self.remote)
+        );
+        tracing::warn!(
+            session = self.session_id,
+            remote = %self.remote,
+            held,
+            files = totals.files,
+            dirs = totals.dirs,
+            share,
+            pool_used = pool.used(),
+            pool_capacity = pool.capacity(),
+            "client {} holds {held} handles, past its share of {share}",
+            self.remote
+        );
+    }
+
+    /// An open refused, by the pool (`from_os` none) or by the process's own descriptor limit, each counted by its event; logged the first time and then at most every [`REFUSALS_LOGGED_EVERY`] with how many were refused since, and what is left unlogged when the connection goes.
+    fn refused(&self, op: &'static str, from_os: Option<Errno>) {
+        let (kind, why) = match from_os {
+            None => (
+                Slowpath::HandlePoolFull,
+                "every handle the server can spare is held".to_owned(),
+            ),
+            Some(errno) => (
+                Slowpath::HandleFdsExhausted,
+                format!("out of file descriptors: {errno}"),
+            ),
+        };
+        event!(
+            target: EVENT_TARGET,
+            self.events,
+            kind,
+            self.ids_event(op),
+            format!("{} refused a handle: {why}", self.remote)
+        );
+        let now = Instant::now();
+        let Some((refused, first)) = self.refusals.lock().refused(now) else {
+            return;
+        };
+        let totals = self.handles.totals();
+        let pool = self.handles.pool();
+        tracing::warn!(
+            op,
+            session = self.session_id,
+            remote = %self.remote,
+            refused,
+            over = %fmt_duration(now.duration_since(first)),
+            files = totals.files,
+            dirs = totals.dirs,
+            pool_used = pool.used(),
+            pool_capacity = pool.capacity(),
+            "refusing opens: {why}"
+        );
+    }
+
+    /// A request that keeps a handle can fail for want of a slot in the pool; every one can fail with an errno.
+    fn run(&self, req: Request) -> Result<Response, Failure> {
         match req {
             Request::Lookup { parent, name } => {
                 let dir = self.export.resolve_dir(&parent)?;
@@ -180,7 +327,7 @@ impl Ops {
                 };
                 Ok(Response::Attr(attr))
             }
-            Request::Setattr { path, fh, set } => self.setattr(path.as_ref(), fh, set),
+            Request::Setattr { path, fh, set } => Ok(self.setattr(path.as_ref(), fh, set)?),
             Request::Readlink { path } => {
                 let fd = self.export.resolve(&path)?;
                 let target = nix::fcntl::readlinkat(&fd, "")?;
@@ -197,7 +344,7 @@ impl Ops {
                     mode & libc::S_IFMT,
                     libc::S_IFREG | libc::S_IFIFO | libc::S_IFSOCK
                 ) {
-                    return Err(Errno::EPERM);
+                    return Err(Errno::EPERM.into());
                 }
                 let dir = self.export.resolve_dir(&parent)?;
                 self.changes.record_entry(&parent, &name, self.session_id);
@@ -251,7 +398,7 @@ impl Ops {
             } => {
                 let flags = RenameFlags::from_bits(flags).ok_or(Errno::EINVAL)?;
                 if flags.contains(RenameFlags::RENAME_WHITEOUT) {
-                    return Err(Errno::EINVAL);
+                    return Err(Errno::EINVAL.into());
                 }
                 let old_dir = self.export.resolve_dir(&parent)?;
                 let new_dir = self.export.resolve_dir(&newparent)?;
@@ -286,6 +433,7 @@ impl Ops {
                 Ok(Response::Entry(self.attr_in(&new_dir, &newname)?))
             }
             Request::Open { fh, path, flags } => {
+                let slot = self.handles.reserve(fh)?;
                 let flags = open_flags(flags, false);
                 if flags.contains(OFlag::O_TRUNC) {
                     self.changes.record(&path, self.session_id);
@@ -294,14 +442,14 @@ impl Ops {
                 let attr = self.attr_of(&fd)?;
                 servable(attr.kind)?;
                 let watch = self.watches.hold(&parent_of(&path));
-                self.handles.insert(
-                    fh,
-                    Handle::File {
+                self.kept(
+                    "open",
+                    slot.insert(Handle::File {
                         file: Arc::new(File::from(fd)),
                         path,
                         watch,
-                    },
-                )?;
+                    }),
+                );
                 Ok(Response::Opened { attr })
             }
             Request::Create {
@@ -311,6 +459,7 @@ impl Ops {
                 mode,
                 flags,
             } => {
+                let slot = self.handles.reserve(fh)?;
                 self.changes.record_entry(&parent, &name, self.session_id);
                 let fd = self.export.open_in(
                     &parent,
@@ -322,14 +471,14 @@ impl Ops {
                 servable(attr.kind)?;
                 let watch = self.watches.hold(&parent);
                 let path = parent.join(name).map_err(|_| Errno::ENAMETOOLONG)?;
-                self.handles.insert(
-                    fh,
-                    Handle::File {
+                self.kept(
+                    "create",
+                    slot.insert(Handle::File {
                         file: Arc::new(File::from(fd)),
                         path,
                         watch,
-                    },
-                )?;
+                    }),
+                );
                 Ok(Response::Opened { attr })
             }
             Request::Read { fh, offset, size } => {
@@ -342,7 +491,7 @@ impl Ops {
                         Ok(0) => break,
                         Ok(n) => filled += n,
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => return Err(io_errno(e)),
+                        Err(e) => return Err(io_errno(e).into()),
                     }
                 }
                 buf.truncate(filled);
@@ -350,7 +499,7 @@ impl Ops {
             }
             Request::Write { fh, offset, data } => {
                 if data.len() > MAX_IO {
-                    return Err(Errno::EINVAL);
+                    return Err(Errno::EINVAL.into());
                 }
                 let (file, path) = self.handles.file_and_path(fh)?;
                 self.changes.record(&path, self.session_id);
@@ -386,7 +535,7 @@ impl Ops {
                     }
                     match Errno::last() {
                         Errno::EINTR => continue,
-                        errno => return Err(errno),
+                        errno => return Err(errno.into()),
                     }
                 };
                 Ok(Response::Copied(
@@ -400,7 +549,7 @@ impl Ops {
                 mode,
             } => {
                 if len > MAX_FALLOCATE {
-                    return Err(Errno::EINVAL);
+                    return Err(Errno::EINVAL.into());
                 }
                 // A mode outside the protocol's is refused, never trimmed: a punch without its punch bit is an allocation.
                 let mode = FallocateFlags::from_bits(mode)
@@ -445,18 +594,19 @@ impl Ops {
                 Ok(Response::Ok)
             }
             Request::Opendir { fh, path } => {
+                let slot = self.handles.reserve(fh)?;
                 let fd = self
                     .export
                     .open_node(&path, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
                 let attr = self.attr_of(&fd)?;
                 servable(attr.kind)?;
-                self.handles.insert(
-                    fh,
-                    Handle::Dir {
+                self.kept(
+                    "opendir",
+                    slot.insert(Handle::Dir {
                         dir: Arc::new(Mutex::new(fd)),
                         watch: self.watches.hold(&path),
-                    },
-                )?;
+                    }),
+                );
                 Ok(Response::Opened { attr })
             }
             Request::Readdir {
@@ -502,7 +652,7 @@ impl Ops {
                     )
                 };
                 if rc != 0 {
-                    return Err(Errno::last());
+                    return Err(Errno::last().into());
                 }
                 Ok(Response::Ok)
             }
@@ -531,7 +681,7 @@ impl Ops {
                 // SAFETY: both strings are valid NUL-terminated C strings.
                 let rc = unsafe { libc::removexattr(cpath.as_ptr(), cname.as_ptr()) };
                 if rc != 0 {
-                    return Err(Errno::last());
+                    return Err(Errno::last().into());
                 }
                 Ok(Response::Ok)
             }
@@ -710,6 +860,7 @@ fn statfs<F: AsFd>(fd: &F) -> Result<Statfs, Errno> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handles::HandlePool;
     use crate::ids::ModeIds;
     use jackalopefs_proto::owners::NOBODY;
     use jackalopefs_proto::FileKind;
@@ -724,12 +875,18 @@ mod tests {
             dir,
             Ops {
                 export,
-                handles: Arc::new(Handles::new(crate::handles::MAX_HANDLES)),
+                handles: Arc::new(Handles::new(
+                    crate::handles::SHARE_MAX,
+                    Arc::new(HandlePool::new(usize::MAX)),
+                )),
                 session_id: 1,
                 conn: None,
                 changes: Arc::new(ChangeLog::default()),
                 watches: Watches::disabled(),
                 ids: IdMap::of_process(ModeIds::Direct).unwrap(),
+                remote: SocketAddr::from(([127, 0, 0, 1], 4433)),
+                events: crate::perf::Perf::default().events.clone(),
+                refusals: Mutex::new(Refusals::default()),
             },
         )
     }
@@ -1727,9 +1884,10 @@ mod tests {
     }
 
     #[test]
-    fn a_session_past_its_handle_cap_cannot_open() {
+    fn a_session_past_its_share_still_opens_until_the_pool_is_full() {
         let (dir, mut ops) = fixture();
-        ops.handles = Arc::new(Handles::new(1));
+        let pool = Arc::new(HandlePool::new(2));
+        ops.handles = Arc::new(Handles::new(1, pool.clone()));
         fs::write(dir.path().join("f"), b"").unwrap();
         let open = |fh| Request::Open {
             fh,
@@ -1737,20 +1895,70 @@ mod tests {
             flags: libc::O_RDONLY,
         };
         assert!(matches!(dispatch(&ops, open(1)), Response::Opened { .. }));
-        assert_eq!(dispatch(&ops, open(2)), Response::Err(Errno::EMFILE as i32));
+        assert!(
+            matches!(dispatch(&ops, open(2)), Response::Opened { .. }),
+            "past its share"
+        );
+        assert_eq!(dispatch(&ops, open(3)), Response::Err(Errno::EMFILE as i32));
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Opendir {
+                    fh: 4,
+                    path: Path::root()
+                }
+            ),
+            Response::Err(Errno::EMFILE as i32)
+        );
         assert!(
             matches!(dispatch(&ops, open(1)), Response::Opened { .. }),
             "replacing an existing id is still allowed"
         );
         assert_eq!(dispatch(&ops, Request::Release { fh: 1 }), Response::Ok);
-        assert!(matches!(dispatch(&ops, open(2)), Response::Opened { .. }));
+        assert_eq!(pool.used(), 1);
+        assert!(matches!(dispatch(&ops, open(3)), Response::Opened { .. }));
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Create {
+                    fh: 5,
+                    parent: Path::root(),
+                    name: name("new"),
+                    mode: 0o644,
+                    flags: libc::O_RDWR,
+                }
+            ),
+            Response::Err(Errno::EMFILE as i32)
+        );
+        assert!(
+            !dir.path().join("new").exists(),
+            "a refused create creates nothing"
+        );
     }
 
-    fn flattening(ops: Ops) -> Ops {
-        Ops {
-            ids: IdMap::of_process(ModeIds::Flatten).unwrap(),
-            ..ops
-        }
+    #[test]
+    fn refusals_are_logged_first_then_once_a_window_with_the_count_and_the_tail_is_kept() {
+        let mut refusals = Refusals::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        assert_eq!(refusals.refused(at(0)), Some((1, at(0))));
+        assert_eq!(refusals.refused(at(10)), None);
+        assert_eq!(refusals.refused(at(5000)), None);
+        let window = REFUSALS_LOGGED_EVERY.as_millis() as u64;
+        assert_eq!(
+            refusals.refused(at(window)),
+            Some((3, at(10))),
+            "the count since the last line, from the first of them"
+        );
+        assert_eq!(refusals.pending(), None, "nothing unlogged");
+        assert_eq!(refusals.refused(at(window + 1)), None);
+        assert_eq!(refusals.pending(), Some((1, at(window + 1))), "the tail");
+        assert_eq!(refusals.pending(), None);
+    }
+
+    fn flattening(mut ops: Ops) -> Ops {
+        ops.ids = IdMap::of_process(ModeIds::Flatten).unwrap();
+        ops
     }
 
     /// A valid access ACL granting `rw-` to the owner, the owning group, others, and the named user `uid`.

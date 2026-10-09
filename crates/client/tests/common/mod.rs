@@ -144,7 +144,8 @@ impl TestServer {
             perf,
             Limits {
                 connections: 64,
-                handles_per_session: jackalopefs_server::handles::MAX_HANDLES,
+                handle_share: jackalopefs_server::handles::SHARE_MAX,
+                handle_pool: usize::MAX,
             },
             IdMap::of_process(ids).unwrap(),
         ));
