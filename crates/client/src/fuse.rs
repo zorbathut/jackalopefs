@@ -943,41 +943,52 @@ impl Filesystem for Backend {
             );
             return;
         };
-        let stands = self.shared.judge.stands(tid);
-        let perf = self.shared.client.perf();
-        let ids = IdsEvent {
-            unique: Some(unique.0),
-            op: Some(op),
-            ..IdsEvent::default()
-        };
-        event!(
-            target: EVENT_TARGET,
-            perf.events,
-            Slowpath::Interrupt,
-            ids.clone(),
-            format!("thread {tid}: a signal is pending: {stands}")
-        );
-        if stands {
-            request.interrupt();
-            return;
-        }
-        event!(
-            target: EVENT_TARGET,
-            perf.events,
-            Slowpath::InterruptIgnored,
-            ids,
-            format!("thread {tid}: interrupted without a pending signal (task work such as an io_uring completion); the call goes on")
-        );
-        // The in-flight table and the task answering the request hold it; once both let go it is answered, and the watcher stops.
-        let request = Arc::downgrade(&request);
+        // Judged on the runtime with the reads on the blocking pool: the in-flight lookup above is all that must happen here, after the request's registration (`Shared::inflight`).
         let shared = self.shared.clone();
+        // The in-flight table and the task answering the request hold it; once both let go it is answered, and the interrupt is ignored as one for a request already answered.
+        let request = Arc::downgrade(&request);
         self.runtime.spawn(async move {
+            let stands = shared.judge.stands(tid).await;
+            let Some(request) = request.upgrade() else {
+                tracing::trace!(
+                    unique = unique.0,
+                    "interrupt for a request answered while it was judged"
+                );
+                return;
+            };
+            let perf = shared.client.perf();
+            let ids = IdsEvent {
+                unique: Some(unique.0),
+                op: Some(op),
+                ..IdsEvent::default()
+            };
+            // Counted before the request is interrupted: once it is, the caller is answered and may look at the counts.
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::Interrupt,
+                ids.clone(),
+                format!("thread {tid}: a signal is pending: {stands}")
+            );
+            if stands {
+                request.interrupt();
+                return;
+            }
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::InterruptIgnored,
+                ids,
+                format!("thread {tid}: interrupted without a pending signal (task work such as an io_uring completion); the call goes on")
+            );
+            // Once the request is answered, the watcher stops.
+            let request = Arc::downgrade(&request);
             loop {
                 tokio::time::sleep(signals::RECHECK).await;
                 let Some(request) = request.upgrade() else {
                     return;
                 };
-                if shared.judge.signal_came(tid) {
+                if shared.judge.signal_came(tid).await {
                     request.interrupt();
                     return;
                 }

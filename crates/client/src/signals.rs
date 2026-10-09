@@ -4,7 +4,9 @@ use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-// Only `status` and `stat` are read, never `cmdline`, `environ`, `maps` or the like: those take the target's mmap lock, which a caller blocked in a page fault on this mount holds, so a read would wait on the very request it is judging (and the first read runs on the FUSE session thread).
+// Only `status` and `stat` are read, never `cmdline`, `environ`, `maps` or the like: those take the target's mmap lock, which a caller blocked in a page fault on this mount holds, so a read would wait on the very request it is judging.
+//
+// Even these take a reference to the caller's memory for the read, and they are read on the blocking pool, never on the FUSE session thread or the runtime's one worker. A caller blocked in our request holds its memory itself, but its reply can land while it is judged, and if its process then exits (a fatal signal is what makes that likely here), our reference can be the last: dropping it unmaps the process's files, and the release of one on this mount runs on the reading thread and waits for writeback (or a times `SETATTR`) that only the session thread and the worker can carry.
 
 /// How often a request whose interrupt stood for no signal looks again for a real one.
 pub const RECHECK: Duration = Duration::from_millis(50);
@@ -42,19 +44,20 @@ impl Judge {
         self.enabled
     }
 
-    /// Whether an interrupt for a request from thread `tid` is to be honoured: when a signal is pending for the thread, when the thread is an io_uring worker (io_uring stops one, on a cancellation, a linked timeout or the ring's teardown, with the very notification that is no signal anywhere else), and when it cannot be judged, rather than risk a call nothing can end.
-    pub fn stands(&self, tid: u32) -> bool {
+    /// Whether an interrupt for a request from thread `tid` is to be honoured: when a signal is pending for the thread, when the thread is an io_uring worker (io_uring stops one, on a cancellation, a linked timeout or the ring's teardown, with the very notification that is no signal anywhere else), and when it cannot be judged, rather than risk a call nothing can end. Read on the blocking pool (see the head of this module).
+    pub async fn stands(&self, tid: u32) -> bool {
         self.verdict(tid, |tid| {
             Ok(unblocked_signal_pending(tid)? || is_io_worker(tid)?)
         })
+        .await
     }
 
-    /// Whether a real signal has come since an interrupt for thread `tid` stood for none; the thread is no io_uring worker, or that interrupt would have stood.
-    pub fn signal_came(&self, tid: u32) -> bool {
-        self.verdict(tid, unblocked_signal_pending)
+    /// Whether a real signal has come since an interrupt for thread `tid` stood for none; the thread is no io_uring worker, or that interrupt would have stood. Read on the blocking pool.
+    pub async fn signal_came(&self, tid: u32) -> bool {
+        self.verdict(tid, unblocked_signal_pending).await
     }
 
-    fn verdict(&self, tid: u32, judge: impl FnOnce(u32) -> io::Result<bool>) -> bool {
+    async fn verdict(&self, tid: u32, judge: fn(u32) -> io::Result<bool>) -> bool {
         if !self.enabled {
             return true;
         }
@@ -64,7 +67,12 @@ impl Judge {
                 "the request names no thread in this pid namespace",
             ))
         } else {
-            judge(tid)
+            match tokio::task::spawn_blocking(move || judge(tid)).await {
+                Ok(verdict) => verdict,
+                Err(e) => Err(io::Error::other(format!(
+                    "reading /proc did not finish: {e}"
+                ))),
+            }
         };
         verdict.unwrap_or_else(|e| {
             let count = self.unjudged.fetch_add(1, Ordering::Relaxed) + 1;
@@ -103,7 +111,7 @@ fn io_worker_in(stat: &str) -> Option<bool> {
 }
 
 /// Whether thread `tid` has a signal pending that it has not blocked. Unlike the kernel's `signal_pending()`, task work does not count.
-pub fn unblocked_signal_pending(tid: u32) -> io::Result<bool> {
+fn unblocked_signal_pending(tid: u32) -> io::Result<bool> {
     let status = std::fs::read_to_string(format!("/proc/{tid}/status"))?;
     pending_in(&status).ok_or_else(|| {
         io::Error::new(
@@ -114,7 +122,7 @@ pub fn unblocked_signal_pending(tid: u32) -> io::Result<bool> {
 }
 
 /// Whether thread `tid` is an io_uring worker.
-pub fn is_io_worker(tid: u32) -> io::Result<bool> {
+fn is_io_worker(tid: u32) -> io::Result<bool> {
     let stat = std::fs::read_to_string(format!("/proc/{tid}/stat"))?;
     io_worker_in(&stat).ok_or_else(|| {
         io::Error::new(
@@ -213,22 +221,25 @@ mod tests {
     }
 
     /// An interrupt the judge cannot judge is honoured, rather than risk a call nothing can end.
-    #[test]
-    fn an_interrupt_that_cannot_be_judged_stands() {
+    #[tokio::test]
+    async fn an_interrupt_that_cannot_be_judged_stands() {
         let judge = Judge::for_this_process();
         let tid = nix::unistd::gettid().as_raw() as u32;
-        assert!(!judge.stands(tid), "this thread has no signal pending");
-        assert!(!judge.signal_came(tid));
-        assert!(judge.stands(0), "no thread named");
+        assert!(
+            !judge.stands(tid).await,
+            "this thread has no signal pending"
+        );
+        assert!(!judge.signal_came(tid).await);
+        assert!(judge.stands(0).await, "no thread named");
         // Above the kernel's highest pid_max, so no such thread.
-        assert!(judge.stands(0x7fff_ffff));
-        assert!(judge.signal_came(0x7fff_ffff));
+        assert!(judge.stands(0x7fff_ffff).await);
+        assert!(judge.signal_came(0x7fff_ffff).await);
         let off = Judge {
             enabled: false,
             unjudged: AtomicU64::new(0),
         };
         assert!(
-            off.stands(tid),
+            off.stands(tid).await,
             "every interrupt stands where /proc cannot be trusted"
         );
     }

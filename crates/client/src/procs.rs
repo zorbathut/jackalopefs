@@ -81,7 +81,7 @@ impl Openers {
 
     /// The process behind thread `tid`, or `None` when it cannot be told: thread 0 (outside the mount's pid namespace), another namespace's `/proc`, or a `/proc` that would not say.
     ///
-    /// What is not remembered is read on the blocking pool, never on the FUSE session thread: reading another process's `status` can drop the last reference to its memory when it is exiting, and the file puts that follow run on the reading thread, where a release on this mount waits for writeback only the session thread can carry.
+    /// What is not remembered is read on the blocking pool, never on the FUSE session thread or the runtime's one worker, which two blocking reads per open would hold up. The caller is blocked in its open and holds its own memory, so unlike an interrupt's verdict (`crate::signals`) the read cannot drop the last reference to it.
     pub async fn of(&self, tid: u32) -> Option<Opener> {
         if tid == 0 || !self.proc_ours {
             return None;
