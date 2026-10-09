@@ -1,7 +1,7 @@
 //! The control socket: how `jackalopefs-ctl` reads a running process's counters and subscribes to its events and requests, without a restart. It is a Linux abstract Unix socket, `jackalopefs/{uid}/{side}-{pid}`, so there is no file to create, protect or clean up; only the process's own user (and root) may use it. It is served from a thread of its own, so it answers while the process's runtime is the thing that is stuck.
 
 use crate::hub::Hub;
-use jackalopefs_proto::control::{Ask, ControlReply, ControlRequest, Counters, Record};
+use jackalopefs_proto::control::{Ask, ControlReply, ControlRequest, Counters, Handles, Record};
 use jackalopefs_proto::{read_frame, write_frame, CONTROL_REVISION};
 use std::io;
 use std::os::linux::net::SocketAddrExt;
@@ -16,8 +16,10 @@ pub trait Source: Send + Sync + 'static {
     fn side(&self) -> &'static str;
     /// The mount and its server, or the export and its address.
     fn describe(&self) -> String;
-    /// The events, the per-operation totals and the requests in flight; [`Control`] fills in the rest.
+    /// The events, the per-operation totals, the requests in flight and the handles open; [`Control`] fills in the rest.
     fn counters(&self) -> Counters;
+    /// The handles open, by process on a client and by session on a server, at most [`HANDLES_ROWS_MAX`](jackalopefs_proto::control::HANDLES_ROWS_MAX) rows. It may walk every handle, so it is called on the control socket's thread, never the process's runtime.
+    fn handles(&self) -> Handles;
     /// When the process started, for its uptime.
     fn started(&self) -> Instant;
     fn hub(&self) -> Arc<Hub>;
@@ -173,6 +175,14 @@ async fn answer(stream: UnixStream, source: Arc<dyn Source>, runtime: tokio::run
                     return;
                 }
             }
+            Ask::Handles => {
+                // On the control socket's own thread, which serves nothing else, so it answers however busy or stuck the process's runtime and blocking pool are.
+                let handles = source.handles();
+                if let Err(e) = write_frame(&mut tx, &ControlReply::Handles(handles)).await {
+                    tracing::debug!("control socket: cannot answer: {e}");
+                    return;
+                }
+            }
             Ask::Census => {
                 let why = "a census is asked for during a subscription".to_owned();
                 if let Err(e) = write_frame(&mut tx, &ControlReply::Refused(why)).await {
@@ -235,7 +245,7 @@ mod tests {
     use crate::event;
     use crate::events::{Events, Kind};
     use crate::hub::IdsEvent;
-    use jackalopefs_proto::control::{Happened, Names, Selection};
+    use jackalopefs_proto::control::{HandlesSession, Happened, Names, Selection};
     use std::time::Duration;
 
     #[derive(Clone, Copy, Debug)]
@@ -273,6 +283,13 @@ mod tests {
                     .collect(),
                 ..Counters::default()
             }
+        }
+        fn handles(&self) -> Handles {
+            Handles::Sessions(vec![HandlesSession {
+                session: 7,
+                files: 1,
+                ..HandlesSession::default()
+            }])
         }
         fn hub(&self) -> Arc<Hub> {
             self.hub.clone()
@@ -315,6 +332,25 @@ mod tests {
         assert!(admits(1000, 1000));
         assert!(admits(0, 1000));
         assert!(!admits(1001, 1000));
+    }
+
+    #[tokio::test]
+    async fn handles_are_answered_and_the_connection_stays_open() {
+        let (_source, control) = serving("handles");
+        let mut stream = connect(&control).await;
+        let request = ControlRequest {
+            revision: CONTROL_REVISION,
+            ask: Ask::Handles,
+        };
+        for _ in 0..2 {
+            match ask(&mut stream, request.clone()).await {
+                ControlReply::Handles(Handles::Sessions(rows)) => {
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].session, 7);
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

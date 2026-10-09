@@ -1,6 +1,7 @@
 //! The typed request API. A request on a live connection is waited for as long as that connection lives, or up to an optional deadline; only the wait for a connection is always bounded. A call whose reply was lost to a dropped connection is retried once on the next connection only when that is safe, and a call made for a kernel request is abandoned when the kernel interrupts that request.
 
 use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
+use crate::handles::Opener;
 use crate::handles::{HandleKind, HandleTable};
 use crate::ids::{IdMap, ModeIds};
 use crate::inodes::KeyNode;
@@ -868,12 +869,13 @@ impl Client {
         }
     }
 
-    /// Open (or opendir, or create) under a fresh handle id. `node` says which node the reply's attributes belong to, or refuses them (an open whose path led to a file other than the one meant; a created file that cannot be registered), in which case the handle is released. Whenever the outcome leaves any doubt about whether the server opened something, the id is released in the background; only a definite refusal from the server needs no cleanup.
+    /// Open (or opendir, or create) under a fresh handle id, recorded with the process whose open it is. `node` says which node the reply's attributes belong to, or refuses them (an open whose path led to a file other than the one meant; a created file that cannot be registered), in which case the handle is released. Whenever the outcome leaves any doubt about whether the server opened something, the id is released in the background; only a definite refusal from the server needs no cleanup.
     async fn open_handle(
         &self,
         path: Path,
         flags: i32,
         kind: HandleKind,
+        opener: Option<Opener>,
         build: impl FnOnce(u64) -> Request,
         node: impl FnOnce(&Attr) -> Result<u64, Error>,
     ) -> Result<(u64, Attr), Error> {
@@ -882,9 +884,15 @@ impl Client {
         match self.call(req).await {
             Ok(Response::Opened { attr }) => match node(&attr) {
                 Ok(nodeid) => {
-                    self.caller
-                        .handles
-                        .insert(fh, nodeid, KeyNode::of(&attr), path, flags, kind);
+                    self.caller.handles.insert(
+                        fh,
+                        nodeid,
+                        KeyNode::of(&attr),
+                        path,
+                        flags,
+                        kind,
+                        opener,
+                    );
                     Ok((fh, attr))
                 }
                 Err(e) => {
@@ -998,6 +1006,7 @@ impl Client {
         &self,
         path: Path,
         flags: i32,
+        opener: Option<Opener>,
         node: impl FnOnce(&Attr) -> Result<u64, Error>,
     ) -> Result<(u64, Attr), Error> {
         let p = path.clone();
@@ -1005,6 +1014,7 @@ impl Client {
             path,
             flags,
             HandleKind::File,
+            opener,
             move |fh| Request::Open { fh, path: p, flags },
             node,
         )
@@ -1018,6 +1028,7 @@ impl Client {
         name: Name,
         mode: u32,
         flags: i32,
+        opener: Option<Opener>,
         node: impl FnOnce(&Attr) -> Result<u64, Error>,
     ) -> Result<(u64, Attr), Error> {
         let path = match parent.join(name.clone()) {
@@ -1031,6 +1042,7 @@ impl Client {
             path,
             flags,
             HandleKind::File,
+            opener,
             move |fh| Request::Create {
                 fh,
                 parent,
@@ -1117,6 +1129,7 @@ impl Client {
     pub async fn opendir(
         &self,
         path: Path,
+        opener: Option<Opener>,
         node: impl FnOnce(&Attr) -> Result<u64, Error>,
     ) -> Result<(u64, Attr), Error> {
         let p = path.clone();
@@ -1124,6 +1137,7 @@ impl Client {
             path,
             libc::O_RDONLY | libc::O_DIRECTORY,
             HandleKind::Dir,
+            opener,
             move |fh| Request::Opendir { fh, path: p },
             node,
         )

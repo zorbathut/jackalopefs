@@ -13,7 +13,7 @@ use jackalopefs_perf::{
     fmt_duration, line_process, line_quic, line_udp, lines_link, verdict, MeterLink, MeterProcess,
     MeterUdp, SampleLink, TrackerQuic,
 };
-use jackalopefs_proto::control::Summary;
+use jackalopefs_proto::control::{HandlesSession, HandlesTotals, Summary};
 use jackalopefs_proto::{
     encode, read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply,
     Request, Response, PROTO_REVISION,
@@ -65,6 +65,8 @@ pub struct SessionState {
 struct Attachment {
     epoch: u64,
     detached_at: Option<Instant>,
+    /// The client's address on the connection that last attached.
+    remote: Option<std::net::SocketAddr>,
 }
 
 pub struct Sessions {
@@ -91,7 +93,7 @@ impl Sessions {
             handles: Arc::new(Handles::new(self.max_handles)),
             attachment: Mutex::new(Attachment {
                 epoch: 1,
-                detached_at: None,
+                ..Attachment::default()
             }),
         });
         let mut map = self.map.lock();
@@ -166,22 +168,39 @@ impl Sessions {
         self.map.lock().get(&id).cloned()
     }
 
-    /// Every session's id, open handle count and whether it is detached, in id order.
-    pub fn handles_held(&self) -> Vec<(u64, usize, bool)> {
-        let mut held: Vec<(u64, usize, bool)> = self
+    /// Every session's handles by kind, its client's last address and whether it is detached, in id order.
+    pub fn handle_rows(&self) -> Vec<HandlesSession> {
+        let mut rows: Vec<HandlesSession> = self
             .map
             .lock()
             .iter()
             .map(|(id, s)| {
-                (
-                    *id,
-                    s.handles.len(),
-                    s.attachment.lock().detached_at.is_some(),
-                )
+                let totals = s.handles.totals();
+                let attachment = s.attachment.lock();
+                HandlesSession {
+                    session: *id,
+                    remote: attachment
+                        .remote
+                        .map_or_else(String::new, |remote| remote.to_string()),
+                    detached: attachment.detached_at.is_some(),
+                    files: totals.files,
+                    dirs: totals.dirs,
+                }
             })
             .collect();
-        held.sort_unstable();
-        held
+        rows.sort_unstable_by_key(|row| row.session);
+        rows
+    }
+
+    /// The handles every session holds, by kind.
+    pub fn handle_totals(&self) -> HandlesTotals {
+        self.map.lock().values().map(|s| s.handles.totals()).fold(
+            HandlesTotals::default(),
+            |sum, t| HandlesTotals {
+                files: sum.files + t.files,
+                dirs: sum.dirs + t.dirs,
+            },
+        )
     }
 }
 
@@ -272,9 +291,9 @@ impl Server {
             }
             Err(e) => tracing::warn!("counting open file descriptors: {e}"),
         }
-        for (session, open, detached) in self.sessions.handles_held() {
-            let state = if detached { "detached" } else { "attached" };
-            tracing::info!(target: TRACE_TARGET, "perf handles session={session} open={open} state={state}");
+        for row in self.sessions.handle_rows() {
+            let state = if row.detached { "detached" } else { "attached" };
+            tracing::info!(target: TRACE_TARGET, "perf handles session={} open={} files={} dirs={} state={state} remote={}", row.session, row.files + row.dirs, row.files, row.dirs, row.remote);
         }
         let (served, moved) = self.perf.served();
         let (process, links, udp) = {
@@ -392,6 +411,12 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     };
     let conn_key = jackalopefs_perf::conn_key(&conn);
     tracing::info!(%remote, session = session.id, conn = conn_key, resumed, "session attached");
+    {
+        let mut attachment = session.attachment.lock();
+        if attachment.epoch == epoch {
+            attachment.remote = Some(remote);
+        }
+    }
     let tracker = Arc::new(Mutex::new(TrackerQuic::default()));
     {
         let mut connections = server.connections.lock();

@@ -1,12 +1,14 @@
 //! Per-session table of open files and directories, keyed by the client-chosen handle id.
 
 use crate::watch::Armed;
+use jackalopefs_proto::control::HandlesTotals;
 use jackalopefs_proto::Path;
 use nix::errno::Errno;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::fd::OwnedFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Files are shared freely because every access that depends on a position carries its own offset (`pread`/`pwrite`); an `lseek` for data or a hole moves the descriptor's position, which nothing reads. A directory's read position is shared state and so carries its own lock.
@@ -45,6 +47,15 @@ pub fn per_session(limit: u64) -> usize {
 pub struct Handles {
     map: Mutex<HashMap<u64, Handle>>,
     max: usize,
+    /// The handles in `map` of each kind, changed under its lock.
+    files: AtomicU64,
+    dirs: AtomicU64,
+}
+
+impl Handle {
+    fn is_dir(&self) -> bool {
+        matches!(self, Handle::Dir { .. })
+    }
 }
 
 impl Handles {
@@ -52,6 +63,24 @@ impl Handles {
         Handles {
             map: Mutex::new(HashMap::new()),
             max,
+            files: AtomicU64::new(0),
+            dirs: AtomicU64::new(0),
+        }
+    }
+
+    fn count(&self, handle: &Handle) -> &AtomicU64 {
+        if handle.is_dir() {
+            &self.dirs
+        } else {
+            &self.files
+        }
+    }
+
+    /// The handles open, by kind.
+    pub fn totals(&self) -> HandlesTotals {
+        HandlesTotals {
+            files: self.files.load(Ordering::Relaxed),
+            dirs: self.dirs.load(Ordering::Relaxed),
         }
     }
 
@@ -65,7 +94,9 @@ impl Handles {
         if map.len() >= self.max && !map.contains_key(&fh) {
             return Err(Errno::EMFILE);
         }
-        if map.insert(fh, handle).is_some() {
+        self.count(&handle).fetch_add(1, Ordering::Relaxed);
+        if let Some(old) = map.insert(fh, handle) {
+            self.count(&old).fetch_sub(1, Ordering::Relaxed);
             tracing::debug!(fh, "replaced an existing handle");
         }
         Ok(())
@@ -94,7 +125,10 @@ impl Handles {
     }
 
     pub fn remove(&self, fh: u64) -> Option<Handle> {
-        self.map.lock().remove(&fh)
+        let mut map = self.map.lock();
+        let handle = map.remove(&fh)?;
+        self.count(&handle).fetch_sub(1, Ordering::Relaxed);
+        Some(handle)
     }
 
     pub fn len(&self) -> usize {
@@ -127,6 +161,30 @@ mod tests {
         assert!(handles.remove(2).is_some());
         handles.insert(3, handle()).unwrap();
         assert_eq!(handles.len(), 2);
+    }
+
+    #[test]
+    fn totals_count_each_kind_through_replacement_and_removal() {
+        let handles = Handles::new(8);
+        let file = Arc::new(File::open("/dev/null").unwrap());
+        let file_handle = || Handle::File {
+            file: file.clone(),
+            path: Path::root(),
+            watch: None,
+        };
+        let dir_handle = || Handle::Dir {
+            dir: Arc::new(Mutex::new(OwnedFd::from(File::open("/").unwrap()))),
+            watch: None,
+        };
+        handles.insert(1, file_handle()).unwrap();
+        handles.insert(2, dir_handle()).unwrap();
+        handles.insert(3, dir_handle()).unwrap();
+        assert_eq!(handles.totals(), HandlesTotals { files: 1, dirs: 2 });
+        handles.insert(1, dir_handle()).unwrap();
+        assert_eq!(handles.totals(), HandlesTotals { files: 0, dirs: 3 });
+        handles.remove(2);
+        assert!(handles.remove(2).is_none());
+        assert_eq!(handles.totals(), HandlesTotals { files: 0, dirs: 2 });
     }
 
     #[test]

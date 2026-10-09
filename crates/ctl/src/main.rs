@@ -1,8 +1,9 @@
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use jackalopefs_ctl::{
-    counter_lines, fmt_record, fmt_record_long, frame_selection, rates, read_preamble, read_record,
-    render_top, resources_between, selection, targets, write_preamble, write_record, Target,
+    counter_lines, fmt_handles, fmt_record, fmt_record_long, frame_selection, rates, read_preamble,
+    read_record, render_top, resources_between, selection, targets, write_preamble, write_record,
+    Target,
 };
 use jackalopefs_proto::control::{
     Ask, CensusOp, ControlReply, ControlRequest, Counters, Happened, Header, Record, Selection,
@@ -44,6 +45,12 @@ enum Command {
     },
     /// One process's counters once, as `key value` lines for scripts: its resource use, events and per-operation totals since it started.
     Counters {
+        /// The process; needed when there is more than one.
+        #[arg(long)]
+        pid: Option<u32>,
+    },
+    /// The handles one process holds open: on a client by the process that opened each (a descriptor inherited or passed on counts as its opener's) with the directory most of them are in, on a server by session with the client's address.
+    Handles {
         /// The process; needed when there is more than one.
         #[arg(long)]
         pid: Option<u32>,
@@ -127,6 +134,20 @@ async fn run(command: Command) -> anyhow::Result<()> {
         Command::Counters { pid } => {
             let mut stream = connect(&pick(pid)?).await?;
             Ok(say(counter_lines(&counters(&mut stream).await?).trim_end())?)
+        }
+        Command::Handles { pid } => {
+            let mut stream = connect(&pick(pid)?).await?;
+            let asked = async {
+                send(&mut stream, Ask::Handles).await?;
+                match reply(&mut stream).await? {
+                    ControlReply::Handles(handles) => Ok(handles),
+                    other => bail!("expected handles, got {other:?}"),
+                }
+            };
+            let handles = tokio::time::timeout(PATIENCE, asked)
+                .await
+                .context("no answer within 5s")??;
+            Ok(say(fmt_handles(&handles).trim_end())?)
         }
         Command::Trace {
             pid,

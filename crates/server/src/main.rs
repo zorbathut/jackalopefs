@@ -232,6 +232,7 @@ fn main() -> anyhow::Result<()> {
         ));
         let source = jackalopefs_server::perf::ControlSource {
             perf: server.perf.clone(),
+            sessions: server.sessions.clone(),
             describe: format!(
                 "{} on {}",
                 args.export.display(),

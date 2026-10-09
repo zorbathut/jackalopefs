@@ -4,7 +4,7 @@ use jackalopefs_perf::control::Source;
 use jackalopefs_perf::events::{Events, Kind};
 use jackalopefs_perf::hub::Hub;
 use jackalopefs_perf::{fmt_bytes, fmt_duration, Totals};
-use jackalopefs_proto::control::{Counters, TotalOp};
+use jackalopefs_proto::control::{Counters, Handles, TotalOp, HANDLES_ROWS_MAX};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -404,6 +404,7 @@ fn fmt_row(row: &Row, window: Duration) -> String {
 /// What this client shows through its control socket.
 pub struct ControlSource {
     pub perf: Arc<Perf>,
+    pub client: Arc<crate::client::Client>,
     pub describe: String,
     /// When the process started.
     pub started: Instant,
@@ -429,8 +430,15 @@ impl Source for ControlSource {
                 .collect(),
             ops: self.perf.totals(),
             inflight: u64::from(self.perf.inflight()),
+            handles: self.client.handles().totals(),
             ..Counters::default()
         }
+    }
+
+    fn handles(&self) -> Handles {
+        let mut rows = self.client.handles().processes();
+        rows.truncate(HANDLES_ROWS_MAX);
+        Handles::Processes(rows)
     }
 
     fn hub(&self) -> Arc<Hub> {

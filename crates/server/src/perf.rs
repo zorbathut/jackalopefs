@@ -5,7 +5,7 @@ use jackalopefs_perf::events::{Events, Kind};
 use jackalopefs_perf::hub::Hub;
 use jackalopefs_perf::stall::{Ended, ErrorLockHeld, ModeScan, Progress, LOCK_PATIENCE};
 use jackalopefs_perf::{fmt_bytes, fmt_duration, Totals};
-use jackalopefs_proto::control::{Counters, TotalOp};
+use jackalopefs_proto::control::{Counters, Handles, TotalOp, HANDLES_ROWS_MAX};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -536,6 +536,7 @@ impl Perf {
 /// What this server shows through its control socket.
 pub struct ControlSource {
     pub perf: Arc<Perf>,
+    pub sessions: Arc<crate::session::Sessions>,
     pub describe: String,
     /// When the process started.
     pub started: Instant,
@@ -561,8 +562,16 @@ impl Source for ControlSource {
                 .collect(),
             ops: self.perf.totals(),
             inflight: u64::from(self.perf.inflight()),
+            handles: self.sessions.handle_totals(),
             ..Counters::default()
         }
+    }
+
+    fn handles(&self) -> Handles {
+        let mut rows = self.sessions.handle_rows();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.files + row.dirs));
+        rows.truncate(HANDLES_ROWS_MAX);
+        Handles::Sessions(rows)
     }
 
     fn hub(&self) -> Arc<Hub> {

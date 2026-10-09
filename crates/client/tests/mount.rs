@@ -2478,3 +2478,54 @@ async fn a_stalled_request_is_listed_in_flight_with_its_call() {
     blocking(move || child.wait().unwrap()).await;
     m.abort_and_finish().await;
 }
+
+/// A handle is put down to the process that opened it, not to whatever thread or process serves the mount.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn handles_are_put_down_to_the_process_that_opened_them() {
+    let Some(m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(1)).await else {
+        return;
+    };
+    fs::create_dir_all(m.export.path().join("tree/deep")).unwrap();
+    fs::write(m.export.path().join("tree/deep/f"), b"x").unwrap();
+    let mnt = m.mnt();
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"exec 3<"$1" 4<"$2" 5<"$3"; echo ready; read x"#)
+        .arg("sh")
+        .arg(mnt.join("tree/deep"))
+        .arg(mnt.join("tree"))
+        .arg(mnt.join("tree/deep/f"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let mut stdout = child.stdout.take().unwrap();
+    let ready = blocking(move || {
+        let mut line = [0u8; 6];
+        stdout.read_exact(&mut line).map(|()| line)
+    })
+    .await
+    .unwrap();
+    assert_eq!(&ready, b"ready\n");
+    let rows = m.mount.as_ref().unwrap().client().handles().processes();
+    let row = rows
+        .iter()
+        .find(|r| r.pid == pid)
+        .unwrap_or_else(|| panic!("no row for the child {pid}: {rows:?}"));
+    assert_ne!(pid, std::process::id());
+    assert_eq!((row.dirs, row.files), (2, 1), "{row:?}");
+    assert_eq!(row.within, "/tree", "{row:?}");
+    assert_eq!(row.name, "sh");
+    let totals = m.mount.as_ref().unwrap().client().handles().totals();
+    assert!(totals.dirs >= 2 && totals.files >= 1, "{totals:?}");
+    let mut stdin = child.stdin.take().unwrap();
+    let status = blocking(move || {
+        stdin.write_all(b"\n").unwrap();
+        drop(stdin);
+        child.wait().unwrap()
+    })
+    .await;
+    assert!(status.success());
+    m.finish().await;
+}

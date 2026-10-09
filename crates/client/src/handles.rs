@@ -1,11 +1,85 @@
 //! Client-side table of open handles. The client chooses handle ids and never reuses one, so when an open's outcome is unknown (timeout, lost connection) the client can simply ask the server to release that id: releasing an id the server never opened is harmless, and releasing one it did closes the fd the client would otherwise never learn about.
 
 use crate::inodes::KeyNode;
-use jackalopefs_proto::{Path, Request, Response};
+use jackalopefs_proto::control::{HandlesProcess, HandlesTotals};
+use jackalopefs_proto::{Name, Path, Request, Response};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
+/// The process that opened a handle: its thread group's id and name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Opener {
+    pub pid: u32,
+    pub name: String,
+}
+
+/// One row per opener of `handles`, each given as its opener (`None` when it could not be named), whether it is a directory, and its path; the largest rows first.
+fn processes<'a>(
+    handles: impl IntoIterator<Item = (Option<&'a Opener>, bool, &'a Path)>,
+) -> Vec<HandlesProcess> {
+    #[derive(Default)]
+    struct Row<'a> {
+        files: u64,
+        dirs: u64,
+        /// Handles under each directory, counted at every ancestor of the one each is in.
+        under: HashMap<&'a [Name], u64>,
+    }
+    let mut rows: HashMap<Option<&Opener>, Row> = HashMap::new();
+    for (opener, dir, path) in handles {
+        let row = rows.entry(opener).or_default();
+        if dir {
+            row.dirs += 1;
+        } else {
+            row.files += 1;
+        }
+        let names = path.names();
+        let parent = &names[..names.len().saturating_sub(1)];
+        for depth in 0..=parent.len() {
+            *row.under.entry(&parent[..depth]).or_default() += 1;
+        }
+    }
+    let mut out: Vec<HandlesProcess> = rows
+        .into_iter()
+        .map(|(opener, row)| {
+            let total = row.files + row.dirs;
+            let within = row
+                .under
+                .iter()
+                .filter(|(_, n)| 2 * **n >= total)
+                .map(|(dir, _)| *dir)
+                .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)))
+                .unwrap_or(&[]);
+            HandlesProcess {
+                pid: opener.map_or(0, |o| o.pid),
+                name: opener.map_or_else(String::new, |o| o.name.clone()),
+                files: row.files,
+                dirs: row.dirs,
+                within: fmt_within(within),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (b.files + b.dirs)
+            .cmp(&(a.files + a.dirs))
+            .then(a.pid.cmp(&b.pid))
+    });
+    out
+}
+
+/// A directory relative to the mount, `/` being its root.
+fn fmt_within(names: &[Name]) -> String {
+    let mut out = String::new();
+    for name in names {
+        out.push('/');
+        out.push_str(&String::from_utf8_lossy(name.as_bytes()));
+    }
+    if out.is_empty() {
+        out.push('/');
+    }
+    out
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandleKind {
@@ -22,6 +96,8 @@ pub struct HandleRec {
     /// The flags the server opened with, which is how the file is reopened after a lost session and what says whether this handle writes; the kernel's own flags differ in access mode and append.
     pub flags: i32,
     pub kind: HandleKind,
+    /// The process whose open made the handle, `None` when it could not be named; known to this client alone.
+    pub opener: Option<Opener>,
     /// Set when a reopen after a lost session found a different inode (or nothing) at the path; every later use fails with `ESTALE`.
     dead: AtomicBool,
 }
@@ -57,6 +133,9 @@ pub struct HandleTable {
     map: Mutex<HashMap<u64, Arc<HandleRec>>>,
     /// Releases that failed for want of a connection; the session that holds their ids gets them if it resumes.
     owed: Mutex<Vec<Request>>,
+    /// The handles in `map` of each kind, changed under its lock.
+    files: AtomicU64,
+    dirs: AtomicU64,
 }
 
 impl HandleTable {
@@ -65,6 +144,7 @@ impl HandleTable {
         self.next.fetch_add(1, Ordering::Relaxed) + 1
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert(
         &self,
         fh: u64,
@@ -73,6 +153,7 @@ impl HandleTable {
         path: Path,
         flags: i32,
         kind: HandleKind,
+        opener: Option<Opener>,
     ) -> Arc<HandleRec> {
         let rec = Arc::new(HandleRec {
             nodeid,
@@ -80,12 +161,40 @@ impl HandleTable {
             path,
             flags,
             kind,
+            opener,
             dead: AtomicBool::new(false),
         });
-        if self.map.lock().insert(fh, rec.clone()).is_some() {
+        let mut map = self.map.lock();
+        self.count(kind).fetch_add(1, Ordering::Relaxed);
+        if let Some(old) = map.insert(fh, rec.clone()) {
+            self.count(old.kind).fetch_sub(1, Ordering::Relaxed);
             tracing::error!(fh, "handle id reused; this is a bug");
         }
         rec
+    }
+
+    fn count(&self, kind: HandleKind) -> &AtomicU64 {
+        match kind {
+            HandleKind::File => &self.files,
+            HandleKind::Dir => &self.dirs,
+        }
+    }
+
+    /// The handles open, by kind.
+    pub fn totals(&self) -> HandlesTotals {
+        HandlesTotals {
+            files: self.files.load(Ordering::Relaxed),
+            dirs: self.dirs.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The handles open, by the process that opened them, the largest first; the walk is outside the table's lock, which every call on a handle takes.
+    pub fn processes(&self) -> Vec<HandlesProcess> {
+        let recs: Vec<Arc<HandleRec>> = self.map.lock().values().cloned().collect();
+        processes(
+            recs.iter()
+                .map(|r| (r.opener.as_ref(), r.kind == HandleKind::Dir, &r.path)),
+        )
     }
 
     pub fn get(&self, fh: u64) -> Option<Arc<HandleRec>> {
@@ -93,7 +202,10 @@ impl HandleTable {
     }
 
     pub fn remove(&self, fh: u64) -> Option<Arc<HandleRec>> {
-        self.map.lock().remove(&fh)
+        let mut map = self.map.lock();
+        let rec = map.remove(&fh)?;
+        self.count(rec.kind).fetch_sub(1, Ordering::Relaxed);
+        Some(rec)
     }
 
     pub fn owe_release(&self, release: Request) {
@@ -229,6 +341,7 @@ mod tests {
             Path::root(),
             libc::O_RDWR | libc::O_TRUNC | libc::O_CREAT,
             HandleKind::File,
+            None,
         );
         assert!(
             matches!(rec.reopen_request(fh), Request::Open { flags, .. } if flags == libc::O_RDWR)
@@ -245,6 +358,7 @@ mod tests {
             Path::root(),
             libc::O_RDONLY,
             HandleKind::File,
+            None,
         );
         let mut same_number = attr(42);
         same_number.identity.handle.push(1);
@@ -266,6 +380,7 @@ mod tests {
             Path::root(),
             libc::O_RDONLY,
             HandleKind::File,
+            None,
         );
         let b = table.alloc();
         table.insert(
@@ -275,6 +390,7 @@ mod tests {
             Path::root(),
             libc::O_RDONLY,
             HandleKind::File,
+            None,
         );
         assert_eq!(table.any_live_for(42), Some(a));
         assert_eq!(table.any_live_for(43), Some(b));
@@ -295,6 +411,7 @@ mod tests {
             Path::root(),
             libc::O_RDONLY,
             HandleKind::File,
+            None,
         );
         let d = table.alloc();
         table.insert(
@@ -304,6 +421,7 @@ mod tests {
             Path::root(),
             libc::O_RDONLY | libc::O_DIRECTORY,
             HandleKind::Dir,
+            None,
         );
         assert!(!table.has_writer(42));
         assert!(!table.may_be_dirty(42));
@@ -315,6 +433,7 @@ mod tests {
             Path::root(),
             libc::O_RDWR,
             HandleKind::File,
+            None,
         );
         assert!(table.has_writer(42));
         assert!(!table.has_writer(43));
@@ -337,9 +456,128 @@ mod tests {
             Path::root(),
             libc::O_WRONLY | libc::O_CREAT,
             HandleKind::File,
+            None,
         );
         assert!(table.has_writer(42));
         table.remove(w2);
         assert!(!table.has_writer(42));
+    }
+
+    #[test]
+    fn totals_and_processes_follow_inserts_and_removes() {
+        let table = HandleTable::default();
+        let find = Opener {
+            pid: 7,
+            name: "find".into(),
+        };
+        let dir = |name: &str| {
+            Path::from_names(vec![
+                jackalopefs_proto::Name::new("tree").unwrap(),
+                jackalopefs_proto::Name::new(name).unwrap(),
+            ])
+            .unwrap()
+        };
+        let mut dirs = Vec::new();
+        for name in ["a", "b", "c"] {
+            let fh = table.alloc();
+            table.insert(
+                fh,
+                42,
+                KeyNode::of(&attr(42)),
+                dir(name),
+                libc::O_RDONLY | libc::O_DIRECTORY,
+                HandleKind::Dir,
+                Some(find.clone()),
+            );
+            dirs.push(fh);
+        }
+        let file = table.alloc();
+        table.insert(
+            file,
+            43,
+            KeyNode::of(&attr(43)),
+            Path::root(),
+            libc::O_RDONLY,
+            HandleKind::File,
+            None,
+        );
+        assert_eq!(table.totals(), HandlesTotals { files: 1, dirs: 3 });
+        let rows = table.processes();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].pid, rows[0].dirs, rows[0].within.as_str()),
+            (7, 3, "/tree")
+        );
+        assert_eq!((rows[1].pid, rows[1].files), (0, 1));
+        table.remove(dirs[0]);
+        table.remove(file);
+        assert!(table.remove(file).is_none());
+        assert_eq!(table.totals(), HandlesTotals { files: 0, dirs: 2 });
+        assert_eq!(table.processes().len(), 1);
+    }
+
+    fn path_of(text: &str) -> Path {
+        Path::from_names(
+            text.split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| Name::new(s).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn opener(pid: u32, name: &str) -> Opener {
+        Opener {
+            pid,
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn rows_are_per_opener_largest_first_with_kinds_counted() {
+        let find = opener(10, "find");
+        let torrent = opener(20, "qbittorrent");
+        let paths: Vec<Path> = (0..5).map(|i| path_of(&format!("a/d{i}"))).collect();
+        let file = path_of("v/x.mkv");
+        let mut handles: Vec<(Option<&Opener>, bool, &Path)> =
+            paths.iter().map(|p| (Some(&find), true, p)).collect();
+        handles.push((Some(&torrent), false, &file));
+        handles.push((Some(&torrent), false, &file));
+        handles.push((Some(&find), false, &file));
+        handles.push((None, true, &file));
+        let rows = processes(handles);
+        let summary: Vec<(u32, &str, u64, u64)> = rows
+            .iter()
+            .map(|r| (r.pid, r.name.as_str(), r.files, r.dirs))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(10, "find", 1, 5), (20, "qbittorrent", 2, 0), (0, "", 0, 1)]
+        );
+    }
+
+    #[test]
+    fn within_is_the_deepest_directory_holding_half() {
+        let walker = opener(1, "walker");
+        let deep: Vec<Path> = (0..6)
+            .map(|i| path_of(&format!("video/old/show/s{i}")))
+            .collect();
+        let elsewhere: Vec<Path> = (0..4).map(|i| path_of(&format!("music/a{i}"))).collect();
+        let handles = deep
+            .iter()
+            .chain(&elsewhere)
+            .map(|p| (Some(&walker), true, p));
+        assert_eq!(processes(handles)[0].within, "/video/old/show");
+
+        let spread: Vec<Path> = ["a/x", "b/x", "c/x"].iter().map(|p| path_of(p)).collect();
+        let handles = spread.iter().map(|p| (Some(&walker), true, p));
+        assert_eq!(processes(handles)[0].within, "/");
+
+        let root = Path::root();
+        assert_eq!(
+            processes([(Some(&walker), true, &root)])[0].within,
+            "/",
+            "the root's place is the root"
+        );
     }
 }

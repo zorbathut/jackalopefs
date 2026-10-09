@@ -275,6 +275,10 @@ impl Mount {
         })
     }
 
+    pub fn client(&self) -> &Arc<Client> {
+        &self.shared.client
+    }
+
     pub fn perf(&self) -> &Arc<Perf> {
         self.shared.client.perf()
     }

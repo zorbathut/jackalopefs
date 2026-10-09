@@ -2,7 +2,8 @@
 
 use jackalopefs_perf::{fmt_count, level_outermost, totals_at, RateResources};
 use jackalopefs_proto::control::{
-    Bucket, ControlReply, Counters, Exchange, Happened, Ids, Names, Record, Selection, Summary,
+    Bucket, ControlReply, Counters, Exchange, Handles, Happened, Ids, Names, Record, Selection,
+    Summary,
 };
 use jackalopefs_proto::{
     decode, read_frame, write_frame, Event, Request, Response, CONTROL_REVISION, PROTO_REVISION,
@@ -284,6 +285,8 @@ pub fn counter_lines(c: &Counters) -> String {
     put("pid", &c.pid);
     put("uptime_ns", &c.uptime_ns);
     put("inflight", &c.inflight);
+    put("handles.files", &c.handles.files);
+    put("handles.dirs", &c.handles.dirs);
     let r = &c.resources;
     put("resources.user_ns", &r.user_ns);
     put("resources.sys_ns", &r.sys_ns);
@@ -349,12 +352,15 @@ pub fn render_top(
     let mut out = String::new();
     writeln!(
         out,
-        "{} {} — {} — up {}, {} in flight, every {seconds:.1}s",
+        "{} {} — {} — up {}, {} in flight, {} handles open ({} files, {} dirs), every {seconds:.1}s",
         clean(&now.side),
         now.pid,
         clean(&now.describe),
         fmt_ns(now.uptime_ns),
-        now.inflight
+        now.inflight,
+        now.handles.files + now.handles.dirs,
+        now.handles.files,
+        now.handles.dirs
     )
     .expect("a String takes any write");
     if let Some(resources) = resources {
@@ -396,6 +402,71 @@ pub fn render_top(
         )
         .expect("a String takes any write");
     }
+    out
+}
+
+/// The handles a process holds: on a client by the process that opened them, on a server by session; largest first, then the total.
+pub fn fmt_handles(handles: &Handles) -> String {
+    let mut out = String::new();
+    let (files, dirs) = match handles {
+        Handles::Processes(rows) => {
+            writeln!(
+                out,
+                "{:>8} {:<16} {:>8} {:>8}  within",
+                "pid", "process", "files", "dirs"
+            )
+            .expect("a String takes any write");
+            let mut rows: Vec<_> = rows.iter().collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.files + r.dirs));
+            for r in &rows {
+                let (pid, name) = if r.pid == 0 {
+                    ("?".to_owned(), "(unattributed)".to_owned())
+                } else {
+                    (r.pid.to_string(), clean(&r.name))
+                };
+                writeln!(
+                    out,
+                    "{pid:>8} {name:<16} {:>8} {:>8}  {}",
+                    r.files,
+                    r.dirs,
+                    clean(&r.within)
+                )
+                .expect("a String takes any write");
+            }
+            rows.iter()
+                .fold((0, 0), |(f, d), r| (f + r.files, d + r.dirs))
+        }
+        Handles::Sessions(rows) => {
+            writeln!(
+                out,
+                "{:>8} {:<40} {:<9} {:>8} {:>8}",
+                "session", "client", "state", "files", "dirs"
+            )
+            .expect("a String takes any write");
+            let mut rows: Vec<_> = rows.iter().collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.files + r.dirs));
+            for r in &rows {
+                let state = if r.detached { "detached" } else { "attached" };
+                writeln!(
+                    out,
+                    "{:>8} {:<40} {state:<9} {:>8} {:>8}",
+                    r.session,
+                    clean(&r.remote),
+                    r.files,
+                    r.dirs
+                )
+                .expect("a String takes any write");
+            }
+            rows.iter()
+                .fold((0, 0), |(f, d), r| (f + r.files, d + r.dirs))
+        }
+    };
+    writeln!(
+        out,
+        "{} handles open: {files} files, {dirs} dirs",
+        files + dirs
+    )
+    .expect("a String takes any write");
     out
 }
 
@@ -682,7 +753,7 @@ pub async fn read_record<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jackalopefs_proto::control::TotalOp;
+    use jackalopefs_proto::control::{HandlesProcess, HandlesSession, HandlesTotals, TotalOp};
 
     #[test]
     fn only_listening_control_sockets_of_this_user_are_targets() {
@@ -863,6 +934,7 @@ mod tests {
                 sizes: buckets(&[(4096, 3)]),
                 ..total("request", "read", 3, 12288, 0, 300)
             }],
+            handles: HandlesTotals { files: 4, dirs: 5 },
             ..Counters::default()
         };
         let text = counter_lines(&c);
@@ -878,12 +950,95 @@ mod tests {
             ("op.request.read.count", "3"),
             ("op.request.read.bytes", "12288"),
             ("op.request.read.bytes_le.4096", "3"),
+            ("handles.files", "4"),
+            ("handles.dirs", "5"),
         ] {
             assert!(
                 text.lines().any(|l| l == format!("{key} {value}")),
                 "{key} in {text}"
             );
         }
+    }
+
+    #[test]
+    fn handle_tables_list_every_row_largest_first_with_a_total() {
+        let unattributed = HandlesProcess {
+            files: 3,
+            ..HandlesProcess::default()
+        };
+        let processes = fmt_handles(&Handles::Processes(vec![
+            unattributed.clone(),
+            HandlesProcess {
+                pid: 4242,
+                name: "find".into(),
+                files: 1,
+                dirs: 4000,
+                within: "/video/old".into(),
+            },
+        ]));
+        let lines: Vec<&str> = processes.lines().collect();
+        let find = lines.iter().position(|l| l.contains("4242")).unwrap();
+        assert!(
+            lines[find].contains("find")
+                && lines[find].contains("4000")
+                && lines[find].contains("/video/old")
+        );
+        let alone = fmt_handles(&Handles::Processes(vec![unattributed]));
+        let unknown_row = alone.lines().nth(1).unwrap();
+        let unknown = lines.iter().position(|l| *l == unknown_row).unwrap();
+        assert!(find < unknown, "largest first: {processes}");
+        assert!(
+            lines.iter().any(|l| l.contains("4004")),
+            "a total: {processes}"
+        );
+
+        let session = |session, detached, dirs| HandlesSession {
+            session,
+            remote: format!("192.0.2.{session}:4433"),
+            detached,
+            files: 2,
+            dirs,
+        };
+        let sessions = fmt_handles(&Handles::Sessions(vec![
+            session(1, false, 3),
+            session(2, false, 7),
+        ]));
+        let first = sessions
+            .lines()
+            .position(|l| l.contains("192.0.2.2"))
+            .unwrap();
+        let second = sessions
+            .lines()
+            .position(|l| l.contains("192.0.2.1"))
+            .unwrap();
+        assert!(first < second, "largest first: {sessions}");
+        assert!(
+            sessions.lines().any(|l| l.contains("14")),
+            "a total: {sessions}"
+        );
+        assert_ne!(
+            fmt_handles(&Handles::Sessions(vec![session(1, false, 3)])),
+            fmt_handles(&Handles::Sessions(vec![session(1, true, 3)])),
+            "attached and detached read differently"
+        );
+        assert_ne!(fmt_handles(&Handles::Sessions(vec![])), "");
+    }
+
+    #[test]
+    fn top_says_how_many_handles_are_open() {
+        let now = Counters {
+            handles: HandlesTotals {
+                files: 12,
+                dirs: 34,
+            },
+            ..Counters::default()
+        };
+        let screen = render_top(&now, None, &[], &[], 1.0);
+        let first = screen.lines().next().unwrap();
+        assert!(
+            first.contains("46") && first.contains("12") && first.contains("34"),
+            "{first}"
+        );
     }
 
     #[test]

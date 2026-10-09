@@ -120,6 +120,8 @@ struct DirState {
 pub struct Backend {
     shared: Arc<Shared>,
     runtime: tokio::runtime::Handle,
+    /// The processes behind the threads that open handles, looked up by each open's task before it calls the server.
+    openers: Arc<crate::procs::Openers>,
 }
 
 /// What identifies a kernel request in the trace line and the stall watchdog's.
@@ -207,6 +209,7 @@ impl Backend {
         });
         (
             Backend {
+                openers: Arc::new(crate::procs::Openers::new(shared.proc_ours())),
                 shared: shared.clone(),
                 runtime,
             },
@@ -1352,7 +1355,9 @@ impl Filesystem for Backend {
     fn open(&self, req: &Request, ino: INodeNo, flags: fuser::OpenFlags, reply: ReplyOpen) {
         let shared = self.shared.clone();
         let flags = flags_for_server(flags.0);
+        let (openers, tid) = (self.openers.clone(), req.pid());
         self.spawn(KeyPerf::of("open", req, ino.0), async move {
+            let opener = openers.of(tid).await;
             // A path that led to another file costs the node that name, and the open is tried by the next.
             let opened = loop {
                 let path = match shared.path_of(ino.0) {
@@ -1363,7 +1368,7 @@ impl Filesystem for Backend {
                     (shared.clone(), path.clone(), AtomicBool::new(false));
                 let opened = shared
                     .client
-                    .open(path, flags, |attr| {
+                    .open(path, flags, opener.clone(), |attr| {
                         meant.same_file(ino.0, &by, attr, &wrong_name)
                     })
                     .await;
@@ -1399,7 +1404,9 @@ impl Filesystem for Backend {
             Err(e) => return reply.error(e),
         };
         let flags = flags_for_server(flags);
+        let (openers, tid) = (self.openers.clone(), req.pid());
         self.spawn(KeyPerf::of("create", req, parent.0), async move {
+            let opener = openers.of(tid).await;
             let path = match shared.path_of(parent.0) {
                 Ok(path) => path,
                 Err(e) => return fail(reply, e),
@@ -1408,7 +1415,7 @@ impl Filesystem for Backend {
             let registering = shared.clone();
             let created = shared
                 .client
-                .create(path, name.clone(), mode, flags, |attr| {
+                .create(path, name.clone(), mode, flags, opener, |attr| {
                     registering.dir_grew(parent.0);
                     let registered = registering
                         .register(parent.0, name, attr)
@@ -1697,7 +1704,9 @@ impl Filesystem for Backend {
 
     fn opendir(&self, req: &Request, ino: INodeNo, _flags: fuser::OpenFlags, reply: ReplyOpen) {
         let shared = self.shared.clone();
+        let (openers, tid) = (self.openers.clone(), req.pid());
         self.spawn(KeyPerf::of("opendir", req, ino.0), async move {
+            let opener = openers.of(tid).await;
             let opened = loop {
                 let path = match shared.path_of(ino.0) {
                     Ok(path) => path,
@@ -1707,7 +1716,9 @@ impl Filesystem for Backend {
                     (shared.clone(), path.clone(), AtomicBool::new(false));
                 let opened = shared
                     .client
-                    .opendir(path, |attr| meant.same_file(ino.0, &by, attr, &wrong_name))
+                    .opendir(path, opener.clone(), |attr| {
+                        meant.same_file(ino.0, &by, attr, &wrong_name)
+                    })
                     .await;
                 if !wrong_name.load(Ordering::Relaxed) {
                     break opened;

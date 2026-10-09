@@ -51,6 +51,8 @@ struct ControlRequest {
     # Sent during a subscription: the records still queued, then a census
     # record, and the subscription ends.
     census @3 :Void;
+    # One Handles reply; a connection may ask again.
+    handles @4 :Void;
   }
 }
 
@@ -103,6 +105,46 @@ struct Counters {
   events @5 :List(Count);
   ops @6 :List(TotalOp);
   resources @7 :Resources;
+  # The handles open now, by kind: a snapshot, like inflight.
+  handles @8 :HandlesTotals;
+}
+
+struct HandlesTotals {
+  files @0 :UInt64;
+  dirs @1 :UInt64;
+}
+
+# On a client, the processes that opened the handles open now, one row each.
+# A handle is the opener's however it was passed on (inherited across fork,
+# sent over a socket). Handles the client could not attribute (a caller in
+# another pid namespace, an unreadable /proc) share a row with pid 0 and an
+# empty name. `within` is the deepest directory, relative to the mount (`/`
+# being its root), that holds at least half the row's handles: the directory
+# a file is in, or a directory's parent.
+struct HandlesProcess {
+  pid @0 :UInt32;
+  name @1 :Text;
+  files @2 :UInt64;
+  dirs @3 :UInt64;
+  within @4 :Text;
+}
+
+# On a server, the sessions holding handles, one row each, with the address
+# of the session's client when it was last attached.
+struct HandlesSession {
+  session @0 :UInt64;
+  remote @1 :Text;
+  detached @2 :Bool;
+  files @3 :UInt64;
+  dirs @4 :UInt64;
+}
+
+# At most 256 rows, the largest first.
+struct Handles {
+  union {
+    processes @0 :List(HandlesProcess);
+    sessions @1 :List(HandlesSession);
+  }
 }
 
 # The identifiers that join a record to the log lines and to the other side's
@@ -208,5 +250,6 @@ struct ControlReply {
     counters @0 :Counters;
     record @1 :Record;
     refused @2 :Text;
+    handles @3 :Handles;
   }
 }

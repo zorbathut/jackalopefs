@@ -180,6 +180,7 @@ fn main() -> anyhow::Result<()> {
         tracing::info!("mounted {} at {}", args.server, args.mountpoint.display());
         let source = jackalopefs_client::perf::ControlSource {
             perf: mount.perf().clone(),
+            client: mount.client().clone(),
             describe: format!("{} from {}", args.mountpoint.display(), args.server),
             started,
         };

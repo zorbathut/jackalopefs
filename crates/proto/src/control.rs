@@ -43,6 +43,7 @@ pub enum Ask {
     Subscribe(Selection),
     /// During a subscription: what is still queued, a census, and the end.
     Census,
+    Handles,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +98,44 @@ pub struct Counters {
     pub events: Vec<(String, u64)>,
     pub ops: Vec<TotalOp>,
     pub resources: Resources,
+    pub handles: HandlesTotals,
+}
+
+/// The handles open now, by kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HandlesTotals {
+    pub files: u64,
+    pub dirs: u64,
+}
+
+/// One process's handles on a client; see `HandlesProcess` in the schema.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HandlesProcess {
+    /// 0, with an empty name, for the handles no process could be named for.
+    pub pid: u32,
+    pub name: String,
+    pub files: u64,
+    pub dirs: u64,
+    pub within: String,
+}
+
+/// One session's handles on a server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HandlesSession {
+    pub session: u64,
+    pub remote: String,
+    pub detached: bool,
+    pub files: u64,
+    pub dirs: u64,
+}
+
+/// Most rows a [`Handles`] reply carries; the largest are kept.
+pub const HANDLES_ROWS_MAX: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Handles {
+    Processes(Vec<HandlesProcess>),
+    Sessions(Vec<HandlesSession>),
 }
 
 /// The identifiers that join a record to the log lines and to the other side's records.
@@ -212,6 +251,7 @@ pub enum ControlReply {
     Counters(Counters),
     Record(Record),
     Refused(String),
+    Handles(Handles),
 }
 
 /// Bits of a `present` field, for optional numbers.
@@ -306,6 +346,7 @@ impl Message for ControlRequest {
             Ask::Counters => b.set_counters(()),
             Ask::Subscribe(selection) => build_selection(b.init_subscribe(), selection),
             Ask::Census => b.set_census(()),
+            Ask::Handles => b.set_handles(()),
         }
     }
 
@@ -316,6 +357,7 @@ impl Message for ControlRequest {
             Which::Counters(()) => Ask::Counters,
             Which::Subscribe(s) => Ask::Subscribe(parse_selection(s?)?),
             Which::Census(()) => Ask::Census,
+            Which::Handles(()) => Ask::Handles,
         };
         Ok(ControlRequest {
             revision: r.get_revision(),
@@ -531,6 +573,40 @@ fn parse_buckets(list: capnp::struct_list::Reader<'_, schema::bucket::Owned>) ->
         .collect()
 }
 
+fn parse_handles(r: schema::handles::Reader<'_>) -> Result<Handles, ErrorDecode> {
+    use schema::handles::Which;
+    Ok(match r.which()? {
+        Which::Processes(rows) => Handles::Processes(
+            rows?
+                .iter()
+                .map(|r| {
+                    Ok(HandlesProcess {
+                        pid: r.get_pid(),
+                        name: text(r.get_name()?)?,
+                        files: r.get_files(),
+                        dirs: r.get_dirs(),
+                        within: text(r.get_within()?)?,
+                    })
+                })
+                .collect::<Result<_, ErrorDecode>>()?,
+        ),
+        Which::Sessions(rows) => Handles::Sessions(
+            rows?
+                .iter()
+                .map(|r| {
+                    Ok(HandlesSession {
+                        session: r.get_session(),
+                        remote: text(r.get_remote()?)?,
+                        detached: r.get_detached(),
+                        files: r.get_files(),
+                        dirs: r.get_dirs(),
+                    })
+                })
+                .collect::<Result<_, ErrorDecode>>()?,
+        ),
+    })
+}
+
 impl Message for ControlReply {
     fn build(&self, message: &mut message::Builder<HeapAllocator>) {
         let mut b = message.init_root::<schema::control_reply::Builder<'_>>();
@@ -556,6 +632,9 @@ impl Message for ControlReply {
                 r.set_workers(c.resources.workers);
                 r.set_busy_ns(c.resources.busy_ns);
                 r.set_parks(c.resources.parks);
+                let mut h = o.reborrow().init_handles();
+                h.set_files(c.handles.files);
+                h.set_dirs(c.handles.dirs);
                 let mut ops = o.init_ops(c.ops.len() as u32);
                 for (i, t) in c.ops.iter().enumerate() {
                     let mut o = ops.reborrow().get(i as u32);
@@ -575,6 +654,33 @@ impl Message for ControlReply {
             }
             ControlReply::Record(record) => build_record(b.init_record(), record),
             ControlReply::Refused(why) => b.set_refused(why.as_str()),
+            ControlReply::Handles(handles) => {
+                let h = b.init_handles();
+                match handles {
+                    Handles::Processes(rows) => {
+                        let mut list = h.init_processes(rows.len() as u32);
+                        for (i, row) in rows.iter().enumerate() {
+                            let mut b = list.reborrow().get(i as u32);
+                            b.set_pid(row.pid);
+                            b.set_name(row.name.as_str());
+                            b.set_files(row.files);
+                            b.set_dirs(row.dirs);
+                            b.set_within(row.within.as_str());
+                        }
+                    }
+                    Handles::Sessions(rows) => {
+                        let mut list = h.init_sessions(rows.len() as u32);
+                        for (i, row) in rows.iter().enumerate() {
+                            let mut b = list.reborrow().get(i as u32);
+                            b.set_session(row.session);
+                            b.set_remote(row.remote.as_str());
+                            b.set_detached(row.detached);
+                            b.set_files(row.files);
+                            b.set_dirs(row.dirs);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -624,10 +730,18 @@ impl Message for ControlReply {
                             parks: r.get_parks(),
                         }
                     },
+                    handles: {
+                        let h = c.get_handles()?;
+                        HandlesTotals {
+                            files: h.get_files(),
+                            dirs: h.get_dirs(),
+                        }
+                    },
                 })
             }
             Which::Record(record) => ControlReply::Record(parse_record(record?)?),
             Which::Refused(why) => ControlReply::Refused(text(why?)?),
+            Which::Handles(h) => ControlReply::Handles(parse_handles(h?)?),
         })
     }
 
@@ -653,6 +767,18 @@ impl Message for ControlReply {
                 what: Happened::Undecodable { body, .. } | Happened::EventFrame { body, .. },
                 ..
             }) => 32 + (body.len() / 8) as u32,
+            ControlReply::Handles(Handles::Processes(rows)) => {
+                16 + rows
+                    .iter()
+                    .map(|r| 8 + (r.name.len() + r.within.len()) as u32 / 8)
+                    .sum::<u32>()
+            }
+            ControlReply::Handles(Handles::Sessions(rows)) => {
+                16 + rows
+                    .iter()
+                    .map(|r| 8 + r.remote.len() as u32 / 8)
+                    .sum::<u32>()
+            }
             _ => 64,
         }
     }
@@ -678,6 +804,35 @@ mod tests {
             revision: 7,
             ask: Ask::Census,
         });
+        round_trip(&ControlRequest {
+            revision: 7,
+            ask: Ask::Handles,
+        });
+        round_trip(&ControlReply::Handles(Handles::Processes(vec![
+            HandlesProcess {
+                pid: 4242,
+                name: "find".into(),
+                files: 1,
+                dirs: 4000,
+                within: "video/old".into(),
+            },
+            HandlesProcess::default(),
+        ])));
+        round_trip(&ControlReply::Handles(Handles::Sessions(vec![
+            HandlesSession {
+                session: 1,
+                remote: "192.0.2.1:4433".into(),
+                detached: false,
+                files: 2,
+                dirs: 3,
+            },
+            HandlesSession {
+                session: 2,
+                detached: true,
+                ..HandlesSession::default()
+            },
+        ])));
+        round_trip(&ControlReply::Handles(Handles::Sessions(vec![])));
         round_trip(&ControlRequest {
             revision: 7,
             ask: Ask::Subscribe(Selection {
@@ -727,6 +882,7 @@ mod tests {
                 busy_ns: 6,
                 parks: 7,
             },
+            handles: HandlesTotals { files: 8, dirs: 9 },
         }));
         round_trip(&ControlReply::Record(Record {
             at_ns: 11,
