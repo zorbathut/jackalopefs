@@ -31,21 +31,22 @@ pub fn parse_status(status: &str) -> ThreadStatus {
     }
 }
 
-pub fn status_of(tid: u32) -> io::Result<ThreadStatus> {
+/// Takes a reference to the thread's memory for the read, so never on the FUSE session thread, the runtime's worker or the main thread (`crate::signals`).
+pub(crate) fn status_of(tid: u32) -> io::Result<ThreadStatus> {
     Ok(parse_status(&std::fs::read_to_string(format!(
         "/proc/{tid}/status"
     ))?))
 }
 
 /// The name of process `tgid`.
-pub fn comm_of(tgid: u32) -> io::Result<String> {
+pub(crate) fn comm_of(tgid: u32) -> io::Result<String> {
     Ok(std::fs::read_to_string(format!("/proc/{tgid}/comm"))?
         .trim_end_matches('\n')
         .to_string())
 }
 
-/// The process thread `tid` belongs to.
-pub fn opener_of(tid: u32) -> io::Result<Opener> {
+/// The process thread `tid` belongs to, read as [`status_of`] is.
+fn opener_of(tid: u32) -> io::Result<Opener> {
     let status = status_of(tid)?;
     let pid = status
         .tgid

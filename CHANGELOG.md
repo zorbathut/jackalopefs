@@ -69,6 +69,7 @@
 
 ### Fixed
 
+- The client's `SIGUSR1` and `--perf-interval` reports name the callers of requests in flight on the blocking pool instead of the main thread, which a read caught in a release on this mount (a caller whose process exited while it was read: one whose reply had just landed, or the reader behind a readahead, which is not blocked in its request) could leave unable to act on the second signal that aborts the mount. Those lines can now come after the rest of the report.
 - The client exits when its mount is unmounted from outside (`fusermount -u`). It kept running with nothing to serve, reconnecting to the server, until it was killed.
 - A directory handle that had read to the end of its listing asks the server again after the client sweeps its cache (an event overflow or a reconnect). It kept answering "end" from what it had recorded, so a program polling the directory through that handle never saw the names added meanwhile.
 - A `RUST_LOG` that does not parse is reported at startup instead of silently becoming `info`.

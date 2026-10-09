@@ -206,9 +206,10 @@ fn main() -> anyhow::Result<()> {
             tokio::select! {
                 _ = next_signal(&mut signals.term) => break false,
                 _ = next_signal(&mut signals.int) => break false,
-                _ = next_signal(&mut signals.usr1) => mount.report(),
+                // The in-flight lines come when they come: this loop must stay free to act on a second signal.
+                _ = next_signal(&mut signals.usr1) => drop(mount.report()),
                 _ = next_signal(&mut signals.usr2) => usr2_unused(),
-                _ = next_tick(&mut ticks) => mount.report(),
+                _ = next_tick(&mut ticks) => drop(mount.report()),
                 _ = mount.ended() => break true,
             }
         };

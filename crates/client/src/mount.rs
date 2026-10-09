@@ -170,6 +170,8 @@ pub struct Mount {
     shared: Arc<Shared>,
     limits: Option<KernelLimits>,
     meters: Meters,
+    /// The runtime the mount was started in, which a report's in-flight listing is spawned on.
+    runtime: tokio::runtime::Handle,
 }
 
 /// Aborts a mount's FUSE connection through its control file, which the mounting user owns. Taken from the mount beforehand, so it can be used while the mount is being unmounted.
@@ -272,6 +274,7 @@ impl Mount {
                 generation: 0,
                 quic: TrackerQuic::default(),
             },
+            runtime: tokio::runtime::Handle::current(),
         })
     }
 
@@ -294,10 +297,16 @@ impl Mount {
             .scan_pending(std::time::Instant::now(), ModeScan::Listed)
     }
 
-    /// Log the per-op tables for the window since the last report, the requests in flight at least a second, the kernel's queue depth, the host's physical ports and UDP drop counters, the connection's QUIC statistics with its window, and the verdict when a port is full, in that order so the verdict follows the lines it is drawn from.
-    pub fn report(&mut self) {
+    /// Log the per-op tables for the window since the last report, the requests in flight at least a second, the kernel's queue depth, the host's physical ports and UDP drop counters, the connection's QUIC statistics with its window, and the verdict when a port is full, in that order so the verdict follows the lines it is drawn from. The requests in flight are logged from the blocking pool, as soon as their callers have been read, which can be after the rest; the task that logs them is returned, for a caller that can wait for it.
+    pub fn report(&mut self) -> tokio::task::JoinHandle<()> {
         self.perf().report();
-        report_pending(&self.shared);
+        // Naming the callers reads their `/proc`, which can leave the reading thread in a release on this mount (`crate::signals`); the main thread, which must stay free to abort the mount on a second signal, does not wait for it.
+        let shared = self.shared.clone();
+        let pending = self.runtime.spawn(async move {
+            if let Err(e) = tokio::task::spawn_blocking(move || report_pending(&shared)).await {
+                tracing::error!("listing the requests in flight failed: {e}");
+            }
+        });
         if let Some(waiting) = self.limits.as_ref().and_then(KernelLimits::waiting) {
             tracing::info!(target: TRACE_TARGET, "perf kernel queue waiting={waiting}");
         }
@@ -330,6 +339,7 @@ impl Mount {
             }
             None => tracing::info!(target: TRACE_TARGET, "perf quic: not connected"),
         }
+        pending
     }
 
     /// Completes once the FUSE session has ended, whoever ended it; before this client unmounts, that means the mount was unmounted from outside or the session thread failed.
@@ -381,9 +391,11 @@ impl Mount {
                 .await
                 .context("watchdog shutdown")?;
         }
-        // The session thread is joined, so no new kernel request can arrive; the sysfs entries left with the mount.
+        // The session thread is joined, so no new kernel request can arrive and no release can wait on this mount; the sysfs entries left with the mount. The in-flight lines are waited for, or the runtime could end before they are logged.
         self.limits = None;
-        self.report();
+        if let Err(e) = self.report().await {
+            tracing::error!("the last report's in-flight lines failed: {e}");
+        }
         self.shared.client.shutdown().await;
         outcome
     }

@@ -206,8 +206,8 @@ impl WatchClient {
     }
 }
 
-/// The in-flight listing of a report: every request in flight at least [`jackalopefs_perf::stall::INFLIGHT_LISTED`], oldest first.
-pub fn report_pending(shared: &Shared) {
+/// The in-flight listing of a report: every request in flight at least [`jackalopefs_perf::stall::INFLIGHT_LISTED`], oldest first. It reads each caller's `/proc` ([`crate::procs::status_of`]), so never on the FUSE session thread, the runtime's worker or the main thread.
+pub(crate) fn report_pending(shared: &Shared) {
     match shared.scan_pending(Instant::now(), ModeScan::Listed) {
         Ok(scan) => {
             for line in lines_pending(scan.found, shared.proc_ours()) {
