@@ -1213,6 +1213,11 @@ async fn absent_xattrs_are_answered_from_the_listing() {
         entries
     })
     .await;
+    // Each request's row is recorded a moment after its caller has the answer.
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
+    })
+    .await;
     let snap = perf.report();
     assert!(
         snap.fuse["getxattr"].n >= 80,
@@ -1258,6 +1263,11 @@ async fn absent_xattrs_are_answered_from_the_listing() {
         fs::metadata(&f0_again).unwrap();
         assert_eq!(xattr_get(&f0_again, "user.k"), Ok(b"v".to_vec()));
         assert_eq!(xattr_get(&f0_again, "user.other"), Err(libc::ENODATA));
+    })
+    .await;
+    // Each request's row is recorded a moment after its caller has the answer.
+    wait_for(Duration::from_secs(3), "kernel requests to drain", || {
+        (perf.inflight() == 0).then_some(())
     })
     .await;
     let snap = perf.report();
