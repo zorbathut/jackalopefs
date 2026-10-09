@@ -31,7 +31,7 @@ pub fn parse_status(status: &str) -> ThreadStatus {
     }
 }
 
-/// Takes a reference to the thread's memory for the read, so never on the FUSE session thread, the runtime's worker or the main thread (`crate::signals`).
+/// Takes a reference to the thread's memory for the read, so never on the FUSE session thread, the runtime's worker, the main thread or the stall watchdog's (`crate::signals`).
 pub(crate) fn status_of(tid: u32) -> io::Result<ThreadStatus> {
     Ok(parse_status(&std::fs::read_to_string(format!(
         "/proc/{tid}/status"

@@ -19,7 +19,7 @@ pub const INFLIGHT_LISTED: Duration = Duration::from_secs(1);
 /// Stalled requests described one per line; the rest are counted by what they are doing.
 pub const STALL_DETAILED: usize = 8;
 
-/// Longest the watchdog waits for a lock it shares with the code it watches. A lock held longer is itself the finding, and waiting on it would silence the watchdog in exactly the hang it is there to describe.
+/// Longest the watchdog waits for a lock it shares with the code it watches, or for a read that can wait on it. A lock held longer is itself the finding, and waiting on it would silence the watchdog in exactly the hang it is there to describe.
 pub const LOCK_PATIENCE: Duration = Duration::from_millis(200);
 
 /// A lock the watchdog shares with the code it watches was held past [`LOCK_PATIENCE`].

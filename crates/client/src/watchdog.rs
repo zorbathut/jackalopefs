@@ -8,11 +8,13 @@ use crate::perf::TRACE_TARGET;
 use jackalopefs_perf::fmt_duration;
 use jackalopefs_perf::stall::{
     line_progress, lines_crowd, thread_doing, thread_wchan, ErrorLockHeld, Heartbeat, ModeScan,
-    Persisting, HEARTBEAT_LATE, LOCK_PATIENCE,
+    Persisting, HEARTBEAT_LATE, LOCK_PATIENCE, STALL_DETAILED,
 };
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{mpsc, Arc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// The kernel function the FUSE session thread waits in for the next request.
 const SESSION_IDLE: &str = "fuse_dev_do_read";
@@ -34,6 +36,8 @@ pub struct WatchClient {
     /// The same notifier call in progress, and when it began.
     notifier_busy: Persisting,
     notifier_since: Option<Instant>,
+    /// The threads reading callers' `/proc` for [`callers_read`], which outlive a check when a read does not return.
+    readers: Vec<JoinHandle<()>>,
 }
 
 impl WatchClient {
@@ -53,6 +57,7 @@ impl WatchClient {
             session_away: Persisting::default(),
             notifier_busy: Persisting::default(),
             notifier_since: None,
+            readers: Vec::new(),
         }
     }
 
@@ -65,7 +70,10 @@ impl WatchClient {
             Ok(scan) => {
                 self.table_held.check(now, false);
                 if !scan.found.is_empty() {
-                    for line in lines_pending(scan.found, self.shared.proc_ours()) {
+                    let proc_ours = self.shared.proc_ours();
+                    let names = self.callers(&scan.found, proc_ours);
+                    for line in lines_pending(scan.found, |tid| caller_from(&names, tid, proc_ours))
+                    {
                         tracing::warn!("stalled: {line}");
                     }
                     tracing::warn!(
@@ -97,6 +105,36 @@ impl WatchClient {
         self.check_notifier(now);
         self.completed = self.shared.progress.completed();
         self.heartbeat.ping();
+        self.readers_reap();
+    }
+
+    /// The names of the callers of the requests a stall report describes one per line, for those `/proc` is read for.
+    fn callers(&mut self, found: &[Pending], proc_ours: bool) -> HashMap<u32, String> {
+        // Oldest first, so a read that does not return leaves the oldest named.
+        let mut tids: Vec<u32> = Vec::new();
+        for p in found.iter().take(STALL_DETAILED) {
+            if p.key.pid != 0 && !tids.contains(&p.key.pid) {
+                tids.push(p.key.pid);
+            }
+        }
+        if !proc_ours || tids.is_empty() {
+            return HashMap::new();
+        }
+        let (names, reader) = callers_read(tids, LOCK_PATIENCE, move |tid| caller(tid, proc_ours));
+        self.readers.extend(reader);
+        names
+    }
+
+    fn readers_reap(&mut self) {
+        let (done, out): (Vec<_>, Vec<_>) = std::mem::take(&mut self.readers)
+            .into_iter()
+            .partition(JoinHandle::is_finished);
+        self.readers = out;
+        for reader in done {
+            if reader.join().is_err() {
+                tracing::error!("a thread naming stalled requests' callers panicked");
+            }
+        }
     }
 
     /// The session thread reads every request off `/dev/fuse`. One that has ended leaves the mount answering nothing, and it ends when the mount goes, so only an end this client did not start is reported. One that is elsewhere for long while nothing completes is blocked in a handler, and every request behind it waits in the kernel, out of the table's sight.
@@ -206,11 +244,83 @@ impl WatchClient {
     }
 }
 
-/// The in-flight listing of a report: every request in flight at least [`jackalopefs_perf::stall::INFLIGHT_LISTED`], oldest first. It reads each caller's `/proc` ([`crate::procs::status_of`]), so never on the FUSE session thread, the runtime's worker or the main thread.
+/// Caller reads still out are joined, not left behind: one caught in a release on this mount would otherwise outlive the main thread holding the process's file table, so `/dev/fuse` would never close and the exit would hang with nothing left to abort it. An orderly unmount has usually waited such a read out already, since the session ends only once every release on the mount has; this join is for a session thread that ended with `/dev/fuse` still open, where aborting the mount is what frees the read.
+impl Drop for WatchClient {
+    fn drop(&mut self) {
+        self.readers_reap();
+        if !self.readers.is_empty() {
+            tracing::warn!(
+                "the stall watchdog waits for {} reads of callers' /proc that have not returned; aborting the mount ends one caught in a release on it",
+                self.readers.len()
+            );
+        }
+        for reader in self.readers.drain(..) {
+            if reader.join().is_err() {
+                tracing::error!("a thread naming stalled requests' callers panicked");
+            }
+        }
+    }
+}
+
+/// The names `name` gives `tids`, read in order on a thread of their own and waited for at most `patience` in all: reading another process's `/proc` can leave the reading thread in a release on this mount (`crate::signals`), which must not silence the watchdog. A tid whose read did not return in time is missing, and so is every one after it. The thread is returned, to be joined once it ends.
+fn callers_read(
+    tids: Vec<u32>,
+    patience: Duration,
+    name: impl Fn(u32) -> String + Send + 'static,
+) -> (HashMap<u32, String>, Option<JoinHandle<()>>) {
+    let started = Instant::now();
+    let (named, names_rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("jfs-callers".into())
+        .spawn(move || {
+            for tid in tids {
+                if named.send((tid, name(tid))).is_err() {
+                    tracing::info!(
+                        "the read naming caller {tid} for the stall watchdog finished {} into its check, too late for it",
+                        fmt_duration(started.elapsed())
+                    );
+                    return;
+                }
+            }
+        });
+    let reader = match spawned {
+        Ok(reader) => reader,
+        Err(e) => {
+            tracing::warn!("cannot start a thread to name stalled requests' callers: {e}");
+            return (HashMap::new(), None);
+        }
+    };
+    let mut names = HashMap::new();
+    let deadline = started + patience;
+    // Until every tid is named (the sender is gone) or the time is up.
+    while let Ok((tid, name)) =
+        names_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+    {
+        names.insert(tid, name);
+    }
+    (names, Some(reader))
+}
+
+/// A stall line's caller: as [`callers_read`] found it, or as [`caller`] tells it without reading `/proc`.
+fn caller_from(names: &HashMap<u32, String>, tid: u32, proc_ours: bool) -> String {
+    if tid == 0 || !proc_ours {
+        return caller(tid, proc_ours);
+    }
+    match names.get(&tid) {
+        Some(name) => name.clone(),
+        None => format!(
+            "thread {tid} (not named: naming the callers did not finish within {})",
+            fmt_duration(LOCK_PATIENCE)
+        ),
+    }
+}
+
+/// The in-flight listing of a report: every request in flight at least [`jackalopefs_perf::stall::INFLIGHT_LISTED`], oldest first. It reads each caller's `/proc` ([`crate::procs::status_of`]), so never on the FUSE session thread, the runtime's worker, the main thread or the watchdog's.
 pub(crate) fn report_pending(shared: &Shared) {
     match shared.scan_pending(Instant::now(), ModeScan::Listed) {
         Ok(scan) => {
-            for line in lines_pending(scan.found, shared.proc_ours()) {
+            let proc_ours = shared.proc_ours();
+            for line in lines_pending(scan.found, |tid| caller(tid, proc_ours)) {
                 tracing::info!(target: TRACE_TARGET, "perf inflight {line}");
             }
         }
@@ -221,15 +331,16 @@ pub(crate) fn report_pending(shared: &Shared) {
     }
 }
 
-fn lines_pending(found: Vec<Pending>, proc_ours: bool) -> Vec<String> {
+/// `name` gives the caller of each request described.
+fn lines_pending(found: Vec<Pending>, name: impl Fn(u32) -> String) -> Vec<String> {
     lines_crowd(
         found,
         |p| format!("{} {}", p.key.op, phase_of(p)),
-        |p| describe(p, proc_ours),
+        |p| describe(p, &name(p.key.pid)),
     )
 }
 
-fn describe(p: &Pending, proc_ours: bool) -> String {
+fn describe(p: &Pending, caller: &str) -> String {
     let key = &p.key;
     let mut line = format!(
         "fuse {} ino {} for {} (unique {})",
@@ -247,7 +358,7 @@ fn describe(p: &Pending, proc_ours: bool) -> String {
     if let Some(size) = key.size {
         line.push_str(&format!(" size {size}"));
     }
-    line.push_str(&format!(", caller {}; ", caller(key.pid, proc_ours)));
+    line.push_str(&format!(", caller {caller}; "));
     line.push_str(&match &p.call {
         _ if !p.started => "its task has not run yet (the runtime is not getting to it)".into(),
         Ok(Some(call)) => describe_call(call),
@@ -329,7 +440,6 @@ fn describe_call(call: &CallNow) -> String {
 mod tests {
     use super::*;
     use crate::fuse::KeyPerf;
-    use jackalopefs_perf::stall::STALL_DETAILED;
     use jackalopefs_proto::{Name, Path, Request};
     use std::time::Duration;
 
@@ -375,7 +485,7 @@ mod tests {
             pending(true, Ok(Some(call(PhaseCall::Reply))), 1),
         ]
         .iter()
-        .map(|p| describe(p, false))
+        .map(|p| describe(p, &caller(p.key.pid, false)))
         .collect();
         for (i, a) in lines.iter().enumerate() {
             assert!(!a.is_empty());
@@ -384,8 +494,41 @@ mod tests {
             }
         }
         assert!(lines[4].contains("wanted"), "{}", lines[4]);
-        let outside = describe(&pending(true, Ok(None), 0), true);
+        let outside = describe(&pending(true, Ok(None), 0), &caller(0, true));
         assert_ne!(outside, lines[1]);
+        let names = HashMap::from([(1, "a caller read in time".to_string())]);
+        let named = caller_from(&names, 1, true);
+        let unnamed = caller_from(&HashMap::new(), 1, true);
+        assert!(!unnamed.is_empty());
+        assert_ne!(named, unnamed);
+    }
+
+    #[test]
+    fn a_caller_read_that_does_not_return_names_those_before_it_and_frees_the_watchdog() {
+        let patience = Duration::from_secs(2);
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let (names, reader) = callers_read(vec![1, 2, 3], patience, move |tid| {
+            if tid == 2 {
+                released.recv().unwrap();
+            }
+            format!("named {tid}")
+        });
+        let took = started.elapsed();
+        assert!(took >= patience, "{took:?}");
+        assert!(took < patience * 5, "{took:?}");
+        assert!(names.contains_key(&1), "{names:?}");
+        assert!(
+            !names.contains_key(&2) && !names.contains_key(&3),
+            "{names:?}"
+        );
+
+        let (others, other) = callers_read(vec![4, 5], patience, |tid| format!("named {tid}"));
+        assert_eq!(others.len(), 2, "{others:?}");
+        other.unwrap().join().unwrap();
+
+        release.send(()).unwrap();
+        reader.unwrap().join().unwrap();
     }
 
     #[test]
@@ -393,7 +536,7 @@ mod tests {
         let found: Vec<Pending> = (0..12)
             .map(|_| pending(true, Ok(Some(call(PhaseCall::Reply))), 1))
             .collect();
-        let lines = lines_pending(found, false);
+        let lines = lines_pending(found, |tid| caller(tid, false));
         assert_eq!(lines.len(), STALL_DETAILED + 1);
         let rest = lines.last().unwrap();
         assert!(
