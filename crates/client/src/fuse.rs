@@ -889,7 +889,7 @@ impl Filesystem for Backend {
         self.shared.session_over.send_replace(true);
     }
 
-    /// Each setter answers with the previous value when it accepts and the ceiling when it refuses, so what is logged is the value asked for or the ceiling it hit. The kernel proposes its own readahead (the mount's `bdi` setting, 128 KiB by default) and lets the daemon only lower it, so the readahead cap is the usual outcome and it bounds every read the kernel will ever issue; the effective values are read from sysfs after mounting.
+    /// Each setter answers with the previous value when it accepts and the ceiling when it refuses, so what is logged is the value asked for or the ceiling it hit. The kernel proposes its own readahead (the mount's `bdi` setting, 128 KiB by default) and lets the daemon only lower it, so the readahead cap is the usual outcome and it bounds every read the kernel makes through its page cache (an `O_DIRECT` read comes at its caller's size, up to the 1 MiB request cap); the effective values are read from sysfs after mounting.
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
         let max_write = config
             .set_max_write(MAX_IO as u32)

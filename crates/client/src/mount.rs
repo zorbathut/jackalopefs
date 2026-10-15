@@ -22,7 +22,7 @@ use std::time::Duration;
 pub(crate) struct KernelLimits {
     /// `/sys/fs/fuse/connections/<minor>`: `max_background`, `congestion_threshold`, and `waiting`, the requests queued for the daemon right now.
     connection: PathBuf,
-    /// `/sys/class/bdi/0:<minor>`: `read_ahead_kb`, the ceiling on every read the kernel issues.
+    /// `/sys/class/bdi/0:<minor>`: `read_ahead_kb`, how far ahead the kernel reads a file through its page cache, which sizes those reads.
     bdi: PathBuf,
 }
 
