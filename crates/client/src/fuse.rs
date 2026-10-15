@@ -1,9 +1,12 @@
 //! The FUSE backend: every kernel request is copied out of the session thread and answered from a tokio task, so the session thread never waits on the network.
 
 use crate::client::{CallNow, Client, Error, RequestKernel};
+use crate::conn::ConnState;
 use crate::inodes::{KeyNode, NodeTable, ROOT};
 use crate::invalidate::Work;
+use crate::mount::KernelLimits;
 use crate::perf::{Outcome, Slowpath, EVENT_TARGET, TRACE_TARGET};
+use crate::readahead::{self, FindingReadahead, RunRead};
 use crate::signals;
 use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
@@ -23,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Bytes of directory entries fetched from the server per request; the kernel asks for far less at a time, and the rest is served from the handle's buffer. The first fetch of a listing is smaller, since many readers stop after a few entries (an emptiness check, a file manager's "has children" probe) and every entry fetched is one the server described.
@@ -38,6 +41,12 @@ pub struct Shared {
     pub client: Arc<Client>,
     pub nodes: Mutex<NodeTable>,
     dirs: Mutex<HashMap<u64, DirState>>,
+    /// Each open file's current run of sequential reads, kept as the kernel keeps its readahead state, per open file (`crate::readahead`).
+    reads: Mutex<HashMap<u64, RunRead>>,
+    /// The count of runs found held to the readahead window at which they were last logged ([`jackalopefs_perf::doubling_due`]).
+    readahead_reported: Mutex<u64>,
+    /// The mount's sysfs entries, once mounted.
+    pub(crate) limits: OnceLock<KernelLimits>,
     /// What the last attributes said about each inode's extended attribute names, kept for the attribute TTL; answers only the absence of a name and the list itself, never a value. Bounded by the node table: an entry leaves when the kernel forgets the inode.
     xattrs: Mutex<HashMap<u64, KnownXattrs>>,
     /// The size and mtime the server last reported for each regular file. The kernel discards both for a file it already holds (its writeback cache may be ahead of the server), so when a fresh reply disagrees and this client does not hold the file open, the file is taken away from the kernel by name and looked up afresh; that is what bounds an external change to the attribute TTL. A file this client wrote is dropped from the kernel, record included, when its last handle closes: what the server reported while our own writes were landing says nothing about what the kernel holds, and the kernel's own mtime may be behind the server's.
@@ -193,6 +202,9 @@ impl Backend {
             client,
             nodes: Mutex::new(NodeTable::new()),
             dirs: Mutex::new(HashMap::new()),
+            reads: Mutex::new(HashMap::new()),
+            readahead_reported: Mutex::new(0),
+            limits: OnceLock::new(),
             xattrs: Mutex::new(HashMap::new()),
             reported: Mutex::new(HashMap::new()),
             invalidations: Mutex::new(None),
@@ -698,6 +710,66 @@ impl Shared {
 
     fn reported_forget(&self, ino: u64) {
         self.reported.lock().remove(&ino);
+    }
+
+    fn read_sent(&self, fh: u64, offset: u64, size: u32, now: Instant) {
+        self.reads
+            .lock()
+            .entry(fh)
+            .or_insert_with(|| RunRead::new(offset, now))
+            .start(offset, size, now);
+    }
+
+    fn read_answered(&self, fh: u64, bytes: u64, sent: Instant) {
+        let now = Instant::now();
+        let finding = match self.reads.lock().get_mut(&fh) {
+            Some(run) => run.end(bytes, now.saturating_duration_since(sent), now),
+            None => None,
+        };
+        if let Some(finding) = finding {
+            self.readahead_limited(fh, finding);
+        }
+    }
+
+    /// A heavy sequential read held to the readahead window: an event every time, and a warning the first time and each time the count doubles, with who read what and what would help.
+    fn readahead_limited(&self, fh: u64, finding: FindingReadahead) {
+        let rtt = match &*self.client.state().borrow() {
+            ConnState::Connected(attached) => Some(attached.conn.rtt()),
+            _ => None,
+        };
+        let described = || {
+            let file = match self.client.handles().get(fh) {
+                Some(rec) => match &rec.opener {
+                    Some(opener) => {
+                        format!("{:?} (opened by {}[{}])", rec.path, opener.name, opener.pid)
+                    }
+                    None => format!("{:?}", rec.path),
+                },
+                None => format!("handle {fh}"),
+            };
+            format!("{file}: {}", finding.line(rtt))
+        };
+        let events = &self.client.perf().events;
+        event!(
+            target: EVENT_TARGET,
+            events,
+            Slowpath::ReadaheadLimited,
+            IdsEvent::default(),
+            described()
+        );
+        let found = events.count(Slowpath::ReadaheadLimited);
+        if !jackalopefs_perf::doubling_due(found, 1, &mut self.readahead_reported.lock()) {
+            return;
+        }
+        let limits = self.limits.get();
+        tracing::warn!(
+            "sequential reading waits on reads the kernel's readahead window sizes: {}; {} (found {found} times so far)",
+            described(),
+            readahead::advice(
+                limits.and_then(KernelLimits::readahead_kb),
+                limits.map(KernelLimits::bdi)
+            )
+        );
     }
 
     pub fn xattr_clear(&self) {
@@ -1465,7 +1537,7 @@ impl Filesystem for Backend {
         fh: FileHandle,
         offset: u64,
         size: u32,
-        _flags: fuser::OpenFlags,
+        flags: fuser::OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
@@ -1476,14 +1548,24 @@ impl Filesystem for Backend {
             size: Some(size as u64),
             ..KeyPerf::of("read", req, ino.0)
         };
+        // Taken here, so a read waiting for the runtime counts as one in flight.
+        let sent = Instant::now();
+        let tracked = readahead::through_page_cache(flags.0);
+        if tracked {
+            shared.read_sent(fh.0, offset, size, sent);
+        }
         self.spawn(key, async move {
-            match shared.client.read(fh.0, offset, size).await {
+            let outcome = match shared.client.read(fh.0, offset, size).await {
                 Ok(data) => {
                     reply.data(&data);
                     Outcome::bytes(data.len())
                 }
                 Err(e) => fail(reply, errno(&e)),
+            };
+            if tracked {
+                shared.read_answered(fh.0, outcome.bytes, sent);
             }
+            outcome
         });
     }
 
@@ -1661,6 +1743,7 @@ impl Filesystem for Backend {
         reply: ReplyEmpty,
     ) {
         let shared = self.shared.clone();
+        shared.reads.lock().remove(&fh.0);
         let key = KeyPerf {
             fh: Some(fh.0),
             ..KeyPerf::of("release", req, ino.0)

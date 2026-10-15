@@ -10,6 +10,7 @@ pub mod invalidate;
 pub mod mount;
 pub mod perf;
 pub mod procs;
+pub mod readahead;
 pub mod signals;
 pub mod transport;
 pub mod watchdog;

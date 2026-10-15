@@ -65,6 +65,8 @@ pub enum Slowpath {
     FileDroppedFromKernel,
     /// The server said this client holds many handles, and the client logged what holds them.
     HandlesReported,
+    /// A heavy sequential read was held to the kernel's readahead window (`crate::readahead`).
+    ReadaheadLimited,
 }
 
 impl Slowpath {
@@ -77,6 +79,7 @@ impl Slowpath {
             Slowpath::AliasStale => "alias_stale",
             Slowpath::FileDroppedFromKernel => "file_dropped_from_kernel",
             Slowpath::HandlesReported => "handles_reported",
+            Slowpath::ReadaheadLimited => "readahead_limited",
         }
     }
 }
@@ -90,6 +93,7 @@ impl Kind for Slowpath {
         Slowpath::AliasStale,
         Slowpath::FileDroppedFromKernel,
         Slowpath::HandlesReported,
+        Slowpath::ReadaheadLimited,
     ];
 
     fn name(self) -> &'static str {

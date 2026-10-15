@@ -4,6 +4,7 @@ use crate::client::Client;
 use crate::fuse::{Backend, ScanPending, Shared};
 use crate::invalidate::Invalidator;
 use crate::perf::{Perf, TRACE_TARGET};
+use crate::readahead;
 use crate::watchdog::{report_pending, WatchClient};
 use anyhow::Context;
 use fuser::{BackgroundSession, MountOption, SessionACL};
@@ -75,15 +76,31 @@ impl KernelLimits {
         }
     }
 
-    fn log(&self) {
+    fn log(&self, mountpoint: &Path) {
+        let readahead_kb = self.readahead_kb();
         tracing::info!(
-            read_ahead_kb = self.read(&self.bdi, "read_ahead_kb"),
+            read_ahead_kb = readahead_kb,
             max_background = self.read(&self.connection, "max_background"),
             congestion_threshold = self.read(&self.connection, "congestion_threshold"),
             "FUSE limits the kernel granted, from {} and {}",
             self.bdi.display(),
             self.connection.display()
         );
+        if let Some(hint) = readahead_kb
+            .and_then(|kb| readahead::line_startup(kb, &self.bdi, &spelled_by_kernel(mountpoint)))
+        {
+            tracing::warn!("{hint}");
+        }
+    }
+
+    /// The mount's readahead window as the kernel has it now.
+    pub(crate) fn readahead_kb(&self) -> Option<u64> {
+        self.read(&self.bdi, "read_ahead_kb")
+    }
+
+    /// `/sys/class/bdi/0:<minor>`.
+    pub(crate) fn bdi(&self) -> &Path {
+        &self.bdi
     }
 
     /// Requests the kernel has queued for the daemon at this moment.
@@ -252,7 +269,10 @@ impl Mount {
         let invalidator = Invalidator::start(shared.clone(), events, state, session.notifier());
         let limits = KernelLimits::find(&mountpoint);
         if let Some(limits) = &limits {
-            limits.log();
+            limits.log(&mountpoint);
+            if shared.limits.set(limits.clone()).is_err() {
+                tracing::error!("the mount's sysfs entries were already set");
+            }
         }
         let mut watch = WatchClient::new(
             shared.clone(),
