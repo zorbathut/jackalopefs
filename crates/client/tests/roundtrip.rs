@@ -1308,6 +1308,110 @@ async fn a_resume_closes_the_connection_it_takes_over() {
     server.stop().await;
 }
 
+/// A resume whose Ack never gets written leaves the session detached, to be reaped after its grace period, not attached to a connection that is already gone.
+#[tokio::test]
+async fn a_resume_that_fails_before_its_ack_leaves_the_session_detached() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let hello = |resume| jackalopefs_proto::Hello {
+        revision: PROTO_REVISION,
+        auth: Auth::Anonymous,
+        resume,
+    };
+    let (endpoint, first, reply) = connect_raw(&server, hello(None)).await;
+    let jackalopefs_proto::HelloReply::Ack {
+        session_id,
+        resume_token,
+        ..
+    } = reply
+    else {
+        panic!("the first hello was refused: {reply:?}");
+    };
+    first.close(0u32.into(), b"done");
+    let detached = |server: &TestServer| {
+        server
+            .server
+            .sessions
+            .handle_rows()
+            .iter()
+            .any(|row| row.session == session_id && row.detached)
+    };
+    wait_for(
+        Duration::from_secs(3),
+        "the first connection to detach",
+        || detached(&server).then_some(()),
+    )
+    .await;
+    // The second hello resumes the session, and the client refuses the reply, so the server cannot write its Ack.
+    let second = endpoint
+        .connect(server.addr, "jackalopefs")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, mut recv) = second.open_bi().await.unwrap();
+    recv.stop(0u32.into()).unwrap();
+    jackalopefs_proto::write_frame(
+        &mut send,
+        &hello(Some(jackalopefs_proto::Resume {
+            session_id,
+            token: resume_token,
+        })),
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), second.closed())
+        .await
+        .expect("the server gives up on the handshake");
+    assert!(detached(&server), "the session was left attached");
+    assert_eq!(
+        server.server.sessions.len(),
+        1,
+        "the hello resumed the session rather than making a new one"
+    );
+    endpoint.wait_idle().await;
+    server.stop().await;
+}
+
+/// A new session whose Ack never gets written is dropped: no client learned its id, so it could only take a detached session's place.
+#[tokio::test]
+async fn a_new_session_that_fails_before_its_ack_is_dropped() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(
+        jackalopefs_client::transport::client_config(ServerTrust::Fingerprint(server.fingerprint))
+            .unwrap(),
+    );
+    let conn = endpoint
+        .connect(server.addr, "jackalopefs")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    recv.stop(0u32.into()).unwrap();
+    jackalopefs_proto::write_frame(
+        &mut send,
+        &jackalopefs_proto::Hello {
+            revision: PROTO_REVISION,
+            auth: Auth::Anonymous,
+            resume: None,
+        },
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), conn.closed())
+        .await
+        .expect("the server gives up on the handshake");
+    assert!(
+        server.server.sessions.is_empty(),
+        "the session nobody can resume was kept"
+    );
+    endpoint.wait_idle().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn truncated_request_is_ignored_by_the_server() {
     let export = tempfile::tempdir().unwrap();

@@ -254,6 +254,11 @@ impl Sessions {
     }
 
     /// Mark the session detached, unless a newer connection has already taken it over.
+    /// Drop a session no client can resume: one whose Ack, with its id and token, never reached the client.
+    fn forget(&self, id: u64) {
+        self.map.lock().remove(&id);
+    }
+
     pub fn detach(&self, id: u64, epoch: u64) {
         let Some(state) = self.map.lock().get(&id).cloned() else {
             return;
@@ -684,6 +689,36 @@ struct Refusal {
     error: ErrorHandshake,
 }
 
+/// Undoes the handshake's attaching of a session unless its Ack was written, should the handshake fail after that (the Ack could not be written, or the handshake timed out writing it): a resumed session starts its grace period, since the client still holds its token, and a new one is dropped, since no client ever learned it. It covers the handshake only; `handle_connection` has its own `DetachOnDrop` in place before it next awaits.
+struct DetachUnlessAcked<'a> {
+    sessions: &'a Sessions,
+    id: u64,
+    epoch: u64,
+    resumed: bool,
+    acked: bool,
+}
+
+impl Drop for DetachUnlessAcked<'_> {
+    fn drop(&mut self) {
+        if self.acked {
+            return;
+        }
+        if self.resumed {
+            tracing::info!(
+                session = self.id,
+                "the handshake failed after resuming the session; detached"
+            );
+            self.sessions.detach(self.id, self.epoch);
+        } else {
+            tracing::info!(
+                session = self.id,
+                "the handshake failed before the new session's Ack; dropped"
+            );
+            self.sessions.forget(self.id);
+        }
+    }
+}
+
 async fn handshake(
     conn: &Connection,
     server: &Server,
@@ -724,6 +759,13 @@ async fn handshake(
     };
     match outcome {
         Ok((state, epoch, resumed)) => {
+            let mut unacked = DetachUnlessAcked {
+                sessions: &server.sessions,
+                id: state.id,
+                epoch,
+                resumed,
+                acked: false,
+            };
             write_frame(
                 &mut send,
                 &HelloReply::Ack {
@@ -740,6 +782,7 @@ async fn handshake(
             if let Err(e) = send.finish() {
                 tracing::debug!("control stream already closed: {e}");
             }
+            unacked.acked = true;
             Ok((state, epoch, resumed))
         }
         Err(Refusal { reply, error }) => {
