@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use quinn::{Connection, RecvStream, SendStream};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, Semaphore};
@@ -228,7 +228,13 @@ pub struct Server {
     meters: Mutex<Meters>,
     token: Option<String>,
     connection_permits: Arc<Semaphore>,
+    /// Called on a request's blocking thread just before it runs, and what it returns just after with the response, so a test can hold a request at either point and see what it answered; never set outside tests.
+    pub dispatch_hook: OnceLock<HookDispatch>,
 }
+
+pub type HookDispatch = Arc<dyn Fn(&Request) -> Option<HookAfter> + Send + Sync>;
+
+pub type HookAfter = Box<dyn FnOnce(&Response) + Send>;
 
 /// What change notification hands the server: the batches to fan out, the record of which session made which change, and the watch table requests arm.
 pub struct Notification {
@@ -266,6 +272,7 @@ impl Server {
             }),
             token,
             connection_permits: Arc::new(Semaphore::new(limits.connections)),
+            dispatch_hook: OnceLock::new(),
         }
     }
 
@@ -478,7 +485,13 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
-                tokio::spawn(handle_request(ops.clone(), server.perf.clone(), send, recv));
+                tokio::spawn(handle_request(
+                    ops.clone(),
+                    server.perf.clone(),
+                    server.dispatch_hook.get().cloned(),
+                    send,
+                    recv,
+                ));
             }
             Err(e) => {
                 tracing::debug!(session = session.id, "connection ended: {e}");
@@ -772,6 +785,7 @@ fn outcome_of(resp: &Response) -> Outcome {
 async fn handle_request(
     ops: Arc<Ops>,
     perf: Arc<Perf>,
+    hook: Option<HookDispatch>,
     mut send: SendStream,
     mut recv: RecvStream,
 ) {
@@ -874,13 +888,18 @@ async fn handle_request(
     let queued = Instant::now();
     let running = inflight.clone();
     let resp = match tokio::task::spawn_blocking(move || {
+        let after = hook.and_then(|hook| hook(&req));
         let tid = nix::unistd::gettid().as_raw();
         let started = Instant::now();
         running.arming(tid);
         let armed = ops.watches.arm_request(&req);
         running.running(tid);
         let resp = ops::dispatch(&ops, req);
-        (started, Instant::now(), resp, armed)
+        let finished = Instant::now();
+        if let Some(after) = after {
+            after(&resp);
+        }
+        (started, finished, resp, armed)
     })
     .await
     {

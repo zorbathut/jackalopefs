@@ -425,3 +425,298 @@ pub async fn wait_for<T>(limit: Duration, what: &str, mut check: impl FnMut() ->
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// Where a [`Gate`] holds the request it is armed for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hold {
+    Before,
+    After,
+}
+
+/// A request the server ran while a [`Gate`] was installed: its operation, its handle, and its errno (`None` for success).
+#[derive(Clone, Debug)]
+pub struct Dispatched {
+    pub op: &'static str,
+    pub fh: Option<u64>,
+    pub errno: Option<i32>,
+}
+
+/// The request a [`Gate`] took.
+#[derive(Clone, Debug)]
+pub struct Taken {
+    pub fh: Option<u64>,
+    pub parked: bool,
+    /// Its errno once it has run (`Some(None)` for success); `None` while it has not.
+    pub ran: Option<Option<i32>>,
+}
+
+#[derive(Default)]
+struct GateState {
+    armed: Option<(&'static str, Hold)>,
+    taken: Option<Taken>,
+    released: bool,
+    log: Vec<Dispatched>,
+}
+
+#[derive(Default)]
+struct GateInner {
+    state: std::sync::Mutex<GateState>,
+    release: std::sync::Condvar,
+}
+
+impl GateInner {
+    fn state(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Hold the taken request's blocking thread until the gate is released.
+    fn park(&self, mut state: std::sync::MutexGuard<'_, GateState>) {
+        state
+            .taken
+            .as_mut()
+            .expect("only the taken request parks")
+            .parked = true;
+        drop(
+            self.release
+                .wait_while(state, |state| !state.released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+}
+
+/// A server's dispatch hook that parks the first request of one operation, once armed, before or after it runs until the test releases it, and logs every request the server runs. Dropping it releases the parked request, so a failing test cannot leave a blocking thread that the runtime's shutdown waits on forever.
+pub struct Gate {
+    inner: Arc<GateInner>,
+}
+
+impl Gate {
+    /// Install a fresh gate on `server`.
+    pub fn install(server: &TestServer) -> Gate {
+        let inner = Arc::new(GateInner::default());
+        let hooked = inner.clone();
+        let hook: session::HookDispatch = Arc::new(move |req| {
+            let (op, fh) = (req.op_name(), req.perf_fields().0);
+            let mut state = hooked.state();
+            let hold = match state.armed {
+                Some((armed, hold)) if armed == op && state.taken.is_none() => {
+                    state.taken = Some(Taken {
+                        fh,
+                        parked: false,
+                        ran: None,
+                    });
+                    Some(hold)
+                }
+                _ => None,
+            };
+            if hold == Some(Hold::Before) {
+                hooked.park(state);
+            } else {
+                drop(state);
+            }
+            let hooked = hooked.clone();
+            Some(Box::new(move |resp: &Response| {
+                let errno = match resp {
+                    Response::Err(errno) => Some(*errno),
+                    _ => None,
+                };
+                let mut state = hooked.state();
+                state.log.push(Dispatched { op, fh, errno });
+                if hold.is_none() {
+                    return;
+                }
+                state
+                    .taken
+                    .as_mut()
+                    .expect("the gate took this request")
+                    .ran = Some(errno);
+                if hold == Some(Hold::After) {
+                    hooked.park(state);
+                }
+            }))
+        });
+        if server.server.dispatch_hook.set(hook).is_err() {
+            panic!("the server already has a dispatch hook");
+        }
+        Gate { inner }
+    }
+
+    /// Park the next request for `op` at `hold`; later ones, a resend included, go through.
+    pub fn arm(&self, op: &'static str, hold: Hold) {
+        self.inner.state().armed = Some((op, hold));
+    }
+
+    pub async fn wait_parked(&self) {
+        wait_for(
+            Duration::from_secs(5),
+            "the gate to park its request",
+            || {
+                self.inner
+                    .state()
+                    .taken
+                    .as_ref()
+                    .is_some_and(|taken| taken.parked)
+                    .then_some(())
+            },
+        )
+        .await;
+    }
+
+    pub fn taken(&self) -> Option<Taken> {
+        self.inner.state().taken.clone()
+    }
+
+    pub fn released(&self) -> bool {
+        self.inner.state().released
+    }
+
+    pub fn release(&self) {
+        self.inner.state().released = true;
+        self.inner.release.notify_all();
+    }
+
+    pub fn log(&self) -> Vec<Dispatched> {
+        self.inner.state().log.clone()
+    }
+}
+
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// One path in a [`snapshot`]: what a client could see of it, short of times and inode numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntrySnapshot {
+    pub kind: &'static str,
+    pub mode: u32,
+    pub nlink: u64,
+    /// The first path, in sorted order, of the files sharing this one's inode, so hard links show without inode numbers.
+    pub link_group: std::path::PathBuf,
+    /// A file's size and contents; a symlink's target. Directory sizes are left out: they depend on the filesystem.
+    pub size: Option<u64>,
+    pub data: Vec<u8>,
+    pub xattrs: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+/// Everything under `root` (the root itself included, as `""`), by path relative to it.
+pub fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, EntrySnapshot> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut entries = std::collections::BTreeMap::new();
+    let mut groups: std::collections::HashMap<u64, std::path::PathBuf> = Default::default();
+    let mut pending = vec![std::path::PathBuf::new()];
+    let mut seen = Vec::new();
+    while let Some(rel) = pending.pop() {
+        let full = root.join(&rel);
+        let meta = std::fs::symlink_metadata(&full).unwrap();
+        let kind = meta.file_type();
+        if kind.is_dir() {
+            for entry in std::fs::read_dir(&full).unwrap() {
+                pending.push(rel.join(entry.unwrap().file_name()));
+            }
+        }
+        seen.push((rel, meta));
+    }
+    seen.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rel, meta) in seen {
+        let full = root.join(&rel);
+        let kind = meta.file_type();
+        let (kind_name, size, data) = if kind.is_dir() {
+            ("dir", None, Vec::new())
+        } else if kind.is_symlink() {
+            let target = std::fs::read_link(&full).unwrap();
+            (
+                "symlink",
+                None,
+                target.into_os_string().into_encoded_bytes(),
+            )
+        } else if kind.is_fifo() {
+            ("fifo", None, Vec::new())
+        } else if kind.is_file() {
+            ("file", Some(meta.len()), std::fs::read(&full).unwrap())
+        } else {
+            ("other", None, Vec::new())
+        };
+        let link_group = groups
+            .entry(meta.ino())
+            .or_insert_with(|| rel.clone())
+            .clone();
+        let xattrs = if kind.is_symlink() {
+            Default::default()
+        } else {
+            user_xattrs(&full)
+        };
+        entries.insert(
+            rel,
+            EntrySnapshot {
+                kind: kind_name,
+                mode: meta.mode() & 0o7777,
+                nlink: if kind.is_dir() { 0 } else { meta.nlink() },
+                link_group,
+                size,
+                data,
+                xattrs,
+            },
+        );
+    }
+    entries
+}
+
+/// The `user.` extended attributes of `path`, by name.
+fn user_xattrs(path: &Path) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut names = vec![0u8; 64 * 1024];
+    // SAFETY: `c` is NUL-terminated and `names` is writable for its length.
+    let n = unsafe { libc::llistxattr(c.as_ptr(), names.as_mut_ptr().cast(), names.len()) };
+    assert!(
+        n >= 0,
+        "listing xattrs of {path:?}: {}",
+        std::io::Error::last_os_error()
+    );
+    names.truncate(n as usize);
+    let mut xattrs = std::collections::BTreeMap::new();
+    for name in names.split(|b| *b == 0).filter(|n| n.starts_with(b"user.")) {
+        let cname = std::ffi::CString::new(name).unwrap();
+        let mut value = vec![0u8; 64 * 1024];
+        // SAFETY: both strings are NUL-terminated and `value` is writable for its length.
+        let n = unsafe {
+            libc::lgetxattr(
+                c.as_ptr(),
+                cname.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        assert!(
+            n >= 0,
+            "reading xattr {name:?} of {path:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        value.truncate(n as usize);
+        xattrs.insert(name.to_vec(), value);
+    }
+    xattrs
+}
+
+/// The connection a client has attached at `generation` or later, waiting up to 15 s for it.
+pub async fn wait_for_generation(
+    client: &Client,
+    generation: u64,
+) -> Arc<jackalopefs_client::conn::Attached> {
+    let mut state = client.state();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let jackalopefs_client::ConnState::Connected(att) = &*state.borrow_and_update() {
+            if att.generation >= generation {
+                return att.clone();
+            }
+        }
+        tokio::time::timeout_at(deadline, state.changed())
+            .await
+            .expect("reconnect in time")
+            .unwrap();
+    }
+}

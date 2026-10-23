@@ -31,7 +31,8 @@ fuser's default handler answered `FUSE_FALLOCATE` with `ENOSYS`. The kernel then
 - `crates/client/tests/roundtrip.rs`: an allocation, and a punch longer than two requests' worth arriving as three.
 - `crates/client/tests/mount.rs`: `posix_fallocate` and a punch through the mount, asserting the requests reached the daemon and that next to no payload moved.
 - `scripts/validate/fsx.sh` runs with fallocate, keep-size, punch-hole and zero-range on, against mapped I/O and the kernel's write cache; `fsstress.sh` issues them concurrently and then compares the mount with the export.
-- Not covered: a resend after a lost reply; a range long enough to be split, through the mount (the split is tested at the client).
+- `crates/client/tests/disconnect.rs`: a punch whose reply is lost with its connection and resent, and one held on the server across a reconnect or past an interrupt, which lands after a later write to the range (an expected failure there).
+- Not covered: a range long enough to be split, through the mount (the split is tested at the client).
 
 **Manual check.** `strace -e trace=fallocate,pwrite64 python3 -c 'import os; fd=os.open("<file on the mount>", os.O_CREAT|os.O_RDWR); os.posix_fallocate(fd, 0, 8<<30)'` shows one `fallocate` returning 0 and no `pwrite64` storm, while the network stays idle; the client's perf report (`SIGUSR1`) shows one kernel-level `fallocate`, the 128 calls it became, and no `write` rows.
 

@@ -1288,25 +1288,6 @@ async fn truncated_request_is_ignored_by_the_server() {
     server.stop().await;
 }
 
-async fn wait_for_generation(
-    client: &jackalopefs_client::Client,
-    generation: u64,
-) -> std::sync::Arc<jackalopefs_client::conn::Attached> {
-    let mut state = client.state();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if let ConnState::Connected(att) = &*state.borrow_and_update() {
-            if att.generation >= generation {
-                return att.clone();
-            }
-        }
-        tokio::time::timeout_at(deadline, state.changed())
-            .await
-            .expect("reconnect in time")
-            .unwrap();
-    }
-}
-
 #[tokio::test]
 async fn session_resumes_after_a_connection_drop() {
     let export = tempfile::tempdir().unwrap();
