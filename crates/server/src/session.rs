@@ -43,6 +43,8 @@ pub mod close_code {
     pub const SHUTDOWN: u32 = 0;
     pub const HANDSHAKE: u32 = 1;
     pub const EVENT_STREAM_STALLED: u32 = 2;
+    /// The session has resumed on a newer connection: this one's requests are no longer its own.
+    pub const SUPERSEDED: u32 = 3;
 }
 
 /// An attached session's connection, the attachment epoch it belongs to, and the tracker of its last sample.
@@ -447,21 +449,32 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         }
     }
     let tracker = Arc::new(Mutex::new(TrackerQuic::default()));
-    {
+    let taken_over = {
         let mut connections = server.connections.lock();
-        if connections
-            .get(&session.id)
-            .is_none_or(|entry| entry.epoch < epoch)
-        {
-            connections.insert(
+        match connections.get(&session.id) {
+            // Another resume of the session got here first, from a newer connection.
+            Some(entry) if entry.epoch > epoch => None,
+            _ => Some(connections.insert(
                 session.id,
                 ConnectionEntry {
                     epoch,
                     conn: conn.clone(),
                     tracker: tracker.clone(),
                 },
-            );
+            )),
         }
+    };
+    match taken_over {
+        None => {
+            tracing::info!(%remote, session = session.id, conn = conn_key, "the session resumed on a newer connection before this one attached; closing it");
+            conn.close(close_code::SUPERSEDED.into(), b"session resumed elsewhere");
+            return;
+        }
+        // A takeover: the client has given up on the older connection, and whatever arrives on it now is no longer the session's.
+        Some(Some(old)) => old
+            .conn
+            .close(close_code::SUPERSEDED.into(), b"session resumed elsewhere"),
+        Some(None) => {}
     }
     let _detach = DetachOnDrop {
         server: server.clone(),

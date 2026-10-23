@@ -1229,6 +1229,85 @@ async fn a_nonsense_reply_to_an_open_releases_the_handle() {
     client.shutdown().await;
 }
 
+/// A raw connection to `server` that has sent `hello` and read the server's answer.
+async fn connect_raw(
+    server: &TestServer,
+    hello: jackalopefs_proto::Hello,
+) -> (
+    quinn::Endpoint,
+    quinn::Connection,
+    jackalopefs_proto::HelloReply,
+) {
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(
+        jackalopefs_client::transport::client_config(ServerTrust::Fingerprint(server.fingerprint))
+            .unwrap(),
+    );
+    let conn = endpoint
+        .connect(server.addr, "jackalopefs")
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    jackalopefs_proto::write_frame(&mut send, &hello)
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    let reply = jackalopefs_proto::read_frame(&mut recv).await.unwrap();
+    (endpoint, conn, reply)
+}
+
+/// A client that resumes its session on a new connection has given up on the old one, and the server closes it.
+#[tokio::test]
+async fn a_resume_closes_the_connection_it_takes_over() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let hello = |resume| jackalopefs_proto::Hello {
+        revision: PROTO_REVISION,
+        auth: Auth::Anonymous,
+        resume,
+    };
+    let (first_endpoint, first, reply) = connect_raw(&server, hello(None)).await;
+    let jackalopefs_proto::HelloReply::Ack {
+        session_id,
+        resume_token,
+        ..
+    } = reply
+    else {
+        panic!("the first hello was refused: {reply:?}");
+    };
+    let (second_endpoint, second, reply) = connect_raw(
+        &server,
+        hello(Some(jackalopefs_proto::Resume {
+            session_id,
+            token: resume_token,
+        })),
+    )
+    .await;
+    assert!(
+        matches!(
+            reply,
+            jackalopefs_proto::HelloReply::Ack { resumed: true, .. }
+        ),
+        "{reply:?}"
+    );
+    let reason = tokio::time::timeout(Duration::from_secs(3), first.closed())
+        .await
+        .expect("the server closes the connection it took over");
+    assert!(
+        matches!(&reason, quinn::ConnectionError::ApplicationClosed(close) if close.error_code == jackalopefs_server::session::close_code::SUPERSEDED.into()),
+        "{reason}"
+    );
+    assert!(
+        second.close_reason().is_none(),
+        "the resumed connection stays up"
+    );
+    second.close(0u32.into(), b"done");
+    first_endpoint.wait_idle().await;
+    second_endpoint.wait_idle().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn truncated_request_is_ignored_by_the_server() {
     let export = tempfile::tempdir().unwrap();
