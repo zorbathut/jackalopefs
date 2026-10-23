@@ -31,9 +31,11 @@ pub struct TestServer {
     endpoint: Endpoint,
     task: tokio::task::JoinHandle<()>,
     _watcher: Option<WatcherHandle>,
+    launch: Launch,
 }
 
-/// What a [`TestServer`] is started with, short of its socket.
+/// Everything a [`TestServer`] was started with but its socket, so it can be started again as it was.
+#[derive(Clone)]
 struct Launch {
     export: std::path::PathBuf,
     token: Option<String>,
@@ -59,6 +61,19 @@ impl Launch {
 
 fn any_port() -> UdpSocket {
     UdpSocket::bind("127.0.0.1:0").unwrap()
+}
+
+/// A [`TestServer`] stopped by [`TestServer::stop_held`]. Its port stays bound, so no other test can take it, and the connection attempt a client makes during the outage waits in the socket's buffer for the restarted server to answer.
+pub struct TestServerStopped {
+    socket: UdpSocket,
+    launch: Launch,
+}
+
+impl TestServerStopped {
+    /// The server back on its port with its identity and settings, as a restarted server is; it remembers no session.
+    pub async fn start(self) -> TestServer {
+        TestServer::start_full(self.socket, self.launch).await
+    }
 }
 
 impl TestServer {
@@ -153,7 +168,7 @@ impl TestServer {
             watch_budget,
             ids,
             handle_share,
-        } = launch;
+        } = launch.clone();
         let export = export.as_path();
         let fingerprint = jackalopefs_proto::fingerprint_bytes(identity.cert.as_ref());
         let config = tls::server_config(identity, jackalopefs_server::transport_config()).unwrap();
@@ -204,7 +219,20 @@ impl TestServer {
             endpoint,
             task,
             _watcher: watcher,
+            launch,
         }
+    }
+
+    /// Stop the server but keep its port, for [`TestServerStopped::start`].
+    pub async fn stop_held(self) -> TestServerStopped {
+        let port = self.addr.port();
+        let launch = self.launch.clone();
+        self.stop().await;
+        let socket = wait_for(Duration::from_secs(5), "the port to be free again", || {
+            UdpSocket::bind(("127.0.0.1", port)).ok()
+        })
+        .await;
+        TestServerStopped { socket, launch }
     }
 
     /// Close every connection and release the socket.

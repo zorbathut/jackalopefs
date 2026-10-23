@@ -186,6 +186,19 @@ fn close(file: fs::File) -> std::io::Result<()> {
     }
 }
 
+/// Whether the mount lists a writeback request waiting for a connection; desktop probes of the mount may be waiting too, so only a write says the data is still on this side.
+fn writeback_waiting(mount: &Mount) -> bool {
+    mount
+        .pending()
+        .expect("the table's lock is free")
+        .found
+        .into_iter()
+        .any(|p| {
+            p.key.op == "write"
+                && matches!(&p.call, Ok(Some(call)) if call.phase == PhaseCall::Wait)
+        })
+}
+
 /// Whether `pid` is blocked inside a FUSE request right now, by the wait channel the kernel reports for it.
 fn blocked_in_fuse(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/wchan"))
@@ -2094,6 +2107,116 @@ async fn a_write_after_the_server_vanished_fails_at_the_close() {
         );
     })
     .await;
+    m.finish().await;
+}
+
+/// Writeback that waits through an outage shorter than the offline timeout reaches the server when it is back, through the handle the new session reopened by path: neither truncated by the reopen nor written at the wrong offset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn cached_writes_reach_a_server_back_within_the_offline_timeout() {
+    let Some(mut m) = Mounted::start(Duration::from_secs(10), Duration::from_secs(60)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let file = blocking(move || {
+        let mut file = fs::File::create(mnt.join("f")).unwrap();
+        file.write_all(b"before").unwrap();
+        file.sync_all().unwrap();
+        file
+    })
+    .await;
+    let stopped = m.server.take().unwrap().stop_held().await;
+    let syncing = tokio::task::spawn_blocking(move || {
+        let mut file = file;
+        file.write_all(b"cached").unwrap();
+        let synced = file.sync_all();
+        (file, synced)
+    });
+    let mount = m.mount.as_ref().unwrap();
+    wait_for(
+        Duration::from_secs(5),
+        "the writeback to wait for a connection",
+        || writeback_waiting(mount).then_some(()),
+    )
+    .await;
+    m.server = Some(stopped.start().await);
+    let attached = wait_for_generation(mount.client(), 2).await;
+    assert!(!attached.resumed, "a restarted server remembers no session");
+    let (file, synced) = syncing.await.unwrap();
+    synced.unwrap();
+    close(file).unwrap();
+    assert_eq!(
+        fs::read(m.export.path().join("f")).unwrap(),
+        b"beforecached"
+    );
+    m.finish().await;
+}
+
+/// Pins a known limitation (`docs/design.md`, "Known limitations"): once an outage outlasts the offline timeout, the cached writes it caught never reach the server, though the server comes back and the handle works again. Two things make the loss: the client fails writeback at once past the deadline, and the kernel does not retry writeback that failed (the pages stay in its cache, clean, and reach the server only if dirtied again before anything reopens the file). Writeback that waited for the server in any way would be seen waiting, which brings the server back, and would succeed; a kernel that kept failed pages dirty would send them with the later write. Either change fails at least one assertion here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn cached_writes_are_lost_when_an_outage_outlasts_the_offline_timeout() {
+    // Long enough for a writeback that waits out a deadline of its own to be listed in flight, which takes a second.
+    let offline = Duration::from_secs(2);
+    let Some(mut m) = Mounted::start(offline, Duration::from_secs(60)).await else {
+        return;
+    };
+    let mnt = m.mnt();
+    let file = blocking(move || fs::File::create(mnt.join("f")).unwrap()).await;
+    let stopped = m.server.take().unwrap().stop_held().await;
+    let file = blocking(move || {
+        let mut file = file;
+        file.write_all(b"cached").unwrap();
+        file
+    })
+    .await;
+    let mount = m.mount.as_ref().unwrap();
+    let client = mount.client().clone();
+    let since = wait_for(
+        Duration::from_secs(5),
+        "the loss to be seen",
+        || match *client.state().borrow() {
+            jackalopefs_client::ConnState::Connecting { since } => Some(since),
+            _ => None,
+        },
+    )
+    .await;
+    tokio::time::sleep_until(since + offline + Duration::from_millis(300)).await;
+    let syncing = tokio::task::spawn_blocking(move || {
+        let synced = file.sync_all();
+        (file, synced)
+    });
+    // The server comes back once the fsync has failed, or as soon as its writeback is seen waiting, which today it never is.
+    wait_for(
+        Duration::from_secs(10),
+        "the fsync to fail or its writeback to wait",
+        || (syncing.is_finished() || writeback_waiting(mount)).then_some(()),
+    )
+    .await;
+    m.server = Some(stopped.start().await);
+    let (file, synced) = syncing.await.unwrap();
+    let err = synced.expect_err("the cached write reached the server after all");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ETIMEDOUT),
+        "the writeback failed otherwise than past the deadline: {err}"
+    );
+    wait_for_generation(&client, 2).await;
+    // A write to another page after the reconnect lands: the handle works, and only the outage's page is missing. Page 0 itself would not do, since dirtying it again sends the lost bytes with it.
+    let file = blocking(move || {
+        let mut file = file;
+        file.seek(SeekFrom::Start(4096)).unwrap();
+        file.write_all(b"after").unwrap();
+        file.sync_all().unwrap();
+        file
+    })
+    .await;
+    close(file).unwrap();
+    let mut expected = vec![0; 4096];
+    expected.extend_from_slice(b"after");
+    assert_eq!(
+        fs::read(m.export.path().join("f")).unwrap(),
+        expected,
+        "the cached write reached the server after all"
+    );
     m.finish().await;
 }
 
