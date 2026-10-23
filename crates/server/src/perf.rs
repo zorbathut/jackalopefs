@@ -52,12 +52,16 @@ impl Outcome {
 /// Slowpath events, counted whether or not anything logs them; their detail is built only while a tap selects them or [`EVENT_TARGET`] is logged at `debug`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slowpath {
-    /// The client ended or reset a request stream before the request was complete: a call it interrupted or gave up on.
+    /// The client ended or reset a request stream before the request was complete, or before a change held behind its session's earlier connections could run: a call it interrupted or gave up on, or whose connection went.
     RequestCancelled,
     /// A request stream failed otherwise before the request was read, usually with its connection.
     RequestStreamFailed,
     /// A request was not fully sent within the read timeout.
     RequestReadTimeout,
+    /// A change on a resumed session waited for changes still running from the session's earlier connections.
+    RequestHeld,
+    /// A change from a connection its session has since resumed on another was dropped unrun.
+    RequestSuperseded,
     /// A reply could not be written: the client had given up on it, or the connection went.
     ReplyUndelivered,
     /// A reply was abandoned because the client was not reading it.
@@ -84,6 +88,8 @@ impl Slowpath {
             Slowpath::RequestCancelled => "request_cancelled",
             Slowpath::RequestStreamFailed => "request_stream_failed",
             Slowpath::RequestReadTimeout => "request_read_timeout",
+            Slowpath::RequestHeld => "request_held",
+            Slowpath::RequestSuperseded => "request_superseded",
             Slowpath::ReplyUndelivered => "reply_undelivered",
             Slowpath::ReplyStalled => "reply_stalled",
             Slowpath::WatchEvicted => "watch_evicted",
@@ -102,6 +108,8 @@ impl Kind for Slowpath {
         Slowpath::RequestCancelled,
         Slowpath::RequestStreamFailed,
         Slowpath::RequestReadTimeout,
+        Slowpath::RequestHeld,
+        Slowpath::RequestSuperseded,
         Slowpath::ReplyUndelivered,
         Slowpath::ReplyStalled,
         Slowpath::WatchEvicted,
@@ -127,6 +135,8 @@ impl Kind for Slowpath {
 pub struct Phases {
     /// Stream accepted to request decoded.
     pub read: Duration,
+    /// A change on a resumed session, held behind those still running from the session's earlier connections.
+    pub held: Duration,
     /// `spawn_blocking` called to the closure running.
     pub wait: Duration,
     /// The filesystem work itself.
@@ -138,6 +148,7 @@ pub struct Phases {
 impl std::ops::AddAssign for Phases {
     fn add_assign(&mut self, other: Phases) {
         self.read += other.read;
+        self.held += other.held;
         self.wait += other.wait;
         self.op += other.op;
         self.send += other.send;
@@ -203,6 +214,8 @@ pub struct Snapshot {
 pub enum PhaseServer {
     /// Reading the request off its stream.
     Read,
+    /// A change on a resumed session, held behind those still running from its earlier connections.
+    Held,
     /// Waiting for a blocking thread to run the operation on.
     Wait,
     /// Watching the directories the request names, before it runs.
@@ -217,6 +230,7 @@ impl PhaseServer {
     pub fn name(self) -> &'static str {
         match self {
             PhaseServer::Read => "reading the request",
+            PhaseServer::Held => "held behind the session's earlier connections' changes",
             PhaseServer::Wait => "waiting for a blocking thread",
             PhaseServer::Watch => "watching its directories",
             PhaseServer::Op => "in the filesystem",
@@ -344,6 +358,15 @@ impl InFlight {
         active.subject = Some(subject);
         active.phase = PhaseServer::Wait;
         active.since = Instant::now();
+    }
+
+    /// The change is held behind its session's earlier connections; it waits for a blocking thread once that is over.
+    pub fn held(&self) {
+        self.phase(PhaseServer::Held);
+    }
+
+    pub fn waiting(&self) {
+        self.phase(PhaseServer::Wait);
     }
 
     /// A blocking thread, `tid`, is watching the directories the request names.
@@ -611,6 +634,7 @@ mod tests {
             wait: ms(2),
             op: ms(3),
             send: ms(4),
+            ..Phases::default()
         };
         perf.record("read", &Outcome::bytes(100), ms(10), phases);
         perf.record("read", &Outcome::bytes(50), ms(30), phases);

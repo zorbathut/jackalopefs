@@ -30,6 +30,7 @@ const STALL_LIMIT: Duration = Duration::from_secs(10);
 enum Fault {
     ReplyLost,
     OriginalLate,
+    OriginalRunning,
     Cancelled,
 }
 
@@ -171,6 +172,24 @@ impl Case {
                 | Case::SetxattrCreate
                 | Case::SetxattrReplace
                 | Case::Removexattr
+        )
+    }
+
+    /// Whether the server orders the op behind a resumed session's earlier changes: every op but the reads.
+    fn ordered(self) -> bool {
+        !matches!(
+            self,
+            Case::Lookup
+                | Case::Getattr
+                | Case::Readlink
+                | Case::Read
+                | Case::Readdir
+                | Case::Getxattr
+                | Case::Listxattr
+                | Case::Access
+                | Case::Statfs
+                | Case::Lseek
+                | Case::Fsync
         )
     }
 
@@ -592,25 +611,74 @@ struct Run {
     pool: usize,
     /// What became of the parked original: its errno once it ran (`Some(None)` for success), `None` if the server never ran it.
     original: Option<Option<i32>>,
-    /// Whether the client stalled with the original parked, and the gate let it go early.
-    stalled: bool,
+    /// Why the gate let the original go before the follow-up was done, if it did.
+    early: Option<Early>,
+    /// The server's `request_superseded` and `request_held` counts.
+    superseded: u64,
+    held: u64,
 }
 
-/// `future`, unless it makes no progress for [`STALL_LIMIT`]: then the gate lets its request go, and `future` is awaited to the end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Early {
+    /// The server held a request back for the parked one.
+    Held,
+    /// The client made no progress for [`STALL_LIMIT`].
+    Stalled,
+}
+
+/// `future`, unless the server holds a request back behind the parked one, or the client makes no progress for [`STALL_LIMIT`]: then the gate lets its request go, and `future` is awaited to the end.
 async fn unless_stalled<T>(
     gate: &Gate,
-    stalled: &mut bool,
+    server: &TestServer,
+    early: &mut Option<Early>,
     future: impl std::future::Future<Output = T>,
 ) -> T {
     tokio::pin!(future);
-    tokio::select! {
-        output = &mut future => output,
-        () = tokio::time::sleep(STALL_LIMIT) => {
-            *stalled = true;
-            gate.release();
-            future.await
+    let deadline = tokio::time::Instant::now() + STALL_LIMIT;
+    loop {
+        tokio::select! {
+            output = &mut future => return output,
+            () = tokio::time::sleep(Duration::from_millis(20)) => {
+                let why = if server_holds(server) {
+                    Early::Held
+                } else if tokio::time::Instant::now() >= deadline {
+                    Early::Stalled
+                } else {
+                    continue;
+                };
+                if !gate.released() {
+                    *early = Some(why);
+                    gate.release();
+                }
+                return future.await;
+            }
         }
     }
+}
+
+/// Whether the server lists a request waiting for its session's earlier connections; asked as if a listing's age had passed, so it answers at once.
+fn server_holds(server: &TestServer) -> bool {
+    let now = std::time::Instant::now() + jackalopefs_perf::stall::INFLIGHT_LISTED;
+    server
+        .server
+        .perf
+        .scan_pending(now, jackalopefs_perf::stall::ModeScan::Listed)
+        .expect("the in-flight table's lock is free")
+        .found
+        .iter()
+        .any(|(pending, _)| pending.phase == jackalopefs_server::perf::PhaseServer::Held)
+}
+
+/// The server's count of the event `name`.
+fn count(server: &TestServer, name: &str) -> u64 {
+    server
+        .server
+        .perf
+        .events
+        .counts()
+        .into_iter()
+        .find_map(|(n, count)| (n == name).then_some(count))
+        .expect("the server counts that event")
 }
 
 /// One run of `case` on a fresh export and server, in `order`. `None` when the filesystem takes no `user.` xattrs and the case needs them.
@@ -630,7 +698,7 @@ async fn run(case: Case, order: Order) -> Option<Run> {
             .conn
             .close(9u32.into(), b"simulated blip");
     };
-    let mut stalled = false;
+    let mut early = None;
     let mut follow = None;
     let op = match order {
         Order::FollowUpOnly => None,
@@ -648,10 +716,14 @@ async fn run(case: Case, order: Order) -> Option<Run> {
             };
             Some(tokio::join!(case.op(&client, &mut prep), resume).0)
         }
-        Order::Faulted(Fault::OriginalLate) => {
-            gate.arm(case.op_name(), Hold::Before);
+        Order::Faulted(fault @ (Fault::OriginalLate | Fault::OriginalRunning)) => {
+            let hold = match fault {
+                Fault::OriginalLate => Hold::Before,
+                _ => Hold::Running,
+            };
+            gate.arm(case.op_name(), hold);
             let late = async { tokio::join!(case.op(&client, &mut prep), blip()).0 };
-            Some(unless_stalled(&gate, &mut stalled, late).await)
+            Some(unless_stalled(&gate, &server, &mut early, late).await)
         }
         Order::Faulted(Fault::Cancelled) => {
             gate.arm(case.op_name(), Hold::Before);
@@ -663,17 +735,23 @@ async fn run(case: Case, order: Order) -> Option<Run> {
             };
             let cancelled =
                 async { tokio::join!(scoped.scope(case.op(&client, &mut prep)), interrupt).0 };
-            Some(unless_stalled(&gate, &mut stalled, cancelled).await)
+            Some(unless_stalled(&gate, &server, &mut early, cancelled).await)
         }
     };
     let holds = matches!(
         order,
-        Order::Faulted(Fault::OriginalLate | Fault::Cancelled)
+        Order::Faulted(Fault::OriginalLate | Fault::OriginalRunning | Fault::Cancelled)
     );
     let follow = match follow {
         Some(follow) => follow,
         None if holds => {
-            unless_stalled(&gate, &mut stalled, case.follow_up(&client, &mut prep)).await
+            unless_stalled(
+                &gate,
+                &server,
+                &mut early,
+                case.follow_up(&client, &mut prep),
+            )
+            .await
         }
         None => case.follow_up(&client, &mut prep).await,
     };
@@ -728,6 +806,10 @@ async fn run(case: Case, order: Order) -> Option<Run> {
     let handles = totals.files + totals.dirs;
     let pool = server.server.sessions.pool().used();
     let after = snapshot(export.path());
+    let (superseded, held) = (
+        count(&server, "request_superseded"),
+        count(&server, "request_held"),
+    );
     client.shutdown().await;
     server.stop().await;
     Some(Run {
@@ -738,7 +820,9 @@ async fn run(case: Case, order: Order) -> Option<Run> {
         handles,
         pool,
         original,
-        stalled,
+        early,
+        superseded,
+        held,
     })
 }
 
@@ -821,19 +905,46 @@ async fn cell(case: Case, fault: Fault, expect: Expect) {
     let faulted = run(case, Order::Faulted(fault)).await.unwrap();
     let classes = judge(&faulted, &a, &b);
     println!(
-        "{case:?} {fault:?}: op {:?} (A {:?}), follow-up {:?}, before {:?}, after {:?}, original {:?}, stalled {}, handles {} pool {} => {classes:?}",
+        "{case:?} {fault:?}: op {:?} (A {:?}), follow-up {:?}, before {:?}, after {:?}, original {:?}, early {:?}, superseded {} held {}, handles {} pool {} => {classes:?}",
         faulted.op.as_ref().unwrap(),
         a.op.as_ref().unwrap(),
         faulted.follow,
         faulted.before.as_ref().map(|before| matched(&faulted.follow, before, &a, &b)),
         matched(&faulted.follow, &faulted.after, &a, &b),
         faulted.original,
-        faulted.stalled,
+        faulted.early,
+        faulted.superseded,
+        faulted.held,
         faulted.handles,
         faulted.pool,
     );
     if !classes.is_empty() {
         println!("  after vs A: {}", diff(&faulted.after, &a.after));
+    }
+    // Which way the server kept the original from overtaking: dropped unrun when it had not begun, waited for when it had.
+    if !case.ordered() {
+        assert_eq!(faulted.superseded, 0, "{case:?}: a read was dropped");
+        assert_ne!(
+            faulted.early,
+            Some(Early::Held),
+            "{case:?}: a read was held"
+        );
+    } else {
+        match fault {
+            Fault::OriginalLate => assert_eq!(
+                faulted.superseded, 1,
+                "{case:?}: the parked original was not dropped"
+            ),
+            Fault::OriginalRunning => {
+                assert_eq!(
+                    faulted.early,
+                    Some(Early::Held),
+                    "{case:?}: nothing was held back for the parked original"
+                );
+                assert!(faulted.held >= 1, "{case:?}: no request_held event");
+            }
+            Fault::ReplyLost | Fault::Cancelled => {}
+        }
     }
     match expect {
         Pass => assert!(classes.is_empty(), "{case:?} {fault:?} failed: {classes:?}"),
@@ -845,7 +956,7 @@ async fn cell(case: Case, fault: Fault, expect: Expect) {
 }
 
 macro_rules! grid {
-    ($($module:ident($case:expr) { reply_lost: $reply_lost:expr, original_late: $original_late:expr, cancelled: $cancelled:expr $(,)? })*) => {
+    ($($module:ident($case:expr) { reply_lost: $reply_lost:expr, original_late: $original_late:expr, original_running: $original_running:expr, cancelled: $cancelled:expr $(,)? })*) => {
         $(
             mod $module {
                 use super::*;
@@ -861,6 +972,11 @@ macro_rules! grid {
                 }
 
                 #[tokio::test]
+                async fn original_running() {
+                    cell($case, Fault::OriginalRunning, $original_running).await;
+                }
+
+                #[tokio::test]
                 async fn cancelled() {
                     cell($case, Fault::Cancelled, $cancelled).await;
                 }
@@ -869,146 +985,161 @@ macro_rules! grid {
     };
 }
 
-/// The original, held on the server across the reconnect, runs after the client's resend or failure and its later change.
-const OVERTAKEN: &str = "the original lands after the follow-up";
-/// A late create also opens the file anew under the handle id its resend already opened, so the client's live handle now names the re-created file.
-const OVERTAKEN_CREATE: &str =
-    "the original lands after the follow-up, re-creating the file under the client's live handle";
-/// The same for an open, which also opens a handle the client released before it existed.
-const OVERTAKEN_OPEN: &str =
-    "the original lands after the follow-up and the handle's release, and leaks it";
 /// An interrupted call's request still runs on the server, after whatever the caller did next.
 const ABANDONED: &str = "the abandoned original lands after the follow-up";
 const ABANDONED_OPEN: &str =
     "the abandoned original lands after the follow-up and its orphan release, and leaks the handle";
 
 grid! {
-    lookup(Case::Lookup) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    getattr(Case::Getattr) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    readlink(Case::Readlink) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    read(Case::Read) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    readdir(Case::Readdir) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    getxattr(Case::Getxattr) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    listxattr(Case::Listxattr) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    access(Case::Access) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    statfs(Case::Statfs) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    lseek(Case::Lseek) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    fsync(Case::Fsync) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
+    lookup(Case::Lookup) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    getattr(Case::Getattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    readlink(Case::Readlink) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    read(Case::Read) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    readdir(Case::Readdir) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    getxattr(Case::Getxattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    listxattr(Case::Listxattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    access(Case::Access) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    statfs(Case::Statfs) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    lseek(Case::Lseek) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    fsync(Case::Fsync) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
     write(Case::Write) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     write_append(Case::WriteAppend) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     setattr_size(Case::SetattrSize) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     setattr_mode(Case::SetattrMode) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     mknod(Case::Mknod) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     mkdir(Case::Mkdir) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     unlink(Case::Unlink) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     rmdir(Case::Rmdir) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     symlink(Case::Symlink) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     rename(Case::Rename) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     link(Case::Link) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     open(Case::Open) {
         reply_lost: Pass,
-        original_late: Fail(&[Leak], OVERTAKEN_OPEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[Leak], ABANDONED_OPEN),
     }
     open_trunc(Case::OpenTrunc) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate, Leak], OVERTAKEN_OPEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate, Leak], ABANDONED_OPEN),
     }
     create(Case::Create) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN_CREATE),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate, Leak], ABANDONED_OPEN),
     }
     create_excl(Case::CreateExcl) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate, Leak], OVERTAKEN_OPEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate, Leak], ABANDONED_OPEN),
     }
     create_trunc(Case::CreateTrunc) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate, Leak], OVERTAKEN_OPEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate, Leak], ABANDONED_OPEN),
     }
     setxattr(Case::Setxattr) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     setxattr_create(Case::SetxattrCreate) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     setxattr_replace(Case::SetxattrReplace) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     removexattr(Case::Removexattr) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     fallocate(Case::Fallocate) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     copy_file_range(Case::CopyFileRange) {
         reply_lost: Pass,
-        original_late: Fail(&[StateLate], OVERTAKEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     opendir(Case::Opendir) {
         reply_lost: Pass,
-        original_late: Fail(&[Leak], OVERTAKEN_OPEN),
+        original_late: Pass,
+        original_running: Pass,
         cancelled: Fail(&[Leak], ABANDONED_OPEN),
     }
-    release(Case::Release) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
-    releasedir(Case::Releasedir) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
+    release(Case::Release) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    releasedir(Case::Releasedir) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
 }

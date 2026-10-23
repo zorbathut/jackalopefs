@@ -61,6 +61,8 @@ pub struct SessionState {
     pub handles: Arc<Handles>,
     /// `attached` counts attachments so that only the connection currently holding the session can detach it; `detached_at` starts the grace period.
     attachment: Mutex<Attachment>,
+    /// Woken when the last change of an attachment's connection finishes.
+    drained: tokio::sync::Notify,
 }
 
 #[derive(Default)]
@@ -69,6 +71,109 @@ struct Attachment {
     detached_at: Option<Instant>,
     /// The client's address on the connection that last attached.
     remote: Option<std::net::SocketAddr>,
+    /// Changes running now from the connection attached at `epoch`, and from the session's earlier connections.
+    running: usize,
+    running_older: usize,
+}
+
+impl SessionState {
+    /// Count a change from the connection attached at `epoch` as running, unless the session has resumed on a newer connection since: then the client has already resent the change or failed it, and it must not run.
+    fn begin(self: &Arc<Self>, epoch: u64) -> Option<GuardChange> {
+        let mut attachment = self.attachment.lock();
+        if attachment.epoch != epoch {
+            return None;
+        }
+        attachment.running += 1;
+        Some(GuardChange {
+            session: self.clone(),
+            epoch,
+        })
+    }
+
+    /// How many changes from connections older than `epoch` are running; none for a connection that is no longer current itself, whose changes will not run.
+    fn older_running(&self, epoch: u64) -> usize {
+        let attachment = self.attachment.lock();
+        if attachment.epoch == epoch {
+            attachment.running_older
+        } else {
+            0
+        }
+    }
+
+    /// Wait until no change from a connection older than `epoch` is running; `false` when the connection at `epoch` stopped being current meanwhile, and its change will not run.
+    async fn drain(&self, epoch: u64) -> bool {
+        loop {
+            let notified = self.drained.notified();
+            tokio::pin!(notified);
+            {
+                let attachment = self.attachment.lock();
+                if attachment.epoch != epoch {
+                    return false;
+                }
+                if attachment.running_older == 0 {
+                    return true;
+                }
+                notified.as_mut().enable();
+            }
+            notified.await;
+        }
+    }
+}
+
+/// A change counted as running by [`SessionState::begin`] until dropped.
+struct GuardChange {
+    session: Arc<SessionState>,
+    epoch: u64,
+}
+
+impl Drop for GuardChange {
+    fn drop(&mut self) {
+        let mut attachment = self.session.attachment.lock();
+        if attachment.epoch == self.epoch {
+            attachment.running -= 1;
+            return;
+        }
+        attachment.running_older -= 1;
+        if attachment.running_older == 0 {
+            drop(attachment);
+            self.session.drained.notify_waiters();
+        }
+    }
+}
+
+/// Whether a request can change what a later one finds: everything but the reads, which may run in any order. A late `fsync` changes nothing either.
+fn changes(req: &Request) -> bool {
+    match req {
+        Request::Lookup { .. }
+        | Request::Getattr { .. }
+        | Request::Readlink { .. }
+        | Request::Read { .. }
+        | Request::Readdir { .. }
+        | Request::Getxattr { .. }
+        | Request::Listxattr { .. }
+        | Request::Access { .. }
+        | Request::Statfs { .. }
+        | Request::Lseek { .. }
+        | Request::Fsync { .. } => false,
+        Request::Setattr { .. }
+        | Request::Mknod { .. }
+        | Request::Mkdir { .. }
+        | Request::Unlink { .. }
+        | Request::Rmdir { .. }
+        | Request::Symlink { .. }
+        | Request::Rename { .. }
+        | Request::Link { .. }
+        | Request::Open { .. }
+        | Request::Create { .. }
+        | Request::Write { .. }
+        | Request::Release { .. }
+        | Request::Opendir { .. }
+        | Request::Releasedir { .. }
+        | Request::Setxattr { .. }
+        | Request::Removexattr { .. }
+        | Request::CopyFileRange { .. }
+        | Request::Fallocate { .. } => true,
+    }
 }
 
 pub struct Sessions {
@@ -105,6 +210,7 @@ impl Sessions {
                 epoch: 1,
                 ..Attachment::default()
             }),
+            drained: tokio::sync::Notify::new(),
         });
         let mut map = self.map.lock();
         let mut detached: Vec<(u64, Instant)> = map
@@ -138,8 +244,12 @@ impl Sessions {
         let mut attachment = state.attachment.lock();
         attachment.epoch += 1;
         attachment.detached_at = None;
+        attachment.running_older += attachment.running;
+        attachment.running = 0;
         let epoch = attachment.epoch;
         drop(attachment);
+        // A change held on the connection just superseded will not run now; let it go.
+        state.drained.notify_waiters();
         Some((state, epoch))
     }
 
@@ -507,6 +617,9 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     let serving = Arc::new(Serving {
         ops,
         server: server.clone(),
+        session: session.clone(),
+        epoch,
+        conn: conn.clone(),
     });
     loop {
         match conn.accept_bi().await {
@@ -806,6 +919,10 @@ fn outcome_of(resp: &Response) -> Outcome {
 struct Serving {
     ops: Arc<Ops>,
     server: Arc<Server>,
+    session: Arc<SessionState>,
+    /// The session's attachment epoch this connection holds.
+    epoch: u64,
+    conn: Connection,
 }
 
 /// A request that ran on its blocking thread.
@@ -916,10 +1033,69 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
         sampled.request(&body, || elided(req.with_data_elided()));
     }
     drop(body);
+    let changing = changes(&req);
+    let older = if changing {
+        serving.session.older_running(serving.epoch)
+    } else {
+        0
+    };
+    if older > 0 {
+        inflight.held();
+        let held_since = Instant::now();
+        let current = tokio::select! {
+            current = serving.session.drain(serving.epoch) => current,
+            stopped = send.stopped() => {
+                let why = match stopped {
+                    Ok(code) => format!("the client gave up on it ({code:?})"),
+                    Err(e) => format!("its stream ended ({e})"),
+                };
+                event!(
+                    target: EVENT_TARGET,
+                    perf.events,
+                    Slowpath::RequestCancelled,
+                    IdsEvent {
+                        op: Some(op),
+                        ..ids.clone()
+                    },
+                    format!(
+                        "{}: {why} while it was held behind the session's earlier connections; dropped unrun",
+                        inflight.subject().unwrap_or_default()
+                    )
+                );
+                return;
+            }
+        };
+        inflight.waiting();
+        phases.held = held_since.elapsed();
+        if current {
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::RequestHeld,
+                IdsEvent {
+                    op: Some(op),
+                    ..ids.clone()
+                },
+                format!(
+                    "{}: held {} behind {older} changes still running from the session's earlier connections",
+                    inflight.subject().unwrap_or_default(),
+                    fmt_duration(phases.held)
+                )
+            );
+        }
+    }
     let queued = Instant::now();
     let running = inflight.clone();
+    let session = serving.session.clone();
+    let epoch = serving.epoch;
     let resp = match tokio::task::spawn_blocking(move || {
         let mut hooked = hook.and_then(|hook| hook(&req));
+        // Counted from here to the end of the closure, hook included, so a test can hold a change that has begun.
+        let _counted = if changing {
+            Some(session.begin(epoch)?)
+        } else {
+            None
+        };
         if let Some(hooked) = hooked.as_mut() {
             hooked(PhaseDispatch::Running);
         }
@@ -933,24 +1109,50 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
         if let Some(mut hooked) = hooked {
             hooked(PhaseDispatch::Done(&resp));
         }
-        Ran {
+        Some(Ran {
             started,
             finished,
             resp,
             armed,
-        }
+        })
     })
     .await
     {
-        Ok(Ran {
+        Ok(Some(Ran {
             started,
             finished,
             resp,
             armed,
-        }) => {
+        })) => {
             phases.wait = started - queued;
             phases.op = finished - started;
             (resp, armed)
+        }
+        // Its session resumed on a newer connection before it could run.
+        Ok(None) => {
+            if let Some(sampled) = sampled.as_mut() {
+                sampled.outcome("superseded");
+            }
+            event!(
+                target: EVENT_TARGET,
+                perf.events,
+                Slowpath::RequestSuperseded,
+                IdsEvent {
+                    op: Some(op),
+                    ..ids.clone()
+                },
+                format!(
+                    "{}: the session has resumed on a newer connection; dropped unrun, and this connection closed",
+                    inflight.subject().unwrap_or_default()
+                )
+            );
+            if let Err(e) = send.reset(close_code::SUPERSEDED.into()) {
+                tracing::debug!(op, "reset of a superseded request: {e}");
+            }
+            serving
+                .conn
+                .close(close_code::SUPERSEDED.into(), b"session resumed elsewhere");
+            return;
         }
         Err(e) => {
             tracing::error!(op, "operation panicked: {e}");
@@ -1041,6 +1243,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
             read_us = phases.read.as_micros() as u64,
             wait_us = phases.wait.as_micros() as u64,
             op_us = phases.op.as_micros() as u64,
+            held_us = phases.held.as_micros() as u64,
             send_us = phases.send.as_micros() as u64,
             total_us = total.as_micros() as u64,
             "request"
@@ -1063,6 +1266,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
                 errno: outcome.errno,
                 phases: vec![
                     ("read".into(), ns(phases.read)),
+                    ("held".into(), ns(phases.held)),
                     ("wait".into(), ns(phases.wait)),
                     ("op".into(), ns(phases.op)),
                     ("send".into(), ns(phases.send)),
@@ -1165,5 +1369,133 @@ mod tests {
         assert!(sessions.get(ids[0]).is_none());
         assert!(sessions.get(ids[1]).is_some());
         assert!(sessions.get(fresh.id).is_some());
+    }
+
+    /// Whether `future` is still pending after a moment, which is as long as the tests below give anything to happen.
+    async fn pending<F: std::future::Future>(future: F) -> bool {
+        timeout(Duration::from_millis(50), future).await.is_err()
+    }
+
+    #[test]
+    fn a_change_from_a_superseded_connection_is_refused() {
+        let sessions = sessions_unlimited();
+        let (state, first) = sessions.create();
+        let running = state
+            .begin(first)
+            .expect("the current connection's change runs");
+        let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
+        assert!(
+            state.begin(first).is_none(),
+            "the session has resumed on a newer connection"
+        );
+        assert!(state.begin(second).is_some());
+        drop(running);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_connection_waits_for_the_older_ones_changes_only() {
+        let sessions = sessions_unlimited();
+        let (state, first) = sessions.create();
+        let old = state.begin(first).unwrap();
+        assert_eq!(
+            state.older_running(first),
+            0,
+            "nothing is older than the first connection"
+        );
+        let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
+        let own = state.begin(second).unwrap();
+        assert_eq!(state.older_running(second), 1);
+        assert!(
+            pending(state.drain(second)).await,
+            "an older change is still running"
+        );
+        drop(old);
+        assert!(timeout(Duration::from_secs(1), state.drain(second))
+            .await
+            .unwrap());
+        drop(own);
+
+        let (_, third) = sessions.resume(state.id, &state.resume_token).unwrap();
+        let older = state.begin(third).unwrap();
+        let (_, fourth) = sessions.resume(state.id, &state.resume_token).unwrap();
+        let drained = tokio::spawn({
+            let state = state.clone();
+            async move { state.drain(fourth).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!drained.is_finished());
+        drop(older);
+        assert!(drained.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_held_change_whose_connection_is_superseded_waits_no_longer() {
+        let sessions = sessions_unlimited();
+        let (state, first) = sessions.create();
+        let old = state.begin(first).unwrap();
+        let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
+        let held = tokio::spawn({
+            let state = state.clone();
+            async move { state.drain(second).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !held.is_finished(),
+            "held behind the first connection's change"
+        );
+        let (_, third) = sessions.resume(state.id, &state.resume_token).unwrap();
+        assert!(
+            !timeout(Duration::from_secs(1), held)
+                .await
+                .unwrap()
+                .unwrap(),
+            "its change will not run"
+        );
+        assert_eq!(
+            state.older_running(second),
+            0,
+            "a superseded connection's change is not held"
+        );
+        assert!(!pending(state.drain(second)).await);
+        assert!(
+            pending(state.drain(third)).await,
+            "the first connection's change still runs"
+        );
+        assert!(state.begin(first).is_none() && state.begin(second).is_none());
+        drop(old);
+    }
+
+    #[test]
+    fn only_requests_that_change_something_are_ordered() {
+        let path = jackalopefs_proto::Path::root();
+        assert!(changes(&Request::Write {
+            fh: 1,
+            offset: 0,
+            data: Vec::new()
+        }));
+        assert!(changes(&Request::Setattr {
+            path: None,
+            fh: Some(1),
+            set: Default::default()
+        }));
+        assert!(changes(&Request::Open {
+            fh: 1,
+            path: path.clone(),
+            flags: libc::O_RDONLY
+        }));
+        assert!(changes(&Request::Release { fh: 1 }));
+        assert!(!changes(&Request::Read {
+            fh: 1,
+            offset: 0,
+            size: 1
+        }));
+        assert!(!changes(&Request::Fsync {
+            fh: 1,
+            datasync: false
+        }));
+        assert!(!changes(&Request::Getattr {
+            path: Some(path),
+            fh: None
+        }));
     }
 }
