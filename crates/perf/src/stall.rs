@@ -458,13 +458,16 @@ mod tests {
             stopped.recv().ok();
         });
         let tid = rx.recv().unwrap();
+        // Poll the answer itself: the thread may sleep briefly elsewhere before it reaches the recv, and a sleeping thread can read as running for a moment, so one read that saw it asleep says nothing about the next.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while thread_wchan(tid).unwrap().is_empty() {
-            assert!(Instant::now() < deadline, "the thread never slept");
+        let doing = loop {
+            let doing = thread_doing(tid);
+            if doing.contains("S (sleeping)") && doing.contains(" in ") {
+                break doing;
+            }
+            assert!(Instant::now() < deadline, "the thread never slept: {doing}");
             std::thread::sleep(Duration::from_millis(5));
-        }
-        let doing = thread_doing(tid);
-        assert!(doing.contains(" in "), "{doing}");
+        };
         drop(_stop);
         sleeper.join().unwrap();
         assert!(thread_wchan(i32::MAX).is_err());
