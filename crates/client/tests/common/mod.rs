@@ -484,7 +484,11 @@ pub async fn wait_for<T>(limit: Duration, what: &str, mut check: impl FnMut() ->
 /// Where a [`Gate`] holds the request it is armed for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hold {
+    /// As the request reaches its blocking thread.
     Before,
+    /// About to touch the filesystem, past whatever the server does on the thread first.
+    Running,
+    /// Done, its reply not yet sent.
     After,
 }
 
@@ -571,25 +575,35 @@ impl Gate {
                 drop(state);
             }
             let hooked = hooked.clone();
-            Some(Box::new(move |resp: &Response| {
-                let errno = match resp {
-                    Response::Err(errno) => Some(*errno),
-                    _ => None,
-                };
-                let mut state = hooked.state();
-                state.log.push(Dispatched { op, fh, errno });
-                if hold.is_none() {
-                    return;
-                }
-                state
-                    .taken
-                    .as_mut()
-                    .expect("the gate took this request")
-                    .ran = Some(errno);
-                if hold == Some(Hold::After) {
-                    hooked.park(state);
-                }
-            }))
+            Some(Box::new(
+                move |phase: session::PhaseDispatch<'_>| match phase {
+                    session::PhaseDispatch::Running => {
+                        let state = hooked.state();
+                        if hold == Some(Hold::Running) {
+                            hooked.park(state);
+                        }
+                    }
+                    session::PhaseDispatch::Done(resp) => {
+                        let errno = match resp {
+                            Response::Err(errno) => Some(*errno),
+                            _ => None,
+                        };
+                        let mut state = hooked.state();
+                        state.log.push(Dispatched { op, fh, errno });
+                        if hold.is_none() {
+                            return;
+                        }
+                        state
+                            .taken
+                            .as_mut()
+                            .expect("the gate took this request")
+                            .ran = Some(errno);
+                        if hold == Some(Hold::After) {
+                            hooked.park(state);
+                        }
+                    }
+                },
+            ))
         });
         if server.server.dispatch_hook.set(hook).is_err() {
             panic!("the server already has a dispatch hook");

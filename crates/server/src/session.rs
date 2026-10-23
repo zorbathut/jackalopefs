@@ -228,13 +228,22 @@ pub struct Server {
     meters: Mutex<Meters>,
     token: Option<String>,
     connection_permits: Arc<Semaphore>,
-    /// Called on a request's blocking thread just before it runs, and what it returns just after with the response, so a test can hold a request at either point and see what it answered; never set outside tests.
+    /// Called on a request's blocking thread when it gets there, and what it returns as the request goes on, so a test can hold a request at any of those points and see what it answered; never set outside tests.
     pub dispatch_hook: OnceLock<HookDispatch>,
 }
 
-pub type HookDispatch = Arc<dyn Fn(&Request) -> Option<HookAfter> + Send + Sync>;
+pub type HookDispatch = Arc<dyn Fn(&Request) -> Option<HookRequest> + Send + Sync>;
 
-pub type HookAfter = Box<dyn FnOnce(&Response) + Send>;
+/// What a [`HookDispatch`] keeps for one request.
+pub type HookRequest = Box<dyn FnMut(PhaseDispatch<'_>) + Send>;
+
+/// Where a request a [`HookDispatch`] took has got to.
+pub enum PhaseDispatch<'a> {
+    /// About to touch the filesystem.
+    Running,
+    /// Done, with its response.
+    Done(&'a Response),
+}
 
 /// What change notification hands the server: the batches to fan out, the record of which session made which change, and the watch table requests arm.
 pub struct Notification {
@@ -482,16 +491,14 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         events: server.perf.events.clone(),
         refusals: Mutex::new(ops::Refusals::default()),
     });
+    let serving = Arc::new(Serving {
+        ops,
+        server: server.clone(),
+    });
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
-                tokio::spawn(handle_request(
-                    ops.clone(),
-                    server.perf.clone(),
-                    server.dispatch_hook.get().cloned(),
-                    send,
-                    recv,
-                ));
+                tokio::spawn(handle_request(serving.clone(), send, recv));
             }
             Err(e) => {
                 tracing::debug!(session = session.id, "connection ended: {e}");
@@ -782,13 +789,24 @@ fn outcome_of(resp: &Response) -> Outcome {
     }
 }
 
-async fn handle_request(
+/// What every request on one connection is answered with.
+struct Serving {
     ops: Arc<Ops>,
-    perf: Arc<Perf>,
-    hook: Option<HookDispatch>,
-    mut send: SendStream,
-    mut recv: RecvStream,
-) {
+    server: Arc<Server>,
+}
+
+/// A request that ran on its blocking thread.
+struct Ran {
+    started: Instant,
+    finished: Instant,
+    resp: Response,
+    armed: Vec<crate::watch::Armed>,
+}
+
+async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: RecvStream) {
+    let ops = serving.ops.clone();
+    let perf = serving.server.perf.clone();
+    let hook = serving.server.dispatch_hook.get().cloned();
     let accepted = Instant::now();
     let stream = u64::from(recv.id());
     let inflight = Arc::new(perf.start(ops.session_id, ops.conn, stream));
@@ -888,7 +906,10 @@ async fn handle_request(
     let queued = Instant::now();
     let running = inflight.clone();
     let resp = match tokio::task::spawn_blocking(move || {
-        let after = hook.and_then(|hook| hook(&req));
+        let mut hooked = hook.and_then(|hook| hook(&req));
+        if let Some(hooked) = hooked.as_mut() {
+            hooked(PhaseDispatch::Running);
+        }
         let tid = nix::unistd::gettid().as_raw();
         let started = Instant::now();
         running.arming(tid);
@@ -896,14 +917,24 @@ async fn handle_request(
         running.running(tid);
         let resp = ops::dispatch(&ops, req);
         let finished = Instant::now();
-        if let Some(after) = after {
-            after(&resp);
+        if let Some(mut hooked) = hooked {
+            hooked(PhaseDispatch::Done(&resp));
         }
-        (started, finished, resp, armed)
+        Ran {
+            started,
+            finished,
+            resp,
+            armed,
+        }
     })
     .await
     {
-        Ok((started, finished, resp, armed)) => {
+        Ok(Ran {
+            started,
+            finished,
+            resp,
+            armed,
+        }) => {
             phases.wait = started - queued;
             phases.op = finished - started;
             (resp, armed)
