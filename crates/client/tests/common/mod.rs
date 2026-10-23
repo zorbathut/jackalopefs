@@ -33,25 +33,58 @@ pub struct TestServer {
     _watcher: Option<WatcherHandle>,
 }
 
+/// What a [`TestServer`] is started with, short of its socket.
+struct Launch {
+    export: std::path::PathBuf,
+    token: Option<String>,
+    identity: Identity,
+    watch_budget: Option<usize>,
+    ids: ModeIds,
+    handle_share: usize,
+}
+
+impl Launch {
+    /// The defaults every constructor starts from: no token, a fresh identity, the usual watch budget, owners passed through, and no handle limit worth reporting.
+    fn new(export: &Path) -> Launch {
+        Launch {
+            export: export.to_path_buf(),
+            token: None,
+            identity: Identity::generate().unwrap(),
+            watch_budget: Some(WATCH_BUDGET),
+            ids: ModeIds::Direct,
+            handle_share: jackalopefs_server::handles::SHARE_MAX,
+        }
+    }
+}
+
+fn any_port() -> UdpSocket {
+    UdpSocket::bind("127.0.0.1:0").unwrap()
+}
+
 impl TestServer {
     pub async fn start(export: &Path, token: Option<String>) -> TestServer {
-        TestServer::start_on(export, token, UdpSocket::bind("127.0.0.1:0").unwrap()).await
+        TestServer::start_on(export, token, any_port()).await
     }
 
     pub async fn start_on(export: &Path, token: Option<String>, socket: UdpSocket) -> TestServer {
-        TestServer::start_with(export, token, socket, Identity::generate().unwrap()).await
+        TestServer::start_full(
+            socket,
+            Launch {
+                token,
+                ..Launch::new(export)
+            },
+        )
+        .await
     }
 
     /// A server that sends no change events, so a test can see what the client's own refreshes find out.
     pub async fn start_unwatched(export: &Path) -> TestServer {
         TestServer::start_full(
-            export,
-            None,
-            UdpSocket::bind("127.0.0.1:0").unwrap(),
-            Identity::generate().unwrap(),
-            None,
-            ModeIds::Direct,
-            jackalopefs_server::handles::SHARE_MAX,
+            any_port(),
+            Launch {
+                watch_budget: None,
+                ..Launch::new(export)
+            },
         )
         .await
     }
@@ -59,13 +92,11 @@ impl TestServer {
     /// A server that watches at most `budget` directories besides the export root.
     pub async fn start_watching(export: &Path, budget: usize) -> TestServer {
         TestServer::start_full(
-            export,
-            None,
-            UdpSocket::bind("127.0.0.1:0").unwrap(),
-            Identity::generate().unwrap(),
-            Some(budget),
-            ModeIds::Direct,
-            jackalopefs_server::handles::SHARE_MAX,
+            any_port(),
+            Launch {
+                watch_budget: Some(budget),
+                ..Launch::new(export)
+            },
         )
         .await
     }
@@ -73,13 +104,11 @@ impl TestServer {
     /// A server that reports a session past `share` handles, with a pool that never runs out.
     pub async fn start_sharing(export: &Path, share: usize) -> TestServer {
         TestServer::start_full(
-            export,
-            None,
-            UdpSocket::bind("127.0.0.1:0").unwrap(),
-            Identity::generate().unwrap(),
-            Some(WATCH_BUDGET),
-            ModeIds::Direct,
-            share,
+            any_port(),
+            Launch {
+                handle_share: share,
+                ..Launch::new(export)
+            },
         )
         .await
     }
@@ -87,13 +116,11 @@ impl TestServer {
     /// A server with the given owner policy; every other constructor passes owners through (`direct`), so tests about something else see the export's own.
     pub async fn start_ids(export: &Path, ids: ModeIds) -> TestServer {
         TestServer::start_full(
-            export,
-            None,
-            UdpSocket::bind("127.0.0.1:0").unwrap(),
-            Identity::generate().unwrap(),
-            Some(WATCH_BUDGET),
-            ids,
-            jackalopefs_server::handles::SHARE_MAX,
+            any_port(),
+            Launch {
+                ids,
+                ..Launch::new(export)
+            },
         )
         .await
     }
@@ -106,28 +133,28 @@ impl TestServer {
         identity: Identity,
     ) -> TestServer {
         TestServer::start_full(
-            export,
-            token,
             socket,
-            identity,
-            Some(WATCH_BUDGET),
-            ModeIds::Direct,
-            jackalopefs_server::handles::SHARE_MAX,
+            Launch {
+                token,
+                identity,
+                ..Launch::new(export)
+            },
         )
         .await
     }
 
-    async fn start_full(
-        export: &Path,
-        token: Option<String>,
-        socket: UdpSocket,
-        identity: Identity,
-        watch_budget: Option<usize>,
-        ids: ModeIds,
-        handle_share: usize,
-    ) -> TestServer {
+    async fn start_full(socket: UdpSocket, launch: Launch) -> TestServer {
         // The server binary zeroes its umask so client modes are honoured; the in-process server needs the same.
         unsafe { libc::umask(0) };
+        let Launch {
+            export,
+            token,
+            identity,
+            watch_budget,
+            ids,
+            handle_share,
+        } = launch;
+        let export = export.as_path();
         let fingerprint = jackalopefs_proto::fingerprint_bytes(identity.cert.as_ref());
         let config = tls::server_config(identity, jackalopefs_server::transport_config()).unwrap();
         let endpoint = Endpoint::new(

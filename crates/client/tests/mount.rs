@@ -174,6 +174,18 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.unwrap()
 }
 
+/// Close `file` and return what `close(2)` said, which dropping a `File` would discard.
+fn close(file: fs::File) -> std::io::Result<()> {
+    use std::os::fd::IntoRawFd;
+    let fd = file.into_raw_fd();
+    // SAFETY: the descriptor was just taken out of the File and is closed exactly once here.
+    if unsafe { libc::close(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 /// Whether `pid` is blocked inside a FUSE request right now, by the wait channel the kernel reports for it.
 fn blocked_in_fuse(pid: u32) -> bool {
     fs::read_to_string(format!("/proc/{pid}/wchan"))
@@ -2071,17 +2083,10 @@ async fn a_write_after_the_server_vanished_fails_at_the_close() {
     let file = blocking(move || fs::File::create(mnt.join("f")).unwrap()).await;
     m.server.take().unwrap().stop().await;
     blocking(move || {
-        use std::os::fd::IntoRawFd;
         let mut file = file;
         file.write_all(b"cached").unwrap();
-        let fd = file.into_raw_fd();
-        // SAFETY: the descriptor was just taken out of the File and is closed exactly once here.
-        let rc = unsafe { libc::close(fd) };
-        let err = std::io::Error::last_os_error();
-        assert_eq!(
-            rc, -1,
-            "close succeeded although the data could not be written back"
-        );
+        let err =
+            close(file).expect_err("close succeeded although the data could not be written back");
         assert_eq!(
             err.raw_os_error(),
             Some(libc::EIO),
