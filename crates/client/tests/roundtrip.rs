@@ -2054,9 +2054,9 @@ async fn an_outage_past_the_offline_deadline_fails_calls_at_once() {
     client.shutdown().await;
 }
 
-/// A release that fails for want of a connection is owed to the session: the server would otherwise hold that descriptor for as long as the session lives, so it is sent once the session resumes.
+/// A release that fails for want of a connection is owed to the session, since the server would otherwise hold that descriptor for as long as the session lives. It is sent once the session resumes, after the connection is published: the server here never answers it, and the connection is published all the same.
 #[tokio::test]
-async fn a_release_failed_in_an_outage_is_sent_when_the_session_resumes() {
+async fn a_release_failed_in_an_outage_is_sent_once_the_session_resumes() {
     let refused = HelloReply::RevisionMismatch {
         revision: PROTO_REVISION ^ 1,
     };
@@ -2065,17 +2065,14 @@ async fn a_release_failed_in_an_outage_is_sent_when_the_session_resumes() {
         *resumed = true;
     }
     // Four refusals hold the outage for the backoff's 100 + 200 + 400 + 800 ms before the session resumes.
-    let hole = Blackhole::start_answering_handshaking(
-        |_| jackalopefs_proto::Response::Ok,
-        vec![
-            Blackhole::ack(),
-            refused.clone(),
-            refused.clone(),
-            refused.clone(),
-            refused,
-            resumed,
-        ],
-    )
+    let hole = Blackhole::start_handshaking(vec![
+        Blackhole::ack(),
+        refused.clone(),
+        refused.clone(),
+        refused.clone(),
+        refused,
+        resumed,
+    ])
     .await;
     let client = jackalopefs_client::Client::connect(hole.config(Duration::from_millis(200)))
         .await
@@ -2092,8 +2089,7 @@ async fn a_release_failed_in_an_outage_is_sent_when_the_session_resumes() {
         matches!(*client.state().borrow(), ConnState::Connecting { .. }),
         "the session resumed before the release failed; the test proves nothing"
     );
-    wait_for_generation(&client, 2).await;
-    wait_for(Duration::from_secs(3), "the owed release", || {
+    wait_for(Duration::from_secs(5), "the owed release", || {
         hole.requests
             .lock()
             .iter()
@@ -2101,6 +2097,10 @@ async fn a_release_failed_in_an_outage_is_sent_when_the_session_resumes() {
             .then_some(())
     })
     .await;
+    assert!(
+        matches!(&*client.state().borrow(), ConnState::Connected(attached) if attached.generation == 2),
+        "the owed release went out before the resumed connection was published"
+    );
     client.shutdown().await;
 }
 

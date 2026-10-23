@@ -291,36 +291,27 @@ async fn run(
         };
         let restore = async {
             if resumed {
-                send_releases(
-                    &conn,
-                    &root,
-                    ids,
-                    &handles,
-                    handles.take_owed(),
-                    cfg.offline_timeout,
-                    tapping,
-                )
-                .await;
+                Vec::new()
             } else {
                 // A new session holds none of the old one's handles, so the releases owed to that one are moot.
                 handles.take_owed();
-                reopen_handles(&conn, &root, ids, &handles, cfg.offline_timeout, tapping).await;
+                reopen_handles(&conn, &root, ids, &handles, cfg.offline_timeout, tapping).await
             }
         };
-        tokio::select! {
-            _ = restore => {}
+        let stale = tokio::select! {
+            stale = restore => stale,
             _ = stop.changed() => {
                 conn.close(close_code::UNMOUNT.into(), b"unmount");
                 break;
             }
-        }
+        };
         let attached = Arc::new(Attached {
             conn: conn.clone(),
             session_id: attached.session_id,
             resumed,
             generation,
             conn_key,
-            root,
+            root: root.clone(),
             ids,
         });
         if state.send(ConnState::Connected(attached)).is_err() {
@@ -331,6 +322,21 @@ async fn run(
                 tracing::debug!("nobody waiting for the first connection result");
             }
         }
+        // The handles this client no longer has are released once the connection is published, so a server slow to answer holds up no call: their ids are never reused, and nothing on this side waits on them. The next connection waits for the releases to end, so one owed again is there for its resume to send.
+        let releases = if resumed { handles.take_owed() } else { stale };
+        let releasing = {
+            let (conn, root, handles, hub) =
+                (conn.clone(), root.clone(), handles.clone(), hub.clone());
+            let session = tapping.session;
+            tokio::spawn(async move {
+                let tapping = Tapping {
+                    hub: &hub,
+                    session,
+                    conn: conn_key,
+                };
+                send_releases(&conn, &root, ids, &handles, releases, tapping).await;
+            })
+        };
         let reader = tokio::spawn(read_events(
             conn.clone(),
             events.clone(),
@@ -347,10 +353,16 @@ async fn run(
             _ = stop.changed() => {
                 conn.close(close_code::UNMOUNT.into(), b"unmount");
                 reader.abort();
+                if let Err(e) = releasing.await {
+                    tracing::error!("release task failed: {e}");
+                }
                 break;
             }
         }
         reader.abort();
+        if let Err(e) = releasing.await {
+            tracing::error!("release task failed: {e}");
+        }
     }
     if state.send(ConnState::Closed).is_err() {
         tracing::debug!("connection state has no subscribers at shutdown");
@@ -560,7 +572,7 @@ async fn connect_once(
     }
 }
 
-/// The server has no memory of our handles: reopen each by path, concurrently, keep only those that still name the same inode, and release the rest so the server doesn't hold what we won't use. Every step has the offline deadline: reopening is part of getting the connection back, and the connection is not published until it is done, so a reopen without a bound would keep every call on the mount waiting. The steps run concurrently, so the whole phase is bounded by two of them.
+/// The server has no memory of our handles: reopen each by path, concurrently, keep only those that still name the same inode, and return the releases of the rest, so the server doesn't hold what we won't use. Every reopen has the offline deadline: reopening is part of getting the connection back, and the connection is not published until it is done, so a reopen without a bound would keep every call on the mount waiting. The reopens run concurrently, so the whole phase is bounded by one of them.
 async fn reopen_handles(
     conn: &Connection,
     root: &KeyRoot,
@@ -568,10 +580,10 @@ async fn reopen_handles(
     handles: &HandleTable,
     offline_timeout: Duration,
     tapping: Tapping<'_>,
-) {
+) -> Vec<jackalopefs_proto::Request> {
     let live = handles.live();
     if live.is_empty() {
-        return;
+        return Vec::new();
     }
     tracing::info!(count = live.len(), "reopening handles after a new session");
     let mut reopens = tokio::task::JoinSet::new();
@@ -619,17 +631,16 @@ async fn reopen_handles(
             Err(e) => tracing::error!("reopen task failed: {e}"),
         }
     }
-    send_releases(conn, root, ids, handles, stale, offline_timeout, tapping).await;
+    stale
 }
 
-/// Send releases concurrently, each on the offline deadline; one the server never answered is owed again, for the next resume of this session.
+/// Send releases concurrently, for as long as the connection lasts; one the server did not answer is owed again, for the next resume of this session.
 async fn send_releases(
     conn: &Connection,
     root: &KeyRoot,
     ids: IdMap,
     handles: &HandleTable,
     releases: Vec<jackalopefs_proto::Request>,
-    offline_timeout: Duration,
     tapping: Tapping<'_>,
 ) {
     if releases.is_empty() {
@@ -646,16 +657,13 @@ async fn send_releases(
                 session,
                 conn: conn_key,
             };
-            let sent = timeout(
-                offline_timeout,
-                exchange(
-                    &conn,
-                    &root,
-                    &ids,
-                    &release,
-                    &mut Timing::default(),
-                    tapping,
-                ),
+            let sent = exchange(
+                &conn,
+                &root,
+                &ids,
+                &release,
+                &mut Timing::default(),
+                tapping,
             )
             .await;
             (release, sent)
@@ -663,13 +671,9 @@ async fn send_releases(
     }
     while let Some(joined) = sends.join_next().await {
         match joined {
-            Ok((_, Ok(Ok(_)))) => {}
-            Ok((release, Ok(Err(e)))) => {
+            Ok((_, Ok(_))) => {}
+            Ok((release, Err(e))) => {
                 tracing::debug!(?release, "release failed: {e:?}");
-                handles.owe_release(release);
-            }
-            Ok((release, Err(_))) => {
-                tracing::debug!(?release, "release timed out");
                 handles.owe_release(release);
             }
             Err(e) => tracing::error!("release task failed: {e}"),
