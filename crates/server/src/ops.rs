@@ -2,7 +2,7 @@
 
 use crate::dirents::read_dir_fd;
 use crate::export::{kind_from_mode, proc_path, Export};
-use crate::handles::{ErrorPoolFull, Handle, Handles};
+use crate::handles::{ErrorReserve, Handle, Handles};
 use crate::ids::IdMap;
 use crate::perf::{Slowpath, EVENT_TARGET};
 use crate::watch::{parent_of, ChangeLog, Watches};
@@ -129,9 +129,12 @@ impl Drop for Ops {
     }
 }
 
-impl From<ErrorPoolFull> for Failure {
-    fn from(_: ErrorPoolFull) -> Failure {
-        Failure::PoolFull
+impl From<ErrorReserve> for Failure {
+    fn from(e: ErrorReserve) -> Failure {
+        match e {
+            ErrorReserve::PoolFull => Failure::PoolFull,
+            ErrorReserve::Released => Failure::Errno(Errno::EBADF),
+        }
     }
 }
 
@@ -448,7 +451,7 @@ impl Ops {
                         file: Arc::new(File::from(fd)),
                         path,
                         watch,
-                    }),
+                    })?,
                 );
                 Ok(Response::Opened { attr })
             }
@@ -477,7 +480,7 @@ impl Ops {
                         file: Arc::new(File::from(fd)),
                         path,
                         watch,
-                    }),
+                    })?,
                 );
                 Ok(Response::Opened { attr })
             }
@@ -605,7 +608,7 @@ impl Ops {
                     slot.insert(Handle::Dir {
                         dir: Arc::new(Mutex::new(fd)),
                         watch: self.watches.hold(&path),
-                    }),
+                    })?,
                 );
                 Ok(Response::Opened { attr })
             }
@@ -968,6 +971,42 @@ mod tests {
             Response::Ok,
             "releasing an unknown handle is harmless"
         );
+    }
+
+    /// An open the client gave up on, arriving after the release it sent in case the open had landed, touches nothing.
+    #[test]
+    fn an_open_under_a_released_id_changes_nothing() {
+        let (dir, ops) = fixture();
+        fs::write(dir.path().join("kept"), b"contents").unwrap();
+        assert_eq!(dispatch(&ops, Request::Release { fh: 9 }), Response::Ok);
+        assert_eq!(dispatch(&ops, Request::Release { fh: 10 }), Response::Ok);
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Create {
+                    fh: 9,
+                    parent: Path::root(),
+                    name: name("never"),
+                    mode: 0o100644,
+                    flags: libc::O_RDWR,
+                }
+            ),
+            Response::Err(Errno::EBADF as i32)
+        );
+        assert!(!dir.path().join("never").exists());
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Open {
+                    fh: 10,
+                    path: path("kept"),
+                    flags: libc::O_RDWR | libc::O_TRUNC,
+                }
+            ),
+            Response::Err(Errno::EBADF as i32)
+        );
+        assert_eq!(fs::read(dir.path().join("kept")).unwrap(), b"contents");
+        assert!(ops.handles.is_empty());
     }
 
     fn open(ops: &Ops, fh: u64, file: &str, flags: i32) {

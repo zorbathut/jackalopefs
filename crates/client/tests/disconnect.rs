@@ -987,8 +987,6 @@ macro_rules! grid {
 
 /// An interrupted call's request still runs on the server, after whatever the caller did next.
 const ABANDONED: &str = "the abandoned original lands after the follow-up";
-const ABANDONED_OPEN: &str =
-    "the abandoned original lands after the follow-up and its orphan release, and leaks the handle";
 
 grid! {
     lookup(Case::Lookup) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
@@ -1072,31 +1070,31 @@ grid! {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[Leak], ABANDONED_OPEN),
+        cancelled: Pass,
     }
     open_trunc(Case::OpenTrunc) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate, Leak], ABANDONED_OPEN),
+        cancelled: Pass,
     }
     create(Case::Create) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate, Leak], ABANDONED_OPEN),
+        cancelled: Pass,
     }
     create_excl(Case::CreateExcl) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate, Leak], ABANDONED_OPEN),
+        cancelled: Pass,
     }
     create_trunc(Case::CreateTrunc) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate, Leak], ABANDONED_OPEN),
+        cancelled: Pass,
     }
     setxattr(Case::Setxattr) {
         reply_lost: Pass,
@@ -1138,7 +1136,7 @@ grid! {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[Leak], ABANDONED_OPEN),
+        cancelled: Pass,
     }
     release(Case::Release) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
     releasedir(Case::Releasedir) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
