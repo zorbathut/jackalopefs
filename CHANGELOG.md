@@ -70,6 +70,7 @@
 
 ### Fixed
 
+- `Client::write` through a handle opened with `O_APPEND`, or one the client has no record of, is no longer resent when its reply is lost with the connection; it fails with `EIO`, applied or not. The server appends at its own end of file, so the resend appended the data a second time. Writes through the mount are not affected: the kernel places appends itself and opens the server's file without `O_APPEND`.
 - The client's `SIGUSR1` and `--perf-interval` reports name the callers of requests in flight on the blocking pool instead of the main thread, which a read caught in a release on this mount (a caller whose process exited while it was read: one whose reply had just landed, or the reader behind a readahead, which is not blocked in its request) could leave unable to act on the second signal that aborts the mount. Those lines can now come after the rest of the report.
 - The client's stall watchdog no longer goes silent when the read naming a stalled request's caller is caught the same way. It reads callers' `/proc` on a thread of its own and waits for it at most 200 ms per check; a caller not named by then is shown as such, and the watchdog goes on reporting. Unmount still waits for such a read, until the second signal aborts the mount.
 - The client exits when its mount is unmounted from outside (`fusermount -u`). It kept running with nothing to serve, reconnecting to the server, until it was killed.

@@ -2,7 +2,7 @@
 
 use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::Opener;
-use crate::handles::{HandleKind, HandleTable};
+use crate::handles::{HandleKind, HandleRec, HandleTable};
 use crate::ids::{IdMap, ModeIds};
 use crate::inodes::KeyNode;
 use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TRACE_TARGET};
@@ -481,15 +481,14 @@ fn call_ids(req: &Request, attached: &Attached, timing: &Timing<'_>) -> IdsEvent
     }
 }
 
-/// Whether a request whose reply was lost may be sent again without changing the outcome.
-fn retry_safe(req: &Request) -> bool {
+/// Whether a request whose reply was lost may be sent again without changing the outcome, given the records of the handles it names. A write is positional unless its handle was opened with `O_APPEND`, which the server honours by writing at its own end of file each time; one on a handle this client has no record of is not resent.
+fn retry_safe(req: &Request, handles: &[Option<Arc<HandleRec>>; 2]) -> bool {
     match req {
         Request::Lookup { .. }
         | Request::Getattr { .. }
         | Request::Setattr { .. }
         | Request::Readlink { .. }
         | Request::Read { .. }
-        | Request::Write { .. }
         | Request::Release { .. }
         | Request::Fsync { .. }
         | Request::Opendir { .. }
@@ -502,6 +501,7 @@ fn retry_safe(req: &Request) -> bool {
         | Request::CopyFileRange { .. }
         | Request::Fallocate { .. }
         | Request::Lseek { .. } => true,
+        Request::Write { .. } => handles[0].as_ref().is_some_and(|rec| !rec.appends()),
         Request::Open { flags, .. } => flags & libc::O_TRUNC == 0,
         Request::Create { flags, .. } => flags & (libc::O_EXCL | libc::O_TRUNC) == 0,
         Request::Setxattr { flags, .. } => *flags == 0,
@@ -704,7 +704,7 @@ impl Caller {
                     min_generation = attached.generation + 1;
                 }
                 Ok(Err(ErrorExchange::Lost(cause))) => {
-                    if lost_once || !retry_safe(req) {
+                    if lost_once || !retry_safe(req, &handles) {
                         return Err(Error::Disconnected);
                     }
                     event!(
@@ -1241,72 +1241,133 @@ mod tests {
     #[test]
     fn retry_policy() {
         let name = Name::new(b"x").unwrap();
-        assert!(retry_safe(&Request::Read {
+        let table = HandleTable::default();
+        let opened = |flags| {
+            let key = KeyNode {
+                ino: 1,
+                identity: jackalopefs_proto::Identity {
+                    handle_type: 1,
+                    handle: Vec::new(),
+                },
+            };
+            Some(table.insert(
+                table.alloc(),
+                1,
+                key,
+                Path::root(),
+                flags,
+                HandleKind::File,
+                None,
+            ))
+        };
+        let write = Request::Write {
             fh: 1,
             offset: 0,
-            size: 1
-        }));
-        assert!(retry_safe(&Request::Write {
-            fh: 1,
-            offset: 0,
-            data: Vec::new()
-        }));
-        assert!(retry_safe(&Request::CopyFileRange {
-            fh_in: 1,
-            offset_in: 0,
-            fh_out: 2,
-            offset_out: 0,
-            len: 1
-        }));
-        assert!(retry_safe(&Request::Fallocate {
-            fh: 1,
-            offset: 0,
-            len: 1,
-            mode: libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE
-        }));
-        assert!(retry_safe(&Request::Lseek {
-            fh: 1,
-            offset: 0,
-            whence: Whence::Data
-        }));
-        assert!(retry_safe(&Request::Open {
-            fh: 4,
-            path: Path::root(),
-            flags: libc::O_RDWR
-        }));
-        assert!(!retry_safe(&Request::Open {
-            fh: 4,
-            path: Path::root(),
-            flags: libc::O_RDWR | libc::O_TRUNC
-        }));
-        assert!(!retry_safe(&Request::Create {
-            fh: 4,
-            parent: Path::root(),
-            name: name.clone(),
-            mode: 0,
-            flags: libc::O_EXCL
-        }));
-        assert!(retry_safe(&Request::Setattr {
-            path: Some(Path::root()),
-            fh: None,
-            set: SetAttr::default()
-        }));
-        assert!(retry_safe(&Request::Release { fh: 1 }));
-        assert!(!retry_safe(&Request::Unlink {
-            parent: Path::root(),
-            name: name.clone()
-        }));
-        assert!(!retry_safe(&Request::Rename {
-            parent: Path::root(),
-            name: name.clone(),
-            newparent: Path::root(),
-            newname: name.clone(),
-            flags: 0
-        }));
-        assert!(!retry_safe(&Request::Mkdir {
-            parent: Path::root(),
-            name,
-            mode: 0
-        }));
+            data: Vec::new(),
+        };
+        assert!(retry_safe(&write, &[opened(libc::O_WRONLY), None]));
+        assert!(!retry_safe(
+            &write,
+            &[opened(libc::O_WRONLY | libc::O_APPEND), None]
+        ));
+        assert!(
+            !retry_safe(&write, &[None, None]),
+            "a handle this client never recorded"
+        );
+        assert!(retry_safe(
+            &Request::Read {
+                fh: 1,
+                offset: 0,
+                size: 1
+            },
+            &[None, None]
+        ));
+        assert!(retry_safe(
+            &Request::CopyFileRange {
+                fh_in: 1,
+                offset_in: 0,
+                fh_out: 2,
+                offset_out: 0,
+                len: 1
+            },
+            &[None, None]
+        ));
+        assert!(retry_safe(
+            &Request::Fallocate {
+                fh: 1,
+                offset: 0,
+                len: 1,
+                mode: libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE
+            },
+            &[None, None]
+        ));
+        assert!(retry_safe(
+            &Request::Lseek {
+                fh: 1,
+                offset: 0,
+                whence: Whence::Data
+            },
+            &[None, None]
+        ));
+        assert!(retry_safe(
+            &Request::Open {
+                fh: 4,
+                path: Path::root(),
+                flags: libc::O_RDWR
+            },
+            &[None, None]
+        ));
+        assert!(!retry_safe(
+            &Request::Open {
+                fh: 4,
+                path: Path::root(),
+                flags: libc::O_RDWR | libc::O_TRUNC
+            },
+            &[None, None]
+        ));
+        assert!(!retry_safe(
+            &Request::Create {
+                fh: 4,
+                parent: Path::root(),
+                name: name.clone(),
+                mode: 0,
+                flags: libc::O_EXCL
+            },
+            &[None, None]
+        ));
+        assert!(retry_safe(
+            &Request::Setattr {
+                path: Some(Path::root()),
+                fh: None,
+                set: SetAttr::default()
+            },
+            &[None, None]
+        ));
+        assert!(retry_safe(&Request::Release { fh: 1 }, &[None, None]));
+        assert!(!retry_safe(
+            &Request::Unlink {
+                parent: Path::root(),
+                name: name.clone()
+            },
+            &[None, None]
+        ));
+        assert!(!retry_safe(
+            &Request::Rename {
+                parent: Path::root(),
+                name: name.clone(),
+                newparent: Path::root(),
+                newname: name.clone(),
+                flags: 0
+            },
+            &[None, None]
+        ));
+        assert!(!retry_safe(
+            &Request::Mkdir {
+                parent: Path::root(),
+                name,
+                mode: 0
+            },
+            &[None, None]
+        ));
     }
 }

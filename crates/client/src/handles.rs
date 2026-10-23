@@ -107,6 +107,11 @@ impl HandleRec {
         self.dead.load(Ordering::Relaxed)
     }
 
+    /// Whether the server opened the handle to append, placing every write at its own end of file.
+    pub fn appends(&self) -> bool {
+        self.flags & libc::O_APPEND != 0
+    }
+
     fn mark_dead(&self) {
         self.dead.store(true, Ordering::Relaxed);
     }

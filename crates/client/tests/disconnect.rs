@@ -881,8 +881,6 @@ const OVERTAKEN_OPEN: &str =
 const ABANDONED: &str = "the abandoned original lands after the follow-up";
 const ABANDONED_OPEN: &str =
     "the abandoned original lands after the follow-up and its orphan release, and leaks the handle";
-/// The server appends at its own end of file, so a resend of an `O_APPEND` write is not positional.
-const DOUBLE_APPEND: &str = "the resend appends a second time";
 
 grid! {
     lookup(Case::Lookup) { reply_lost: Pass, original_late: Pass, cancelled: Pass }
@@ -902,7 +900,7 @@ grid! {
         cancelled: Fail(&[StateLate], ABANDONED),
     }
     write_append(Case::WriteAppend) {
-        reply_lost: Fail(&[StateResend], DOUBLE_APPEND),
+        reply_lost: Pass,
         original_late: Fail(&[StateLate], OVERTAKEN),
         cancelled: Fail(&[StateLate], ABANDONED),
     }
