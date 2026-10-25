@@ -3,7 +3,8 @@
 //! A [`Gate`] on the server parks the case's request on its blocking thread, and the fault is played around it:
 //! - `reply_lost`: the request has run and its reply is waiting; the connection is closed, the session resumes, and the client resends the request or fails it.
 //! - `original_late`: the request is about to run; the connection is closed, and the request runs only after the client has resent or failed it and made a later change (the case's follow-up).
-//! - `cancelled`: the request is about to run on a live connection when the call is interrupted; it runs after the follow-up.
+//! - `cancelled`: the request is about to run on a live connection when the call is interrupted; it is let go after the follow-up.
+//! - `cancelled_running`: the request is running on a live connection when the call is interrupted; it finishes after the follow-up.
 //!
 //! Each cell also runs controls on fresh exports: A (the op, then the follow-up), B (the follow-up alone, as if the op never happened) and C (the follow-up, then the op: the order a late original makes). The cell's run must report the op's outcome as A did (`Outcome`), unless the client could not tell whether it was applied (a lost connection, a timeout, an interrupt). It must then match A, or B when the outcome is unknown, by the follow-up's outcome and the export's [`snapshot`]. Where the late original can act, the state is checked just before it is released too, which says whether a failure is the late original's doing (`StateLate`) or the resend's (`StateResend`). After every handle the case opened is released, the server must hold none (`Leak`). Control C must match neither A nor B for a case that changes the export, or its follow-up could not show a late original at all.
 //!
@@ -32,6 +33,7 @@ enum Fault {
     OriginalLate,
     OriginalRunning,
     Cancelled,
+    CancelledRunning,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,8 +729,12 @@ async fn run(case: Case, order: Order) -> Option<Run> {
             let late = async { tokio::join!(case.op(&client, &mut prep), blip()).0 };
             Some(unless_stalled(&gate, &server, &mut early, late).await)
         }
-        Order::Faulted(Fault::Cancelled) => {
-            gate.arm(case.op_name(), Hold::Before);
+        Order::Faulted(fault @ (Fault::Cancelled | Fault::CancelledRunning)) => {
+            let hold = match fault {
+                Fault::Cancelled => Hold::Before,
+                _ => Hold::Running,
+            };
+            gate.arm(case.op_name(), hold);
             let req = RequestKernel::new(1);
             let scoped = req.clone();
             let interrupt = async {
@@ -742,7 +748,12 @@ async fn run(case: Case, order: Order) -> Option<Run> {
     };
     let holds = matches!(
         order,
-        Order::Faulted(Fault::OriginalLate | Fault::OriginalRunning | Fault::Cancelled)
+        Order::Faulted(
+            Fault::OriginalLate
+                | Fault::OriginalRunning
+                | Fault::Cancelled
+                | Fault::CancelledRunning
+        )
     );
     let follow = match follow {
         Some(follow) => follow,
@@ -945,7 +956,7 @@ async fn cell(case: Case, fault: Fault, expect: Expect) {
                 );
                 assert!(faulted.held >= 1, "{case:?}: no request_held event");
             }
-            Fault::ReplyLost | Fault::Cancelled => {}
+            Fault::ReplyLost | Fault::Cancelled | Fault::CancelledRunning => {}
         }
     }
     match expect {
@@ -958,7 +969,7 @@ async fn cell(case: Case, fault: Fault, expect: Expect) {
 }
 
 macro_rules! grid {
-    ($($module:ident($case:expr) { reply_lost: $reply_lost:expr, original_late: $original_late:expr, original_running: $original_running:expr, cancelled: $cancelled:expr $(,)? })*) => {
+    ($($module:ident($case:expr) { reply_lost: $reply_lost:expr, original_late: $original_late:expr, original_running: $original_running:expr, cancelled: $cancelled:expr, cancelled_running: $cancelled_running:expr $(,)? })*) => {
         $(
             mod $module {
                 use super::*;
@@ -982,6 +993,11 @@ macro_rules! grid {
                 async fn cancelled() {
                     cell($case, Fault::Cancelled, $cancelled).await;
                 }
+
+                #[tokio::test]
+                async fn cancelled_running() {
+                    cell($case, Fault::CancelledRunning, $cancelled_running).await;
+                }
             }
         )*
     };
@@ -991,155 +1007,178 @@ macro_rules! grid {
 const ABANDONED: &str = "the abandoned original lands after the follow-up";
 
 grid! {
-    lookup(Case::Lookup) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    getattr(Case::Getattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    readlink(Case::Readlink) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    read(Case::Read) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    readdir(Case::Readdir) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    getxattr(Case::Getxattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    listxattr(Case::Listxattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    access(Case::Access) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    statfs(Case::Statfs) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    lseek(Case::Lseek) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    fsync(Case::Fsync) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    lookup(Case::Lookup) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    getattr(Case::Getattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    readlink(Case::Readlink) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    read(Case::Read) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    readdir(Case::Readdir) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    getxattr(Case::Getxattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    listxattr(Case::Listxattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    access(Case::Access) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    statfs(Case::Statfs) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    lseek(Case::Lseek) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    fsync(Case::Fsync) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
     write(Case::Write) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     write_append(Case::WriteAppend) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     setattr_size(Case::SetattrSize) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     setattr_mode(Case::SetattrMode) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     mknod(Case::Mknod) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     mkdir(Case::Mkdir) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     unlink(Case::Unlink) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     rmdir(Case::Rmdir) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     symlink(Case::Symlink) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     rename(Case::Rename) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     link(Case::Link) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     open(Case::Open) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Pass,
+        cancelled_running: Pass,
     }
     open_trunc(Case::OpenTrunc) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Pass,
+        cancelled_running: Pass,
     }
     create(Case::Create) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Pass,
+        cancelled_running: Pass,
     }
     create_excl(Case::CreateExcl) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Pass,
+        cancelled_running: Pass,
     }
     create_trunc(Case::CreateTrunc) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Pass,
+        cancelled_running: Pass,
     }
     setxattr(Case::Setxattr) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     setxattr_create(Case::SetxattrCreate) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     setxattr_replace(Case::SetxattrReplace) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     removexattr(Case::Removexattr) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     fallocate(Case::Fallocate) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     copy_file_range(Case::CopyFileRange) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Fail(&[StateLate], ABANDONED),
+        cancelled_running: Fail(&[StateLate], ABANDONED),
     }
     opendir(Case::Opendir) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
         cancelled: Pass,
+        cancelled_running: Pass,
     }
-    release(Case::Release) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
-    releasedir(Case::Releasedir) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass }
+    release(Case::Release) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
+    releasedir(Case::Releasedir) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
 }
