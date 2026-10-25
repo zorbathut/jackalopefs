@@ -174,4 +174,26 @@ module session_small {
     .then(publish).expect(client.owed == Set(1))
     .then(owedSend(1)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3)).expect(client.owed == Set())
     .then(closeSession(1)).expect(pool == 0 and quiescent and okSoFar)
+
+  /// A new session whose reopen is given up on while the server runs it: the connection is published at once, the reopen running on, and the release of the dead handle goes out beside it.
+  run reopenGivenUpTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
+    .then(loseClient(1, Set())).then(loseServer(1)).then(dropSession(1)).then(newSession)
+    .then(reopenSend(1)).then(arrive(2)).then(begin(2)).then(reopenGiveUp(2)).expect(client.dead == Set(1) and client.owed == Set(1))
+    .then(publish).expect(conns.get(2).published and phaseOf(2) == Running)
+    .then(owedSend(1)).expect(reqs.get(3).origin == OwedRelease(1))
+    .then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
+    .then(finish(2, false)).then(receive(2)).then(closeSession(1))
+    .expect(sessions.get(2).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
+
+  /// A new session whose reopen is still out when the kernel releases the handle: the connection is not published until the reopen has answered, and the handle it keeps is then released as stale.
+  run reopenReleasedTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
+    .then(loseClient(1, Set())).then(loseServer(1)).then(dropSession(1)).then(newSession)
+    .then(reopenSend(1)).then(start(2, Release(1), true)).expect(client.held.get(1) == 0 and client.reopening == Set(2))
+    .then(arrive(2)).then(begin(2)).then(finish(2, false)).expect(sessions.get(2).handles.get(1).by == 2)
+    .then(receive(2)).expect(client.owed == Set(1) and client.reopening == Set())
+    .then(publish).then(owedSend(1)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
+    .then(send(2)).then(arrive(4)).then(begin(4)).then(finish(4, false)).then(receive(4)).then(closeSession(1))
+    .expect(sessions.get(2).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
 }
