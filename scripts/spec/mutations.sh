@@ -54,11 +54,11 @@ mutate giveup_never_counts S1 \
   "conns' = if (cancels) conns.setBy(q.conn, k => k.with(\"cancels\", k.cancels + 1)) else conns," \
   "conns' = conns,"
 mutate resume_keeps_abandoned countsConsistent \
-  '.with("running", 0).with("abandoned", 0).with("detached", false).with("handshakeLost", false)' \
-  '.with("running", 0).with("detached", false).with("handshakeLost", false)'
+  '.with("running", 0).with("abandoned", 0).with("live", true).with("detached", false).with("handshakeLost", false)' \
+  '.with("running", 0).with("live", true).with("detached", false).with("handshakeLost", false)'
 mutate resume_forgets_running S1 \
-  '.with("runningOlder", ses.runningOlder + ses.running).with("running", 0).with("abandoned", 0).with("detached", false)' \
-  '.with("running", 0).with("abandoned", 0).with("detached", false)'
+  '.with("runningOlder", ses.runningOlder + ses.running).with("running", 0).with("abandoned", 0).with("live", true).with("detached", false)' \
+  '.with("running", 0).with("abandoned", 0).with("live", true).with("detached", false)'
 mutate begin_ignores_epoch S2 \
   'if (orderedReq(q) and ses.epoch != q.epoch) all {' \
   'if (false) all {'
@@ -71,6 +71,9 @@ mutate no_released_window S3 \
 mutate resend_opens_again S3 \
   'else if (ses.handles.get(fh).by != 0) Kept' \
   'else if (false) Kept'
+mutate drop_forgets_living_sessions S1strong \
+  'def resumable(s: int): bool = sessions.get(s).live or alive(s)' \
+  'def resumable(s: int): bool = sessions.get(s).live'
 
 echo
 if [[ $failures -eq 0 ]]; then echo "every mutation was caught"; else echo "$failures mutation(s) not caught"; exit 1; fi

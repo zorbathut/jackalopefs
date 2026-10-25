@@ -140,6 +140,12 @@ module session {
   def unsettled(q: Req): bool = (isOrphan(q.origin) or isOwed(q.origin)) and (q.phase != Finished or q.answer != NoAnswer)
 
   /// `SessionState::fencing`: what a change from the connection attached at `epoch` waits for; nothing for a connection no longer current, whose changes will not run.
+  /// Whether anything of session `s` lives at the server: a request not ended, or a connection whose task still runs. Each holds the session's `Arc`, which is what `Sessions::resume` finds a dropped session by.
+  def alive(s: int): bool = REQS.exists(r => reqs.get(r).session == s and not(terminal(reqs.get(r).phase))) or GENS.exists(g => conns.get(g).session == s and conns.get(g).serverAlive)
+
+  /// Whether a hello naming session `s` resumes it: it is in the table, or dropped from it with something of it still alive.
+  def resumable(s: int): bool = sessions.get(s).live or alive(s)
+
   def fencing(s: int, epoch: int): int = {
     val ses = sessions.get(s)
     if (ses.epoch == epoch) ses.runningOlder + ses.abandoned else 0
@@ -404,7 +410,7 @@ module session {
     }
   }
 
-  /// The client connects again and the server resumes the session (`Sessions::resume`, M1): the epoch moves on, the changes still running become `running_older`, and those given up on are no longer counted apart. A connection the server still held is taken over and closed (`handle_connection`), its requests `cutOff`. The connection is published at once, with everything owed to send (`take_owed`).
+  /// The client connects again and the server resumes the session (`Sessions::resume`, M1), taking it back into the table if it was dropped while something of it lived: the epoch moves on, the changes still running become `running_older`, and those given up on are no longer counted apart. A connection the server still held is taken over and closed (`handle_connection`), its requests `cutOff`. The connection is published at once, with everything owed to send (`take_owed`).
   action reconnect: bool = {
     val g = gen + 1
     val old = conns.get(gen)
@@ -412,10 +418,10 @@ module session {
     all {
       g <= MAX_GEN,
       not(old.clientAlive),
-      ses.live,
+      resumable(sid),
       gen' = g,
       sid' = sid,
-      sessions' = sessions.set(sid, ses.with("epoch", ses.epoch + 1).with("runningOlder", ses.runningOlder + ses.running).with("running", 0).with("abandoned", 0).with("detached", false).with("handshakeLost", false)),
+      sessions' = sessions.set(sid, ses.with("epoch", ses.epoch + 1).with("runningOlder", ses.runningOlder + ses.running).with("running", 0).with("abandoned", 0).with("live", true).with("detached", false).with("handshakeLost", false)),
       pool' = pool,
       conns' = conns.set(g, liveConn(sid, ses.epoch + 1, true, client.owed)).setBy(gen, k => k.with("serverAlive", false)),
       reqs' = REQS.mapBy(r => if (reqs.get(r).conn == gen and old.serverAlive) cutOff(reqs.get(r)) else reqs.get(r)),
@@ -428,14 +434,14 @@ module session {
     }
   }
 
-  /// The client connects again, but the server no longer has the session: `Sessions::create` makes a new one and the client starts from nothing (`conn.rs`, the new-session branch): the releases owed to the old session are moot, and the held handles are reopened before the connection is published. The old connection, if the server still holds it, is nobody's to close, and its requests go on (G1).
+  /// The client connects again, but nothing of its session is left at the server: `Sessions::create` makes a new one and the client starts from nothing (`conn.rs`, the new-session branch): the releases owed to the old session are moot, and the held handles are reopened before the connection is published.
   action newSession: bool = {
     val g = gen + 1
     val s = sid + 1
     all {
       g <= MAX_GEN,
       not(conns.get(gen).clientAlive),
-      not(sessions.get(sid).live),
+      not(resumable(sid)),
       gen' = g,
       sid' = s,
       sessions' = sessions.set(s, freshSession),
@@ -453,9 +459,9 @@ module session {
     val ses = sessions.get(sid)
     all {
       not(conns.get(gen).clientAlive),
-      ses.live,
+      resumable(sid),
       not(ses.handshakeLost),
-      sessions' = sessions.set(sid, ses.with("epoch", ses.epoch + 1).with("runningOlder", ses.runningOlder + ses.running).with("running", 0).with("abandoned", 0).with("detached", true).with("handshakeLost", true)),
+      sessions' = sessions.set(sid, ses.with("epoch", ses.epoch + 1).with("runningOlder", ses.runningOlder + ses.running).with("running", 0).with("abandoned", 0).with("live", true).with("detached", true).with("handshakeLost", true)),
       pool' = pool,
       keepCalls,
       keepReqs,
@@ -465,7 +471,7 @@ module session {
     }
   }
 
-  /// The session's grace runs out (`Sessions::reap`), or it is the oldest of too many detached ones (`Sessions::create`): it leaves the table. Nothing tells its requests, which still compare epochs against it.
+  /// The session's grace runs out (`Sessions::reap`), or it is the oldest of too many detached ones (`Sessions::create`): it leaves the table for the dropped ones, which a hello naming it finds while something of it lives (`resumable`).
   action dropSession(s: int): bool = {
     val ses = sessions.get(s)
     all {
@@ -766,7 +772,7 @@ module session {
   /// S1, no overtaking, as design.md states it: for changes a and b of one session, b after a, every request of a that ran had finished before any request of b began (`overtakes`).
   val S1 = not(overtook)
 
-  /// S1 across the client's sessions. Expected to fail: a session the server dropped does not stop its old connection's queued changes (G1).
+  /// S1 across the client's sessions: a session dropped while something of it still runs is resumed, not replaced, so a new session starts only once nothing of the old one can begin or is running. A client that restarts names no session (G1), which the model, of one client's lifetime, leaves out.
   val S1strong = not(overtookAcross)
 
   /// S2, bounded repeats: a call's request ran at most twice, the second time only as a resend, and for a change on one session only after the first finished (`resendOvertakes`).

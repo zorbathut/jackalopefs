@@ -1412,6 +1412,91 @@ async fn a_new_session_that_fails_before_its_ack_is_dropped() {
     server.stop().await;
 }
 
+/// A session whose grace runs out while one of its changes still runs is resumed by the client that names it, so the client's next change waits for that one rather than overtaking it on a new session.
+#[tokio::test]
+async fn a_dropped_session_whose_change_still_runs_is_resumed() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let gate = Gate::install(&server);
+    gate.arm("mkdir", Hold::Running);
+    let hello = |resume| jackalopefs_proto::Hello {
+        revision: PROTO_REVISION,
+        auth: Auth::Anonymous,
+        resume,
+    };
+    let mkdir = |dir: &str| Request::Mkdir {
+        parent: Path::root(),
+        name: name(dir),
+        mode: 0o755,
+    };
+    let (first_endpoint, first, reply) = connect_raw(&server, hello(None)).await;
+    let HelloReply::Ack {
+        session_id,
+        resume_token,
+        ..
+    } = reply
+    else {
+        panic!("the first hello was refused: {reply:?}");
+    };
+    let (mut send, _recv) = first.open_bi().await.unwrap();
+    jackalopefs_proto::write_frame(&mut send, &mkdir("early"))
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    gate.wait_parked().await;
+    first.close(0u32.into(), b"lost");
+    wait_for(
+        Duration::from_secs(3),
+        "the first connection to detach",
+        || {
+            server
+                .server
+                .sessions
+                .handle_rows()
+                .iter()
+                .any(|row| row.session == session_id && row.detached)
+                .then_some(())
+        },
+    )
+    .await;
+    assert_eq!(server.server.sessions.reap(Duration::ZERO), 1);
+    assert!(server.server.sessions.is_empty(), "the session is dropped");
+    let (second_endpoint, second, reply) = connect_raw(
+        &server,
+        hello(Some(jackalopefs_proto::Resume {
+            session_id,
+            token: resume_token,
+        })),
+    )
+    .await;
+    assert!(
+        matches!(reply, HelloReply::Ack { resumed: true, session_id: resumed, .. } if resumed == session_id),
+        "{reply:?}"
+    );
+    let (mut send, mut recv) = second.open_bi().await.unwrap();
+    jackalopefs_proto::write_frame(&mut send, &mkdir("late"))
+        .await
+        .unwrap();
+    send.finish().unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !export.path().join("late").exists(),
+        "the later change ran while the dropped session's earlier one still did"
+    );
+    gate.release();
+    let resp: jackalopefs_proto::Response = jackalopefs_proto::read_frame(&mut recv).await.unwrap();
+    assert!(
+        !matches!(resp, jackalopefs_proto::Response::Err(_)),
+        "{resp:?}"
+    );
+    assert!(export.path().join("early").is_dir());
+    assert!(export.path().join("late").is_dir());
+    second.close(0u32.into(), b"done");
+    first_endpoint.wait_idle().await;
+    second_endpoint.wait_idle().await;
+    server.stop().await;
+}
+
 #[tokio::test]
 async fn truncated_request_is_ignored_by_the_server() {
     let export = tempfile::tempdir().unwrap();

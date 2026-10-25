@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 use quinn::{Connection, RecvStream, SendStream};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tokio::sync::{broadcast, Semaphore};
@@ -214,6 +214,8 @@ impl Drop for GuardChange {
 
 pub struct Sessions {
     map: Mutex<HashMap<u64, Arc<SessionState>>>,
+    /// Sessions dropped from `map` (grace run out, or evicted), for as long as something of theirs lives: every request task and every change running holds its session. A client that names one gets it back ([`Sessions::resume`]), so a change of it still queued or running stays ordered before the client's next ones; one whose last reference has gone has nothing left to order, and the client starts a new session. Locked only under `map`'s lock.
+    dropped: Mutex<HashMap<u64, Weak<SessionState>>>,
     next_id: AtomicU64,
     /// The handles a session holds before it is reported.
     handle_share: usize,
@@ -225,6 +227,7 @@ impl Sessions {
     pub fn new(handle_share: usize, pool: Arc<HandlePool>) -> Sessions {
         Sessions {
             map: Mutex::new(HashMap::new()),
+            dropped: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
             handle_share,
             pool,
@@ -264,18 +267,30 @@ impl Sessions {
                     limit = MAX_DETACHED_SESSIONS,
                     "too many detached sessions; dropping the oldest"
                 );
-                map.remove(old);
+                self.retire(&mut map, *old);
             }
         }
         map.insert(id, state.clone());
         (state, 1)
     }
 
-    /// Reattach `id` if the token matches; a session still attached elsewhere is taken over, since the client evidently lost that connection.
+    /// Reattach `id` if the token matches; a session still attached elsewhere is taken over, since the client evidently lost that connection. A session dropped from the table comes back while anything of it lives. Done under the table's lock, so no drop comes between finding the session and attaching it.
     pub fn resume(&self, id: u64, token: &[u8; 16]) -> Option<(Arc<SessionState>, u64)> {
-        let state = self.map.lock().get(&id)?.clone();
+        let mut map = self.map.lock();
+        let (state, dropped) = match map.get(&id) {
+            Some(state) => (state.clone(), false),
+            None => (self.dropped.lock().get(&id)?.upgrade()?, true),
+        };
         if !bool::from(state.resume_token.ct_eq(token)) {
             return None;
+        }
+        if dropped {
+            tracing::info!(
+                session = id,
+                "resuming a dropped session whose requests still run"
+            );
+            self.dropped.lock().remove(&id);
+            map.insert(id, state.clone());
         }
         let mut attachment = state.attachment.lock();
         attachment.epoch += 1;
@@ -285,9 +300,20 @@ impl Sessions {
         attachment.abandoned = 0;
         let epoch = attachment.epoch;
         drop(attachment);
+        drop(map);
         // A change held on the connection just superseded will not run now; let it go.
         state.drained.notify_waiters();
         Some((state, epoch))
+    }
+
+    /// Move `id` from the table to the dropped sessions, forgetting those of them with nothing left.
+    fn retire(&self, map: &mut HashMap<u64, Arc<SessionState>>, id: u64) {
+        let Some(state) = map.remove(&id) else {
+            return;
+        };
+        let mut dropped = self.dropped.lock();
+        dropped.retain(|_, state| state.strong_count() > 0);
+        dropped.insert(id, Arc::downgrade(&state));
     }
 
     /// Drop a session no client can resume: one whose Ack, with its id and token, never reached the client.
@@ -306,16 +332,25 @@ impl Sessions {
         }
     }
 
-    /// Drop sessions detached for longer than `grace`, closing their handles.
+    /// Drop sessions detached for longer than `grace`, closing their handles once nothing of theirs runs.
     pub fn reap(&self, grace: Duration) -> usize {
         let now = Instant::now();
         let mut map = self.map.lock();
-        let before = map.len();
-        map.retain(|_, state| match state.attachment.lock().detached_at {
-            Some(at) => now.duration_since(at) < grace,
-            None => true,
-        });
-        before - map.len()
+        let expired: Vec<u64> = map
+            .iter()
+            .filter(|(_, state)| {
+                state
+                    .attachment
+                    .lock()
+                    .detached_at
+                    .is_some_and(|at| now.duration_since(at) >= grace)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &expired {
+            self.retire(&mut map, *id);
+        }
+        expired.len()
     }
 
     pub fn len(&self) -> usize {
@@ -1549,6 +1584,65 @@ mod tests {
         assert!(sessions.get(ids[0]).is_none());
         assert!(sessions.get(ids[1]).is_some());
         assert!(sessions.get(fresh.id).is_some());
+    }
+
+    /// A session whose grace ran out while one of its changes still ran comes back to a client that names it: its changes stay ordered by M1, and its handles are the ones the client holds.
+    #[tokio::test]
+    async fn a_dropped_session_with_a_change_running_is_resumed() {
+        let sessions = sessions_unlimited();
+        let (state, first) = sessions.create();
+        let running = state.begin(first, &Change::new()).unwrap();
+        sessions.detach(state.id, first);
+        assert_eq!(sessions.reap(Duration::ZERO), 1);
+        assert!(sessions.get(state.id).is_none(), "dropped");
+        assert!(
+            sessions.resume(state.id, &[0u8; 16]).is_none(),
+            "a wrong token resumes nothing"
+        );
+        let (again, second) = sessions
+            .resume(state.id, &state.resume_token)
+            .expect("its change still runs, so the session is resumed");
+        assert!(Arc::ptr_eq(&state, &again));
+        assert!(
+            sessions.get(state.id).is_some(),
+            "back in the table, to be detached and reaped as before"
+        );
+        assert_eq!(
+            state.fencing(second),
+            1,
+            "the change still running is waited for"
+        );
+        assert!(pending(state.drain(second)).await);
+        drop(running);
+        assert!(timeout(Duration::from_secs(1), state.drain(second))
+            .await
+            .unwrap());
+    }
+
+    #[test]
+    fn a_dropped_session_with_nothing_left_is_not_resumed() {
+        let sessions = sessions_unlimited();
+        let (state, epoch) = sessions.create();
+        let (id, token) = (state.id, state.resume_token);
+        sessions.detach(id, epoch);
+        assert_eq!(sessions.reap(Duration::ZERO), 1);
+        drop(state);
+        assert!(sessions.resume(id, &token).is_none());
+    }
+
+    #[test]
+    fn a_session_evicted_while_its_change_runs_is_resumed() {
+        let sessions = sessions_unlimited();
+        let (state, epoch) = sessions.create();
+        let running = state.begin(epoch, &Change::new()).unwrap();
+        sessions.detach(state.id, epoch);
+        for _ in 0..MAX_DETACHED_SESSIONS {
+            let (other, other_epoch) = sessions.create();
+            sessions.detach(other.id, other_epoch);
+        }
+        assert!(sessions.get(state.id).is_none(), "evicted as the oldest");
+        assert!(sessions.resume(state.id, &state.resume_token).is_some());
+        drop(running);
     }
 
     /// Whether `future` is still pending after a moment, which is as long as the tests below give anything to happen.

@@ -134,6 +134,18 @@ module session_small {
     .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect).expect(conns.get(2).owedToSend == Set(1))
     .then(owedSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(client.owed == Set() and sessions.get(1).handles.get(1).by == 0 and quiescent and S3noG5 and okSoFar)
 
+  /// A session dropped twice while a change given up on by losing its connection still runs is resumed both times, and the client's next change waits for that one: S1 across sessions.
+  run droppedResumedTest = init
+    .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))
+    .then(loseClient(1, Set())).expect(calls.get(1).outcome == Failed)
+    .then(loseServer(1)).then(dropSession(1)).expect(not(sessions.get(1).live) and resumable(1))
+    .then(reconnect).expect(sid == 1 and sessions.get(1).live)
+    .then(loseClient(2, Set())).then(loseServer(2)).then(dropSession(1))
+    .then(reconnect).expect(sid == 1 and gen == 3 and sessions.get(1).runningOlder == 1)
+    .then(start(2, Change, true)).then(send(2)).then(arrive(2)).expect(phaseOf(2) == Held and not(canDrain(2)))
+    .then(finish(1, false)).then(drain(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
+    .expect(calls.get(2).outcome == Replied and quiescent and S1strong and okSoFar)
+
   /// A new session: the held handle is reopened under its id before the connection is published, the client expects the server's entry from the reopen, and the old session's handle goes back to the pool when it closes.
   run reopenTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks the Quint model of the session protocol (spec/) as spec/README.md describes: typecheck, the scenario runs, and TLC on the tiny instance finding each gap's trace and each reachability witness. With FULL=1 it also has TLC explore the tiny instance's whole state space for the invariants that must hold (about half an hour) and simulates the small instance. Every outcome is asserted: a gap that stops being reachable fails the script, which is the cue to move it out of design.md's gap list and out of S3's allowances.
+# Checks the Quint model of the session protocol (spec/) as spec/README.md describes: typecheck, the scenario runs, and TLC on the tiny instance finding each gap's trace and each reachability witness. With FULL=1 it also has TLC explore the tiny instance's whole state space for the invariants that must hold (about twenty minutes) and simulates the small instance. Every outcome is asserted: a gap that stops being reachable fails the script, which is the cue to move it out of design.md's gap list and out of S3's allowances.
 #
 # Needs Node and a JDK. The first run installs the pinned Quint into spec/node_modules (from spec/package-lock.json) and downloads the pinned Apalache, which carries TLC, into ~/.quint; `quint run` under FULL=1 also fetches its own evaluator binary. TLC is given an 8 GB heap.
 set -euo pipefail
@@ -7,8 +7,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SPEC=$ROOT/spec
 APALACHE_VERSION=0.62.1
-MUST_HOLD="S1 S2 S3 S3identity countsConsistent poolConsistent aliveIsCurrent"
-MUST_FAIL="S1strong S3noG4 S3noG5"
+MUST_HOLD="S1 S1strong S2 S3 S3identity countsConsistent poolConsistent aliveIsCurrent"
+MUST_FAIL="S3noG4 S3noG5"
 WITNESSES="neverFenced neverSuperseded neverResendRan neverTakeover neverRefused neverOrphanRan neverReopenSettled neverOwedSettled neverQuiescentHolding"
 # The fewest states TLC may report for the tiny instance: a model change that collapses the state space would otherwise pass as "no violation".
 TINY_STATES_AT_LEAST=10000000
