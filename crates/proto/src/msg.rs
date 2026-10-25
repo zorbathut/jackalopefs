@@ -231,7 +231,7 @@ impl Request {
         }
     }
 
-    /// Whether a request can change what a later one finds: everything but the reads, which may run in any order. A late `fsync` changes nothing either.
+    /// Whether a request takes part in the session's ordering: everything but the reads, which may run in any order. A late `fsync` changes nothing either, and nor does a late release: handle ids are never reused, and an open a release overtakes keeps nothing. An open is ordered even when it changes no file, since one from a superseded connection could otherwise replace a live handle with whatever file is at its path by then.
     pub fn changes(&self) -> bool {
         match self {
             Request::Lookup { .. }
@@ -244,7 +244,9 @@ impl Request {
             | Request::Access { .. }
             | Request::Statfs { .. }
             | Request::Lseek { .. }
-            | Request::Fsync { .. } => false,
+            | Request::Fsync { .. }
+            | Request::Release { .. }
+            | Request::Releasedir { .. } => false,
             Request::Setattr { .. }
             | Request::Mknod { .. }
             | Request::Mkdir { .. }
@@ -256,9 +258,7 @@ impl Request {
             | Request::Open { .. }
             | Request::Create { .. }
             | Request::Write { .. }
-            | Request::Release { .. }
             | Request::Opendir { .. }
-            | Request::Releasedir { .. }
             | Request::Setxattr { .. }
             | Request::Removexattr { .. }
             | Request::CopyFileRange { .. }
@@ -540,7 +540,7 @@ mod tests {
             flags: 0
         }
         .changes());
-        assert!(Request::Release { fh: 1 }.changes());
+        assert!(!Request::Release { fh: 1 }.changes());
         assert!(!Request::Read {
             fh: 1,
             offset: 0,

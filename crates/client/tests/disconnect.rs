@@ -175,7 +175,7 @@ impl Case {
         )
     }
 
-    /// Whether the server orders the op behind a resumed session's earlier changes: every op but the reads.
+    /// Whether the server orders the op behind a resumed session's earlier changes: every op but the reads and the releases.
     fn ordered(self) -> bool {
         !matches!(
             self,
@@ -190,6 +190,8 @@ impl Case {
                 | Case::Statfs
                 | Case::Lseek
                 | Case::Fsync
+                | Case::Release
+                | Case::Releasedir
         )
     }
 

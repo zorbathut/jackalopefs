@@ -92,12 +92,11 @@ pub struct Slot<'a> {
 }
 
 impl Slot<'_> {
-    /// Register `handle` under the slot's `fh`; an existing entry (a retried open whose reply was lost) is replaced and closed. The answer is the number of handles held when that just crossed a report threshold (the share, then each doubling), for the dispatcher to log with the rest of the session's state. Refused, and `handle` closed, when the client released `fh` while it was being opened: whether nothing was open under it then, or the entry a retried open relied on was the one released.
+    /// Register `handle` under the slot's `fh`; an existing entry (a retried open whose reply was lost) is replaced and closed. The answer is the number of handles held when that just crossed a report threshold (the share, then each doubling), for the dispatcher to log with the rest of the session's state. Refused, and `handle` closed, when the client released `fh` while it was being opened, whether or not anything was open under it then; and when the entry a retried open relied on for its slot is gone, however long ago its release was.
     pub fn insert(mut self, handle: Handle) -> Result<Option<u64>, ErrorReserve> {
         let handles = self.handles;
         let mut map = handles.map.lock();
-        if handles.released.lock().contains(&self.fh)
-            || (!self.taken && !map.contains_key(&self.fh))
+        if handles.released.lock().contains(self.fh) || (!self.taken && !map.contains_key(&self.fh))
         {
             tracing::debug!(
                 fh = self.fh,
@@ -146,8 +145,32 @@ pub enum ErrorReserve {
     Released,
 }
 
-/// Ids released before anything was opened under them that a session remembers, the most recent ones. An open as late as that is an open the client gave up on long ago; beyond this many it would keep its descriptor until the session ends.
+/// Released ids a session remembers, the most recent ones. An open under one older than that is an open the client gave up on long ago; it would keep its descriptor until the session ends.
 const RELEASED_KEPT: usize = 1024;
+
+/// The ids a session's client has released, the latest [`RELEASED_KEPT`] of them.
+#[derive(Default)]
+struct Released {
+    order: VecDeque<u64>,
+    set: std::collections::HashSet<u64>,
+}
+
+impl Released {
+    fn contains(&self, fh: u64) -> bool {
+        self.set.contains(&fh)
+    }
+
+    fn record(&mut self, fh: u64) {
+        if !self.set.insert(fh) {
+            return;
+        }
+        if self.order.len() == RELEASED_KEPT {
+            let oldest = self.order.pop_front().expect("the list is full");
+            self.set.remove(&oldest);
+        }
+        self.order.push_back(fh);
+    }
+}
 
 /// One session's handles, each holding a slot of the server's pool until it is removed or the table dropped.
 pub struct Handles {
@@ -157,8 +180,8 @@ pub struct Handles {
     pool: Arc<HandlePool>,
     /// The report threshold last crossed ([`jackalopefs_perf::stall::doubling_due`] from the share), 0 once the session is back under half its share; changed under `map`'s lock.
     reported: AtomicU64,
-    /// Ids released while nothing was open under them, oldest first, at most [`RELEASED_KEPT`]; locked only under `map`'s lock.
-    released: Mutex<VecDeque<u64>>,
+    /// Locked only under `map`'s lock.
+    released: Mutex<Released>,
     /// The handles in `map` of each kind, changed under its lock.
     files: AtomicU64,
     dirs: AtomicU64,
@@ -179,7 +202,7 @@ impl Handles {
             share,
             pool,
             reported: AtomicU64::new(0),
-            released: Mutex::new(VecDeque::new()),
+            released: Mutex::new(Released::default()),
             files: AtomicU64::new(0),
             dirs: AtomicU64::new(0),
             notice: watch::Sender::new(None),
@@ -219,7 +242,7 @@ impl Handles {
     pub fn reserve(&self, fh: u64) -> Result<Slot<'_>, ErrorReserve> {
         let held = {
             let map = self.map.lock();
-            if self.released.lock().contains(&fh) {
+            if self.released.lock().contains(fh) {
                 tracing::debug!(fh, "an open under an id the client has released is refused");
                 return Err(ErrorReserve::Released);
             }
@@ -263,19 +286,11 @@ impl Handles {
         self.map.lock().get(&fh).cloned().ok_or(Errno::EBADF)
     }
 
-    /// Close the handle under `fh`; an `fh` with none is remembered, so that an open still on its way under it is refused.
+    /// Close the handle under `fh`, and remember the id: the client never opens one again once it has released it, so an open under it still on its way (one it gave up on, or a retry of one whose original has just been released) is refused.
     pub fn remove(&self, fh: u64) -> Option<Handle> {
         let mut map = self.map.lock();
-        let Some(handle) = map.remove(&fh) else {
-            let mut released = self.released.lock();
-            if !released.contains(&fh) {
-                if released.len() == RELEASED_KEPT {
-                    released.pop_front();
-                }
-                released.push_back(fh);
-            }
-            return None;
-        };
+        self.released.lock().record(fh);
+        let handle = map.remove(&fh)?;
         self.pool.give(1);
         self.count(&handle).fetch_sub(1, Ordering::Relaxed);
         // Back under half its share, a session is reported afresh when it next crosses it; a session hovering at its share is not.
@@ -353,6 +368,34 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_of_an_open_already_released_keeps_nothing() {
+        let pool = Arc::new(HandlePool::new(8));
+        let handles = Handles::new(8, pool.clone());
+        handles.insert(3, file_handle()).unwrap();
+        assert!(
+            handles.remove(3).is_some(),
+            "the original landed and was released"
+        );
+        assert_eq!(handles.reserve(3).err(), Some(ErrorReserve::Released));
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn a_retried_open_whose_handle_was_released_long_ago_keeps_nothing() {
+        let pool = Arc::new(HandlePool::new(8));
+        let handles = Handles::new(8, pool.clone());
+        handles.insert(3, file_handle()).unwrap();
+        let retried = handles.reserve(3).unwrap();
+        assert!(handles.remove(3).is_some());
+        for fh in 100..100 + RELEASED_KEPT as u64 {
+            handles.remove(fh);
+        }
+        assert_eq!(retried.insert(file_handle()), Err(ErrorReserve::Released));
+        assert!(handles.is_empty());
+        assert_eq!(pool.used(), 0, "no handle without a slot");
+    }
+
+    #[test]
     fn only_the_most_recent_releases_are_remembered() {
         let handles = Handles::new(8, Arc::new(HandlePool::new(8)));
         for fh in 0..=RELEASED_KEPT as u64 {
@@ -414,7 +457,7 @@ mod tests {
                         if i % 3 == 0 {
                             table.remove(fh);
                         } else {
-                            // A full pool is part of what is exercised; an id released while nothing was open under it is refused from then on, as a client's would be.
+                            // A full pool is part of what is exercised; an id released is refused from then on, as a client's would be.
                             match table.insert(fh, file_handle()) {
                                 Ok(_) | Err(ErrorReserve::PoolFull | ErrorReserve::Released) => {}
                             }
@@ -465,10 +508,10 @@ mod tests {
             .filter_map(|fh| handles.insert(fh, file_handle()).unwrap())
             .collect();
         assert_eq!(again, [4]);
-        // Hovering at the share, opening and closing one, reports nothing more.
-        for _ in 0..5 {
-            handles.remove(42);
-            assert_eq!(handles.insert(42, file_handle()).unwrap(), None);
+        // Hovering at the share, closing one and opening another, reports nothing more.
+        for fh in 42..47 {
+            handles.remove(fh);
+            assert_eq!(handles.insert(fh + 1, file_handle()).unwrap(), None);
         }
     }
 
