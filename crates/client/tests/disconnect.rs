@@ -48,6 +48,10 @@ use Class::*;
 
 enum Expect {
     Pass,
+    #[expect(
+        dead_code,
+        reason = "every cell passes; one found failing is listed with this until it is fixed"
+    )]
     Fail(&'static [Class], &'static str),
 }
 
@@ -617,9 +621,11 @@ struct Run {
     original: Option<Option<i32>>,
     /// Why the gate let the original go before the follow-up was done, if it did.
     early: Option<Early>,
-    /// The server's `request_superseded` and `request_held` counts.
+    /// The server's `request_superseded`, `request_held`, `request_cancelled` and `request_abandoned` counts.
     superseded: u64,
     held: u64,
+    cancelled: u64,
+    abandoned: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -819,9 +825,11 @@ async fn run(case: Case, order: Order) -> Option<Run> {
     let handles = totals.files + totals.dirs;
     let pool = server.server.sessions.pool().used();
     let after = snapshot(export.path());
-    let (superseded, held) = (
+    let (superseded, held, cancelled, abandoned) = (
         count(&server, "request_superseded"),
         count(&server, "request_held"),
+        count(&server, "request_cancelled"),
+        count(&server, "request_abandoned"),
     );
     client.shutdown().await;
     server.stop().await;
@@ -836,6 +844,8 @@ async fn run(case: Case, order: Order) -> Option<Run> {
         early,
         superseded,
         held,
+        cancelled,
+        abandoned,
     })
 }
 
@@ -918,7 +928,7 @@ async fn cell(case: Case, fault: Fault, expect: Expect) {
     let faulted = run(case, Order::Faulted(fault)).await.unwrap();
     let classes = judge(&faulted, &a, &b);
     println!(
-        "{case:?} {fault:?}: op {:?} (A {:?}), follow-up {:?}, before {:?}, after {:?}, original {:?}, early {:?}, superseded {} held {}, handles {} pool {} => {classes:?}",
+        "{case:?} {fault:?}: op {:?} (A {:?}), follow-up {:?}, before {:?}, after {:?}, original {:?}, early {:?}, superseded {} held {} cancelled {} abandoned {}, handles {} pool {} => {classes:?}",
         faulted.op.as_ref().unwrap(),
         a.op.as_ref().unwrap(),
         faulted.follow,
@@ -928,6 +938,8 @@ async fn cell(case: Case, fault: Fault, expect: Expect) {
         faulted.early,
         faulted.superseded,
         faulted.held,
+        faulted.cancelled,
+        faulted.abandoned,
         faulted.handles,
         faulted.pool,
     );
@@ -956,7 +968,31 @@ async fn cell(case: Case, fault: Fault, expect: Expect) {
                 );
                 assert!(faulted.held >= 1, "{case:?}: no request_held event");
             }
-            Fault::ReplyLost | Fault::Cancelled | Fault::CancelledRunning => {}
+            Fault::Cancelled => {
+                assert_eq!(
+                    faulted.original, None,
+                    "{case:?}: the original given up on before it began ran"
+                );
+                assert!(
+                    faulted.cancelled >= 1,
+                    "{case:?}: no request_cancelled event"
+                );
+            }
+            Fault::CancelledRunning => {
+                assert_eq!(
+                    faulted.abandoned, 1,
+                    "{case:?}: the original given up on while it ran was not fenced"
+                );
+                // A follow-up that makes no request has nothing to hold.
+                if faulted.follow != Observed::Ok("none".into()) {
+                    assert_eq!(
+                        faulted.early,
+                        Some(Early::Held),
+                        "{case:?}: the follow-up was not held for the original"
+                    );
+                }
+            }
+            Fault::ReplyLost => {}
         }
     }
     match expect {
@@ -1003,9 +1039,6 @@ macro_rules! grid {
     };
 }
 
-/// An interrupted call's request still runs on the server, after whatever the caller did next.
-const ABANDONED: &str = "the abandoned original lands after the follow-up";
-
 grid! {
     lookup(Case::Lookup) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
     getattr(Case::Getattr) { reply_lost: Pass, original_late: Pass, original_running: Pass, cancelled: Pass, cancelled_running: Pass }
@@ -1022,78 +1055,78 @@ grid! {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     write_append(Case::WriteAppend) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     setattr_size(Case::SetattrSize) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     setattr_mode(Case::SetattrMode) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     mknod(Case::Mknod) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     mkdir(Case::Mkdir) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     unlink(Case::Unlink) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     rmdir(Case::Rmdir) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     symlink(Case::Symlink) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     rename(Case::Rename) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     link(Case::Link) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     open(Case::Open) {
         reply_lost: Pass,
@@ -1134,43 +1167,43 @@ grid! {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     setxattr_create(Case::SetxattrCreate) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     setxattr_replace(Case::SetxattrReplace) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     removexattr(Case::Removexattr) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     fallocate(Case::Fallocate) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     copy_file_range(Case::CopyFileRange) {
         reply_lost: Pass,
         original_late: Pass,
         original_running: Pass,
-        cancelled: Fail(&[StateLate], ABANDONED),
-        cancelled_running: Fail(&[StateLate], ABANDONED),
+        cancelled: Pass,
+        cancelled_running: Pass,
     }
     opendir(Case::Opendir) {
         reply_lost: Pass,

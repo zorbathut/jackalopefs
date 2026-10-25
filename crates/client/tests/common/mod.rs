@@ -295,6 +295,8 @@ pub struct Blackhole {
     pub connections: Arc<Mutex<Vec<Connection>>>,
     /// STOP_SENDING codes received on swallowed request streams, i.e. cancellations the client made explicit.
     pub stops: Arc<Mutex<Vec<u64>>>,
+    /// RESET_STREAM codes received on swallowed request streams: the client giving up on a change, whose answer it waits for.
+    pub resets: Arc<Mutex<Vec<u64>>>,
     endpoint: Endpoint,
 }
 
@@ -354,10 +356,12 @@ impl Blackhole {
         let endpoint = Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stops = Arc::new(Mutex::new(Vec::new()));
+        let resets = Arc::new(Mutex::new(Vec::new()));
         let connections = Arc::new(Mutex::new(Vec::new()));
         let accept_endpoint = endpoint.clone();
         let seen = requests.clone();
         let seen_stops = stops.clone();
+        let seen_resets = resets.clone();
         let accepted = connections.clone();
         let hellos = Arc::new(hellos);
         tokio::spawn(async move {
@@ -365,6 +369,7 @@ impl Blackhole {
             while let Some(incoming) = accept_endpoint.accept().await {
                 let seen = seen.clone();
                 let seen_stops = seen_stops.clone();
+                let seen_resets = seen_resets.clone();
                 let answer = answer.clone();
                 let reply = hellos[count.min(hellos.len() - 1)].clone();
                 count += 1;
@@ -391,6 +396,7 @@ impl Blackhole {
                     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                         let seen = seen.clone();
                         let seen_stops = seen_stops.clone();
+                        let seen_resets = seen_resets.clone();
                         let answer = answer.clone();
                         tokio::spawn(async move {
                             let req = match read_frame::<_, Request>(&mut recv).await {
@@ -413,6 +419,11 @@ impl Blackhole {
                                     send.finish().unwrap();
                                 }
                                 None => {
+                                    tokio::spawn(async move {
+                                        if let Ok(Some(code)) = recv.received_reset().await {
+                                            seen_resets.lock().push(code.into_inner());
+                                        }
+                                    });
                                     if let Ok(Some(code)) = send.stopped().await {
                                         seen_stops.lock().push(code.into_inner());
                                     }
@@ -429,6 +440,7 @@ impl Blackhole {
             requests,
             connections,
             stops,
+            resets,
             endpoint,
         }
     }

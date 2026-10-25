@@ -2445,6 +2445,189 @@ async fn perf_counts_an_interrupt_with_its_phases() {
     client.shutdown().await;
 }
 
+/// `req` made for a kernel request of its own, which the test interrupts.
+fn call_interruptible(
+    client: &std::sync::Arc<jackalopefs_client::Client>,
+    req: Request,
+) -> (
+    std::sync::Arc<RequestKernel>,
+    tokio::task::JoinHandle<Result<jackalopefs_proto::Response, Error>>,
+) {
+    let kernel = RequestKernel::new(1);
+    let (caller, scoped) = (client.clone(), kernel.clone());
+    let pending =
+        tokio::spawn(async move { scoped.scope(async move { caller.call(req).await }).await });
+    (kernel, pending)
+}
+
+/// Interrupt `kernel`'s call and expect it to fail with `EINTR` at once.
+async fn interrupt_now(
+    kernel: &RequestKernel,
+    pending: tokio::task::JoinHandle<Result<jackalopefs_proto::Response, Error>>,
+) {
+    let started = Instant::now();
+    kernel.interrupt();
+    let err = tokio::time::timeout(Duration::from_secs(1), pending)
+        .await
+        .expect("an interrupted call returns at once")
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(err, Error::Interrupted), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+fn mkdir(n: &str) -> Request {
+    Request::Mkdir {
+        parent: Path::root(),
+        name: name(n),
+        mode: 0o755,
+    }
+}
+
+/// A change the call gives up on fails at once, and the connection's next change is not sent until the server has said what became of it, which this server never does; that wait can be given up on too, with nothing sent. The next connection carries the next change.
+#[tokio::test]
+async fn a_change_given_up_on_holds_the_connections_next_change() {
+    let blackhole = Blackhole::start().await;
+    let client = std::sync::Arc::new(
+        jackalopefs_client::Client::connect(blackhole.config(Duration::from_secs(5)))
+            .await
+            .unwrap(),
+    );
+    let sent = |n: &str| {
+        blackhole
+            .requests
+            .lock()
+            .iter()
+            .any(|r| matches!(r, Request::Mkdir { name: sent, .. } if *sent == name(n)))
+    };
+    let (first, pending) = call_interruptible(&client, mkdir("a"));
+    wait_for(
+        Duration::from_secs(3),
+        "the first change to be sent",
+        || sent("a").then_some(()),
+    )
+    .await;
+    interrupt_now(&first, pending).await;
+    wait_for(Duration::from_secs(3), "the change to be reset", || {
+        blackhole
+            .resets
+            .lock()
+            .contains(&u64::from(jackalopefs_proto::code_reset::CANCELLED))
+            .then_some(())
+    })
+    .await;
+    assert!(
+        blackhole.stops.lock().is_empty(),
+        "the client still reads what became of the change"
+    );
+
+    let (second, pending) = call_interruptible(&client, mkdir("b"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !sent("b"),
+        "a change went out before the server answered the cancel"
+    );
+    interrupt_now(&second, pending).await;
+    assert!(!sent("b"), "a change given up on while it waited was sent");
+
+    blackhole.connections.lock()[0].close(0u32.into(), b"test");
+    let caller = client.clone();
+    let third = tokio::spawn(async move { caller.call(mkdir("c")).await });
+    wait_for(
+        Duration::from_secs(5),
+        "the next connection to carry the next change",
+        || sent("c").then_some(()),
+    )
+    .await;
+    third.abort();
+    client.shutdown().await;
+}
+
+/// A change past its deadline is given up on as an interrupted one is: the server is asked what became of it, and the connection's next change waits for the answer, here until its own deadline, unsent.
+#[tokio::test]
+async fn a_change_past_its_deadline_holds_the_connections_next_change() {
+    let blackhole = Blackhole::start().await;
+    let mut cfg = blackhole.config(Duration::from_secs(5));
+    cfg.op_timeout = Some(Duration::from_millis(300));
+    let client = jackalopefs_client::Client::connect(cfg).await.unwrap();
+    let err = client.call(mkdir("a")).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    let err = client.call(mkdir("b")).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    let requests = blackhole.requests.lock().clone();
+    assert!(
+        matches!(&requests[..], [Request::Mkdir { name: sent, .. }] if *sent == name("a")),
+        "{requests:?}"
+    );
+    assert!(blackhole
+        .resets
+        .lock()
+        .contains(&u64::from(jackalopefs_proto::code_reset::CANCELLED)));
+    client.shutdown().await;
+}
+
+/// The server's count of the event `name`.
+fn server_count(server: &TestServer, name: &str) -> u64 {
+    server
+        .server
+        .perf
+        .events
+        .counts()
+        .into_iter()
+        .find_map(|(n, count)| (n == name).then_some(count))
+        .expect("the server counts that event")
+}
+
+/// A change held behind one the call gave up on while it ran can be given up on in turn: it fails at once and never runs, and the next change runs once the first is done.
+#[tokio::test]
+async fn a_change_held_behind_one_given_up_on_can_be_given_up_on_too() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let gate = Gate::install(&server);
+    let client = std::sync::Arc::new(server.client().await);
+    gate.arm("mkdir", Hold::Running);
+    let (first, pending) = call_interruptible(&client, mkdir("a"));
+    gate.wait_parked().await;
+    interrupt_now(&first, pending).await;
+    let (second, pending) = call_interruptible(&client, mkdir("b"));
+    wait_for(
+        Duration::from_secs(3),
+        "the second change to be held",
+        || {
+            let now = std::time::Instant::now() + jackalopefs_perf::stall::INFLIGHT_LISTED;
+            server
+                .server
+                .perf
+                .scan_pending(now, jackalopefs_perf::stall::ModeScan::Listed)
+                .expect("the in-flight table's lock is free")
+                .found
+                .iter()
+                .any(|(pending, _)| pending.phase == jackalopefs_server::perf::PhaseServer::Held)
+                .then_some(())
+        },
+    )
+    .await;
+    interrupt_now(&second, pending).await;
+    wait_for(
+        Duration::from_secs(3),
+        "the held change to be dropped",
+        || (server_count(&server, "request_cancelled") == 1).then_some(()),
+    )
+    .await;
+    assert_eq!(server_count(&server, "request_abandoned"), 1);
+    gate.release();
+    client.call(mkdir("c")).await.unwrap();
+    assert!(export.path().join("a").is_dir(), "the first change ran");
+    assert!(!export.path().join("b").exists(), "the second change ran");
+    assert!(export.path().join("c").is_dir());
+    client.shutdown().await;
+    server.stop().await;
+}
+
 /// What the stall watchdog reads off a kernel request: the call it is making, which phase that is in and on which connection and stream, and nothing once the call is over.
 #[tokio::test]
 async fn a_kernel_request_shows_where_its_call_stands() {

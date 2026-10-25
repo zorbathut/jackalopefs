@@ -179,6 +179,16 @@ struct HelloReply {
 }
 
 # One request per bidi stream. Paths are relative to the export root.
+#
+# A request that changes something (everything but the reads, fsync and the
+# releases) keeps the client's side of its stream open until the reply is
+# read: a client that gives up on it resets that side (code 2, cancelled) and
+# reads on, and the server answers by resetting its own side, code 4 (unrun:
+# it had not begun and never will) or 5 (fenced: it is running, and the
+# session's later changes wait for it), or with the reply if it was done; a
+# reset that arrived before the whole request did gets the stream finished
+# with no reply.
+# docs/design.md, "Streams", lists every reset code.
 struct Request {
   union {
     lookup :group { parent @0 :Path; name @1 :Data; }

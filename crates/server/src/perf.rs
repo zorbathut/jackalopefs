@@ -52,14 +52,16 @@ impl Outcome {
 /// Slowpath events, counted whether or not anything logs them; their detail is built only while a tap selects them or [`EVENT_TARGET`] is logged at `debug`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slowpath {
-    /// The client ended or reset a request stream before the request was complete, or before a change held behind its session's earlier connections could run: a call it interrupted or gave up on, or whose connection went.
+    /// The client ended or reset a request stream before the request was complete, or gave up on a change before it began, which was dropped unrun: a call it interrupted or gave up on, or whose connection went.
     RequestCancelled,
     /// A request stream failed otherwise before the request was read, usually with its connection.
     RequestStreamFailed,
     /// A request was not fully sent within the read timeout.
     RequestReadTimeout,
-    /// A change on a resumed session waited for changes still running from the session's earlier connections.
+    /// A change waited for changes still running that the client gave up on, or that came from the session's earlier connections.
     RequestHeld,
+    /// The client gave up on a change already running; the session's later changes wait for it.
+    RequestAbandoned,
     /// A change from a connection its session has since resumed on another was dropped unrun.
     RequestSuperseded,
     /// A reply could not be written: the client had given up on it, or the connection went.
@@ -89,6 +91,7 @@ impl Slowpath {
             Slowpath::RequestStreamFailed => "request_stream_failed",
             Slowpath::RequestReadTimeout => "request_read_timeout",
             Slowpath::RequestHeld => "request_held",
+            Slowpath::RequestAbandoned => "request_abandoned",
             Slowpath::RequestSuperseded => "request_superseded",
             Slowpath::ReplyUndelivered => "reply_undelivered",
             Slowpath::ReplyStalled => "reply_stalled",
@@ -109,6 +112,7 @@ impl Kind for Slowpath {
         Slowpath::RequestStreamFailed,
         Slowpath::RequestReadTimeout,
         Slowpath::RequestHeld,
+        Slowpath::RequestAbandoned,
         Slowpath::RequestSuperseded,
         Slowpath::ReplyUndelivered,
         Slowpath::ReplyStalled,
@@ -214,7 +218,7 @@ pub struct Snapshot {
 pub enum PhaseServer {
     /// Reading the request off its stream.
     Read,
-    /// A change on a resumed session, held behind those still running from its earlier connections.
+    /// A change held behind those still running that the client gave up on, or that came from the session's earlier connections.
     Held,
     /// Waiting for a blocking thread to run the operation on.
     Wait,
@@ -230,7 +234,9 @@ impl PhaseServer {
     pub fn name(self) -> &'static str {
         match self {
             PhaseServer::Read => "reading the request",
-            PhaseServer::Held => "held behind the session's earlier connections' changes",
+            PhaseServer::Held => {
+                "held behind changes given up on or from the session's earlier connections"
+            }
             PhaseServer::Wait => "waiting for a blocking thread",
             PhaseServer::Watch => "watching its directories",
             PhaseServer::Op => "in the filesystem",

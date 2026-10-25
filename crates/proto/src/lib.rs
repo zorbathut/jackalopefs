@@ -54,6 +54,10 @@ pub mod code_reset {
     pub const CANCELLED: u32 = 2;
     /// The request came on a connection its session has since resumed on another; it was dropped unrun.
     pub const SUPERSEDED: u32 = 3;
+    /// The client gave up on a change before it began, and it will not run.
+    pub const UNRUN: u32 = 4;
+    /// The client gave up on a change while it ran; the session's later changes wait for it.
+    pub const FENCED: u32 = 5;
 }
 
 /// UDP port the server listens on and the client connects to unless told otherwise.

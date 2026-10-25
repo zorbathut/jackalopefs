@@ -407,6 +407,7 @@ fn phase_of(p: &Pending) -> &'static str {
 fn phase_name(phase: PhaseCall) -> &'static str {
     match phase {
         PhaseCall::Wait => "waiting for a connection",
+        PhaseCall::Cancel => "waiting for the server to answer a cancel of an earlier change",
         PhaseCall::Open => "opening a stream",
         PhaseCall::Send => "sending",
         PhaseCall::Reply => "awaiting the reply",

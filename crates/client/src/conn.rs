@@ -55,6 +55,8 @@ pub struct Attached {
     pub conn_key: Option<u64>,
     pub root: KeyRoot,
     pub ids: IdMap,
+    /// Changes on this connection that a call gave up on, and the server has not yet said what became of; a change is sent only once there are none.
+    pub cancels: watch::Sender<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +314,7 @@ async fn run(
             conn_key,
             root: root.clone(),
             ids,
+            cancels: watch::Sender::new(0),
         });
         if state.send(ConnState::Connected(attached)).is_err() {
             break;
@@ -604,6 +607,8 @@ async fn reopen_handles(
                     &rec.reopen_request(fh),
                     &mut Timing::default(),
                     tapping,
+                    None,
+                    std::future::pending(),
                 ),
             )
             .await
@@ -663,6 +668,8 @@ async fn send_releases(
                 &release,
                 &mut Timing::default(),
                 tapping,
+                None,
+                std::future::pending(),
             )
             .await;
             (release, sent)

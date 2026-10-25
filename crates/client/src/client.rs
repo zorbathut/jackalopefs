@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{timeout_at, Instant};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -68,6 +68,8 @@ pub(crate) enum ErrorExchange {
     NotSent(String),
     Lost(String),
     Protocol(String),
+    /// The call stopped waiting for the reply.
+    GaveUp(Error),
 }
 
 impl From<ErrorExchange> for Error {
@@ -75,6 +77,7 @@ impl From<ErrorExchange> for Error {
         match e {
             ErrorExchange::NotSent(_) | ErrorExchange::Lost(_) => Error::Disconnected,
             ErrorExchange::Protocol(msg) => Error::Protocol(msg),
+            ErrorExchange::GaveUp(e) => e,
         }
     }
 }
@@ -93,6 +96,8 @@ pub struct RequestKernel {
 pub enum PhaseCall {
     /// For a usable connection.
     Wait,
+    /// For the server to say what became of an earlier change on the connection that a call gave up on; a change waits for that before it is sent.
+    Cancel,
     /// For a request stream; the server's limit on concurrent streams holds a call here while others are outstanding.
     Open,
     /// Writing the request, which flow control can hold up.
@@ -228,11 +233,24 @@ fn current_request() -> Option<Arc<RequestKernel>> {
     REQUEST_KERNEL.try_with(Arc::clone).ok()
 }
 
-/// `f` under an optional deadline.
-async fn within<T>(limit: Option<Duration>, f: impl Future<Output = T>) -> Result<T, Error> {
-    match limit {
-        Some(limit) => timeout(limit, f).await.map_err(|_| Error::Timeout),
-        None => Ok(f.await),
+/// The reason a call stops waiting for its reply, when one comes: the kernel interrupts the request it is made for, or the optional deadline passes.
+async fn give_up(kernel: Option<&RequestKernel>, limit: Option<Duration>) -> Error {
+    let interrupted = async {
+        match kernel {
+            Some(kernel) => kernel.interrupted().await,
+            None => std::future::pending().await,
+        }
+    };
+    let expired = async {
+        match limit {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        () = interrupted => Error::Interrupted,
+        () = expired => Error::Timeout,
     }
 }
 
@@ -251,24 +269,105 @@ async fn interruptible<T>(
     }
 }
 
-/// Owns a request's streams; dropping it before the reply arrived (a timeout, an interrupt) resets both directions so the server sees a cancellation rather than a clean end of stream.
-struct Streams {
+/// A request's send side. Dropped before it is done with (a timeout, an interrupt), it resets the side so the server sees a cancellation rather than a clean end of stream.
+struct SideSend {
     send: SendStream,
+    done: bool,
+}
+
+impl SideSend {
+    /// End the side cleanly, the request whole.
+    fn finish(&mut self) -> Result<(), quinn::ClosedStream> {
+        self.done = true;
+        self.send.finish()
+    }
+
+    /// Tell the server the call gave up on the request.
+    fn cancel(&mut self) {
+        self.done = true;
+        if let Err(e) = self.send.reset(code_reset::CANCELLED.into()) {
+            tracing::trace!("reset after cancel: {e}");
+        }
+    }
+}
+
+impl Drop for SideSend {
+    fn drop(&mut self) {
+        if !self.done {
+            self.cancel();
+        }
+    }
+}
+
+/// A request's receive side. Dropped before the reply was read, it stops the side so the server sees the call gave up.
+struct SideRecv {
     recv: RecvStream,
     done: bool,
 }
 
-impl Drop for Streams {
+impl Drop for SideRecv {
     fn drop(&mut self) {
         if self.done {
             return;
         }
-        if let Err(e) = self.send.reset(code_reset::CANCELLED.into()) {
-            tracing::trace!("reset after cancel: {e}");
-        }
         if let Err(e) = self.recv.stop(code_reset::CANCELLED.into()) {
             tracing::trace!("stop after cancel: {e}");
         }
+    }
+}
+
+/// A change on a connection that the call gave up on and the server has not yet said what became of, counted on the connection's [`Attached::cancels`] until dropped.
+struct CancelPending(watch::Sender<usize>);
+
+impl CancelPending {
+    fn count(cancels: &watch::Sender<usize>) -> CancelPending {
+        cancels.send_modify(|n| *n += 1);
+        CancelPending(cancels.clone())
+    }
+}
+
+impl Drop for CancelPending {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n -= 1);
+    }
+}
+
+/// Read the stream's end if it has already arrived, as it does with the reply the server finishes it after, without waiting for it: a receive side dropped before its end was read sends the server a STOP_SENDING.
+fn read_end_now(recv: &mut RecvStream) {
+    let mut byte = [0u8; 1];
+    let read = std::pin::pin!(recv.read(&mut byte));
+    let polled = read.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+    match polled {
+        std::task::Poll::Ready(Ok(Some(_))) => {
+            tracing::debug!("data after the reply on its stream")
+        }
+        std::task::Poll::Ready(Err(e)) => {
+            tracing::trace!("reply stream ended without finishing: {e}")
+        }
+        std::task::Poll::Ready(Ok(None)) | std::task::Poll::Pending => {}
+    }
+}
+
+/// What the server said became of a change the call gave up on, read from how its reply stream ended.
+fn verdict_of(read: &Result<(Vec<u8>, Result<Response, ErrorCodec>), ErrorCodec>) -> &'static str {
+    let reset = match read {
+        Ok((_, Ok(_))) => return "finished",
+        Ok((_, Err(_))) => return "undecodable",
+        Err(ErrorCodec::Io(io)) => io
+            .get_ref()
+            .and_then(|e| e.downcast_ref::<quinn::ReadError>()),
+        Err(_) => None,
+    };
+    match reset {
+        Some(quinn::ReadError::Reset(code)) if *code == code_reset::UNRUN.into() => "unrun",
+        Some(quinn::ReadError::Reset(code)) if *code == code_reset::FENCED.into() => "fenced",
+        Some(quinn::ReadError::Reset(code)) if *code == code_reset::SUPERSEDED.into() => {
+            "superseded"
+        }
+        _ if matches!(read, Err(ErrorCodec::Io(io)) if io.kind() == std::io::ErrorKind::UnexpectedEof) => {
+            "unread"
+        }
+        _ => "lost",
     }
 }
 
@@ -360,7 +459,10 @@ pub(crate) struct Tapping<'a> {
     pub conn: Option<u64>,
 }
 
-/// One request on one fresh bidi stream. When a tap captures this exchange ([`Hub::sample`]), it gets the request as sent and the reply as received, before any rewriting here, so its bytes are the server's.
+/// One request on one fresh bidi stream, until `give_up` says the call stops waiting. When a tap captures this exchange ([`Hub::sample`]), it gets the request as sent and the reply as received, before any rewriting here, so its bytes are the server's.
+///
+/// A change keeps its send side open until the reply is in, so that giving up on it can still reach the server: the side is reset, and the server answers by resetting its own, having dropped the change unrun or made the session's later changes wait for it, or with the reply if the change was done. That answer is waited for in the background, the change counted on `cancels` meanwhile; with no `cancels`, a change given up on is dropped like a read, both sides reset at once.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn exchange(
     conn: &Connection,
     root: &KeyRoot,
@@ -368,18 +470,21 @@ pub(crate) async fn exchange(
     req: &Request,
     timing: &mut Timing<'_>,
     tapping: Tapping<'_>,
+    cancels: Option<&watch::Sender<usize>>,
+    give_up: impl Future<Output = Error>,
 ) -> Result<Response, ErrorExchange> {
-    let (send, recv) = conn
-        .open_bi()
-        .await
-        .map_err(|e| ErrorExchange::NotSent(format!("cannot open a stream: {e}")))?;
+    tokio::pin!(give_up);
+    let opened = tokio::select! {
+        biased;
+        e = &mut give_up => return Err(ErrorExchange::GaveUp(e)),
+        opened = conn.open_bi() => opened,
+    };
+    let (send, recv) =
+        opened.map_err(|e| ErrorExchange::NotSent(format!("cannot open a stream: {e}")))?;
     let stream = u64::from(send.id());
     timing.stamp_opened(stream);
-    let mut streams = Streams {
-        send,
-        recv,
-        done: false,
-    };
+    let mut send = SideSend { send, done: false };
+    let recv = SideRecv { recv, done: false };
     let unique = timing.kernel.map(|kernel| kernel.unique);
     let tap_ids = || IdsEvent {
         session: Some(tapping.session),
@@ -398,25 +503,65 @@ pub(crate) async fn exchange(
         sampled.request(&frame[4..], || elided(req.with_data_elided()));
         sampled.outcome("not sent");
     }
-    streams
-        .send
-        .write_all(&frame)
-        .await
-        .map_err(|e| ErrorExchange::NotSent(format!("the stream failed: {e}")))?;
-    if let Err(e) = streams.send.finish() {
-        if let Some(sampled) = sampled.as_mut() {
-            sampled.outcome("lost");
+    tokio::select! {
+        biased;
+        e = &mut give_up => return Err(ErrorExchange::GaveUp(e)),
+        written = send.send.write_all(&frame) => {
+            written.map_err(|e| ErrorExchange::NotSent(format!("the stream failed: {e}")))?
         }
-        return Err(ErrorExchange::Lost(format!(
-            "cannot finish the request: {e}"
-        )));
+    }
+    let changes = req.changes();
+    if !changes {
+        if let Err(e) = send.finish() {
+            if let Some(sampled) = sampled.as_mut() {
+                sampled.outcome("lost");
+            }
+            return Err(ErrorExchange::Lost(format!(
+                "cannot finish the request: {e}"
+            )));
+        }
     }
     timing.stamp_sent(stream);
     // From here, a reply that never comes is the call giving up, unless the stream fails.
     if let Some(sampled) = sampled.as_mut() {
         sampled.outcome("abandoned");
     }
-    let (body, decoded) = match read_frame_body::<_, Response>(&mut streams.recv).await {
+    let mut reply = Box::pin(async move {
+        let mut recv = recv;
+        let read = read_frame_body::<_, Response>(&mut recv.recv).await;
+        recv.done = true;
+        if read.is_ok() {
+            read_end_now(&mut recv.recv);
+        }
+        read
+    });
+    let read = tokio::select! {
+        biased;
+        read = &mut reply => read,
+        e = &mut give_up => {
+            let Some(cancels) = cancels.filter(|_| changes) else {
+                return Err(ErrorExchange::GaveUp(e));
+            };
+            let pending = CancelPending::count(cancels);
+            send.cancel();
+            let op = req.op_name();
+            tokio::spawn(async move {
+                let read = reply.await;
+                let verdict = verdict_of(&read);
+                tracing::debug!(op, stream, verdict, "a change given up on was answered");
+                match (sampled, &read) {
+                    (Some(sampled), Ok((body, Ok(resp)))) => {
+                        sampled.reply(body, || elided(resp.with_data_elided()))
+                    }
+                    (Some(mut sampled), _) => sampled.outcome(verdict),
+                    (None, _) => {}
+                }
+                drop(pending);
+            });
+            return Err(ErrorExchange::GaveUp(e));
+        }
+    };
+    let (body, decoded) = match read {
         Ok(read) => read,
         Err(e) => {
             if let Some(sampled) = sampled.as_mut() {
@@ -441,7 +586,11 @@ pub(crate) async fn exchange(
         }
     };
     timing.replied = Some(Instant::now());
-    streams.done = true;
+    if changes {
+        if let Err(e) = send.finish() {
+            tracing::trace!("finishing a change's request after its reply: {e}");
+        }
+    }
     if let Some(sampled) = sampled {
         sampled.reply(&body, || elided(resp.with_data_elided()));
     }
@@ -627,7 +776,7 @@ impl Caller {
         result
     }
 
-    /// The exchange and its retries; every attempt's phases are added to `account`. The two waits have different clocks. The wait for a connection is bounded by the offline deadline, set once and renewed only for the one resend a lost reply gets, so a server that keeps accepting connections and failing streams cannot hold a call forever; it also ends when the outage itself has lasted the offline timeout, so through a long outage calls fail at once instead of each waiting out a deadline of its own. The exchange itself is bounded only by the optional operation deadline: a server slow to answer on a live connection is not an error, and the connection's own idle timeout fails the exchange if the server dies. Either wait ends early when the kernel interrupts the request the call is made for.
+    /// The exchange and its retries; every attempt's phases are added to `account`. The two waits have different clocks. The wait for a connection is bounded by the offline deadline, set once and renewed only for the one resend a lost reply gets, so a server that keeps accepting connections and failing streams cannot hold a call forever; it also ends when the outage itself has lasted the offline timeout, so through a long outage calls fail at once instead of each waiting out a deadline of its own. The exchange itself, with a change's wait for the server to answer the connection's earlier cancels, is bounded only by the optional operation deadline: a server slow to answer on a live connection is not an error, and the connection's own idle timeout fails the exchange if the server dies. Either wait ends early when the kernel interrupts the request the call is made for.
     async fn attempt(
         &self,
         req: &Request,
@@ -656,28 +805,44 @@ impl Caller {
             // Owners are put in server terms against the connection that carries the request, so a retry on the next one uses that one's.
             let mapped = attached.ids.outgoing(req)?;
             let sent = mapped.as_ref().unwrap_or(req);
+            let give_up = give_up(kernel, self.op_timeout);
+            tokio::pin!(give_up);
+            // A change goes out only once the server has said what became of every change this connection gave up on, so none of those can land after it.
+            if req.changes() && *attached.cancels.borrow() != 0 {
+                if let Some(kernel) = kernel {
+                    kernel.call_phase(PhaseCall::Cancel, Some(&attached), None);
+                }
+                let mut cancels = attached.cancels.subscribe();
+                let waiting = Instant::now();
+                let answered = tokio::select! {
+                    biased;
+                    e = &mut give_up => Err(e),
+                    answered = cancels.wait_for(|pending| *pending == 0) => {
+                        answered.expect("the connection's count lives as long as the connection");
+                        Ok(())
+                    }
+                };
+                account.phases.wait += waiting.elapsed();
+                answered?;
+            }
             if let Some(kernel) = kernel {
                 kernel.call_phase(PhaseCall::Open, Some(&attached), None);
             }
             let mut timing = Timing::for_kernel(kernel);
             let attempt = Instant::now();
-            let exchanged = interruptible(
-                kernel,
-                within(
-                    self.op_timeout,
-                    exchange(
-                        &attached.conn,
-                        &attached.root,
-                        &attached.ids,
-                        sent,
-                        &mut timing,
-                        Tapping {
-                            hub: &self.perf.hub,
-                            session: attached.session_id,
-                            conn: attached.conn_key,
-                        },
-                    ),
-                ),
+            let exchanged = exchange(
+                &attached.conn,
+                &attached.root,
+                &attached.ids,
+                sent,
+                &mut timing,
+                Tapping {
+                    hub: &self.perf.hub,
+                    session: attached.session_id,
+                    conn: attached.conn_key,
+                },
+                Some(&attached.cancels),
+                &mut give_up,
             )
             .await;
             account.phases += timing.phases(attempt);
@@ -686,9 +851,9 @@ impl Caller {
             account.conn = attached.conn_key;
             account.stream = timing.stream;
             match exchanged {
-                Ok(Ok(Response::Err(errno))) => return Err(Error::Remote(errno)),
-                Ok(Ok(resp)) => return Ok(resp),
-                Ok(Err(ErrorExchange::NotSent(cause))) => {
+                Ok(Response::Err(errno)) => return Err(Error::Remote(errno)),
+                Ok(resp) => return Ok(resp),
+                Err(ErrorExchange::NotSent(cause)) => {
                     event!(
                         target: EVENT_TARGET,
                         self.perf.events,
@@ -703,7 +868,7 @@ impl Caller {
                     );
                     min_generation = attached.generation + 1;
                 }
-                Ok(Err(ErrorExchange::Lost(cause))) => {
+                Err(ErrorExchange::Lost(cause)) => {
                     if lost_once || !retry_safe(req, &handles) {
                         return Err(Error::Disconnected);
                     }
@@ -723,8 +888,8 @@ impl Caller {
                     offline_deadline = Instant::now() + self.offline_timeout;
                     min_generation = attached.generation + 1;
                 }
-                Ok(Err(ErrorExchange::Protocol(msg))) => return Err(Error::Protocol(msg)),
-                Err(e) => return Err(e),
+                Err(ErrorExchange::Protocol(msg)) => return Err(Error::Protocol(msg)),
+                Err(ErrorExchange::GaveUp(e)) => return Err(e),
             }
             account.retries += 1;
             if let Some(kernel) = kernel {
