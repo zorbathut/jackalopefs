@@ -823,7 +823,7 @@ async fn timeout_against_a_blackhole_resets_and_releases() {
             blackhole
                 .stops
                 .lock()
-                .contains(&u64::from(jackalopefs_client::conn::close_code::CANCELLED))
+                .contains(&u64::from(jackalopefs_proto::code_reset::CANCELLED))
                 .then_some(())
         },
     )
@@ -2387,7 +2387,7 @@ async fn an_interrupt_abandons_a_pending_call() {
             blackhole
                 .stops
                 .lock()
-                .contains(&u64::from(jackalopefs_client::conn::close_code::CANCELLED))
+                .contains(&u64::from(jackalopefs_proto::code_reset::CANCELLED))
                 .then_some(())
         },
     )

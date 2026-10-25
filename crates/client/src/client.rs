@@ -1,6 +1,6 @@
 //! The typed request API. A request on a live connection is waited for as long as that connection lives, or up to an optional deadline; only the wait for a connection is always bounded. A call whose reply was lost to a dropped connection is retried once on the next connection only when that is safe, and a call made for a kernel request is abandoned when the kernel interrupts that request.
 
-use crate::conn::{close_code, Attached, ConfigConn, ConnManager, ConnState};
+use crate::conn::{Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::Opener;
 use crate::handles::{HandleKind, HandleRec, HandleTable};
 use crate::ids::{IdMap, ModeIds};
@@ -12,8 +12,8 @@ use jackalopefs_perf::hub::{elided, Hub, IdsEvent, Side};
 use jackalopefs_perf::stall::ErrorLockHeld;
 use jackalopefs_proto::control::{Ids, Summary};
 use jackalopefs_proto::{
-    encode, read_frame_body, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name, Path,
-    Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
+    code_reset, encode, read_frame_body, Attr, Auth, DirEntry, ErrorCodec, Event, Identity, Name,
+    Path, Request, Response, SetAttr, Statfs, Whence, MAX_FALLOCATE,
 };
 use quinn::{Connection, RecvStream, SendStream};
 use std::future::Future;
@@ -263,10 +263,10 @@ impl Drop for Streams {
         if self.done {
             return;
         }
-        if let Err(e) = self.send.reset(close_code::CANCELLED.into()) {
+        if let Err(e) = self.send.reset(code_reset::CANCELLED.into()) {
             tracing::trace!("reset after cancel: {e}");
         }
-        if let Err(e) = self.recv.stop(close_code::CANCELLED.into()) {
+        if let Err(e) = self.recv.stop(code_reset::CANCELLED.into()) {
             tracing::trace!("stop after cancel: {e}");
         }
     }

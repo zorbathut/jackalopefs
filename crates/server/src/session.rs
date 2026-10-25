@@ -15,8 +15,8 @@ use jackalopefs_perf::{
 };
 use jackalopefs_proto::control::{HandlesSession, HandlesTotals, Summary};
 use jackalopefs_proto::{
-    encode, read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply,
-    NoticeHandles, Request, Response, PROTO_REVISION,
+    code_reset, encode, read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello,
+    HelloReply, NoticeHandles, Request, Response, PROTO_REVISION,
 };
 use parking_lot::Mutex;
 use quinn::{Connection, RecvStream, SendStream};
@@ -138,41 +138,6 @@ impl Drop for GuardChange {
             drop(attachment);
             self.session.drained.notify_waiters();
         }
-    }
-}
-
-/// Whether a request can change what a later one finds: everything but the reads, which may run in any order. A late `fsync` changes nothing either.
-fn changes(req: &Request) -> bool {
-    match req {
-        Request::Lookup { .. }
-        | Request::Getattr { .. }
-        | Request::Readlink { .. }
-        | Request::Read { .. }
-        | Request::Readdir { .. }
-        | Request::Getxattr { .. }
-        | Request::Listxattr { .. }
-        | Request::Access { .. }
-        | Request::Statfs { .. }
-        | Request::Lseek { .. }
-        | Request::Fsync { .. } => false,
-        Request::Setattr { .. }
-        | Request::Mknod { .. }
-        | Request::Mkdir { .. }
-        | Request::Unlink { .. }
-        | Request::Rmdir { .. }
-        | Request::Symlink { .. }
-        | Request::Rename { .. }
-        | Request::Link { .. }
-        | Request::Open { .. }
-        | Request::Create { .. }
-        | Request::Write { .. }
-        | Request::Release { .. }
-        | Request::Opendir { .. }
-        | Request::Releasedir { .. }
-        | Request::Setxattr { .. }
-        | Request::Removexattr { .. }
-        | Request::CopyFileRange { .. }
-        | Request::Fallocate { .. } => true,
     }
 }
 
@@ -1076,7 +1041,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
         sampled.request(&body, || elided(req.with_data_elided()));
     }
     drop(body);
-    let changing = changes(&req);
+    let changing = req.changes();
     let older = if changing {
         serving.session.older_running(serving.epoch)
     } else {
@@ -1189,7 +1154,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
                     inflight.subject().unwrap_or_default()
                 )
             );
-            if let Err(e) = send.reset(close_code::SUPERSEDED.into()) {
+            if let Err(e) = send.reset(code_reset::SUPERSEDED.into()) {
                 tracing::debug!(op, "reset of a superseded request: {e}");
             }
             serving
@@ -1262,7 +1227,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
                     fmt_duration(REPLY_WRITE_TIMEOUT)
                 )
             );
-            if let Err(e) = send.reset(close_code::EVENT_STREAM_STALLED.into()) {
+            if let Err(e) = send.reset(code_reset::STALLED.into()) {
                 tracing::debug!(op, "reset after stalled reply: {e}");
             }
         }
@@ -1506,39 +1471,5 @@ mod tests {
         );
         assert!(state.begin(first).is_none() && state.begin(second).is_none());
         drop(old);
-    }
-
-    #[test]
-    fn only_requests_that_change_something_are_ordered() {
-        let path = jackalopefs_proto::Path::root();
-        assert!(changes(&Request::Write {
-            fh: 1,
-            offset: 0,
-            data: Vec::new()
-        }));
-        assert!(changes(&Request::Setattr {
-            path: None,
-            fh: Some(1),
-            set: Default::default()
-        }));
-        assert!(changes(&Request::Open {
-            fh: 1,
-            path: path.clone(),
-            flags: libc::O_RDONLY
-        }));
-        assert!(changes(&Request::Release { fh: 1 }));
-        assert!(!changes(&Request::Read {
-            fh: 1,
-            offset: 0,
-            size: 1
-        }));
-        assert!(!changes(&Request::Fsync {
-            fh: 1,
-            datasync: false
-        }));
-        assert!(!changes(&Request::Getattr {
-            path: Some(path),
-            fh: None
-        }));
     }
 }

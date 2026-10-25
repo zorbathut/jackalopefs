@@ -231,6 +231,41 @@ impl Request {
         }
     }
 
+    /// Whether a request can change what a later one finds: everything but the reads, which may run in any order. A late `fsync` changes nothing either.
+    pub fn changes(&self) -> bool {
+        match self {
+            Request::Lookup { .. }
+            | Request::Getattr { .. }
+            | Request::Readlink { .. }
+            | Request::Read { .. }
+            | Request::Readdir { .. }
+            | Request::Getxattr { .. }
+            | Request::Listxattr { .. }
+            | Request::Access { .. }
+            | Request::Statfs { .. }
+            | Request::Lseek { .. }
+            | Request::Fsync { .. } => false,
+            Request::Setattr { .. }
+            | Request::Mknod { .. }
+            | Request::Mkdir { .. }
+            | Request::Unlink { .. }
+            | Request::Rmdir { .. }
+            | Request::Symlink { .. }
+            | Request::Rename { .. }
+            | Request::Link { .. }
+            | Request::Open { .. }
+            | Request::Create { .. }
+            | Request::Write { .. }
+            | Request::Release { .. }
+            | Request::Opendir { .. }
+            | Request::Releasedir { .. }
+            | Request::Setxattr { .. }
+            | Request::Removexattr { .. }
+            | Request::CopyFileRange { .. }
+            | Request::Fallocate { .. } => true,
+        }
+    }
+
     /// This request with the data it carries cut out, and how much that was; `None` when it carries none. For frame captures that leave file contents out.
     pub fn with_data_elided(&self) -> Option<(Request, u64)> {
         match self {
@@ -482,6 +517,46 @@ mod tests {
 
     fn path(s: &str) -> Path {
         Path::from_names(s.split('/').map(|n| Name::new(n).unwrap()).collect()).unwrap()
+    }
+
+    #[test]
+    fn only_requests_that_change_something_are_ordered() {
+        let path = Path::root();
+        assert!(Request::Write {
+            fh: 1,
+            offset: 0,
+            data: Vec::new()
+        }
+        .changes());
+        assert!(Request::Setattr {
+            path: None,
+            fh: Some(1),
+            set: Default::default()
+        }
+        .changes());
+        assert!(Request::Open {
+            fh: 1,
+            path: path.clone(),
+            flags: 0
+        }
+        .changes());
+        assert!(Request::Release { fh: 1 }.changes());
+        assert!(!Request::Read {
+            fh: 1,
+            offset: 0,
+            size: 1
+        }
+        .changes());
+        assert!(!Request::Fsync {
+            fh: 1,
+            datasync: false
+        }
+        .changes());
+        assert!(!Request::Getattr {
+            path: Some(path),
+            fh: None
+        }
+        .changes());
     }
 
     #[test]

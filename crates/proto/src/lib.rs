@@ -46,6 +46,16 @@ pub const PROTO_REVISION: u64 = fnv1a(include_bytes!("../schema/jackalopefs.capn
 /// The revision of the control protocol (`schema/control.capnp`) between a process and `jackalopefs-ctl`, carried in every control request and checked by the process: the hash of that file, independent of [`PROTO_REVISION`].
 pub const CONTROL_REVISION: u64 = fnv1a(include_bytes!("../schema/control.capnp"));
 
+/// Application error codes in RESET_STREAM and STOP_SENDING on a request stream, which both ends read; connection close codes are each side's own.
+pub mod code_reset {
+    /// The server's reply went unread for too long.
+    pub const STALLED: u32 = 1;
+    /// The client gave up on the request.
+    pub const CANCELLED: u32 = 2;
+    /// The request came on a connection its session has since resumed on another; it was dropped unrun.
+    pub const SUPERSEDED: u32 = 3;
+}
+
 /// UDP port the server listens on and the client connects to unless told otherwise.
 pub const DEFAULT_PORT: u16 = 1933;
 

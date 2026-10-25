@@ -27,7 +27,6 @@ const BIND_V6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0
 /// Application error codes sent in CONNECTION_CLOSE.
 pub mod close_code {
     pub const UNMOUNT: u32 = 0;
-    pub const CANCELLED: u32 = 3;
 }
 
 #[derive(Clone, Debug)]
