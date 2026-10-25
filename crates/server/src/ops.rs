@@ -2,7 +2,7 @@
 
 use crate::dirents::read_dir_fd;
 use crate::export::{kind_from_mode, proc_path, Export};
-use crate::handles::{ErrorReserve, Handle, Handles};
+use crate::handles::{ErrorReserve, Handle, Handles, Reserved};
 use crate::ids::IdMap;
 use crate::perf::{Slowpath, EVENT_TARGET};
 use crate::watch::{parent_of, ChangeLog, Watches};
@@ -133,7 +133,7 @@ impl From<ErrorReserve> for Failure {
     fn from(e: ErrorReserve) -> Failure {
         match e {
             ErrorReserve::PoolFull => Failure::PoolFull,
-            ErrorReserve::Released => Failure::Errno(Errno::EBADF),
+            ErrorReserve::Released | ErrorReserve::Duplicate => Failure::Errno(Errno::EBADF),
         }
     }
 }
@@ -240,6 +240,15 @@ impl Ops {
             op: Some(op),
             ..IdsEvent::default()
         }
+    }
+
+    /// The answer to a resent open whose original kept `handle`: its attributes, with nothing opened again.
+    fn opened_already(&self, handle: &Handle) -> Result<Response, Failure> {
+        let attr = match handle {
+            Handle::File { file, .. } => self.attr_of(&**file)?,
+            Handle::Dir { dir, .. } => self.attr_of(&*dir.lock())?,
+        };
+        Ok(Response::Opened { attr })
     }
 
     /// Report a session whose newly kept handle crossed a threshold of its share ([`Slot::insert`](crate::handles::Slot::insert)).
@@ -436,7 +445,10 @@ impl Ops {
                 Ok(Response::Entry(self.attr_in(&new_dir, &newname)?))
             }
             Request::Open { fh, path, flags } => {
-                let slot = self.handles.reserve(fh)?;
+                let slot = match self.handles.reserve(fh)? {
+                    Reserved::Slot(slot) => slot,
+                    Reserved::Held(handle) => return self.opened_already(&handle),
+                };
                 let flags = open_flags(flags, false);
                 if flags.contains(OFlag::O_TRUNC) {
                     self.changes.record(&path, self.session_id);
@@ -462,7 +474,10 @@ impl Ops {
                 mode,
                 flags,
             } => {
-                let slot = self.handles.reserve(fh)?;
+                let slot = match self.handles.reserve(fh)? {
+                    Reserved::Slot(slot) => slot,
+                    Reserved::Held(handle) => return self.opened_already(&handle),
+                };
                 self.changes.record_entry(&parent, &name, self.session_id);
                 let fd = self.export.open_in(
                     &parent,
@@ -597,7 +612,10 @@ impl Ops {
                 Ok(Response::Ok)
             }
             Request::Opendir { fh, path } => {
-                let slot = self.handles.reserve(fh)?;
+                let slot = match self.handles.reserve(fh)? {
+                    Reserved::Slot(slot) => slot,
+                    Reserved::Held(handle) => return self.opened_already(&handle),
+                };
                 let fd = self
                     .export
                     .open_node(&path, OFlag::O_RDONLY | OFlag::O_DIRECTORY)?;
@@ -1006,6 +1024,36 @@ mod tests {
             Response::Err(Errno::EBADF as i32)
         );
         assert_eq!(fs::read(dir.path().join("kept")).unwrap(), b"contents");
+        assert!(ops.handles.is_empty());
+    }
+
+    /// A resend of an open whose original ran and whose reply was lost gets the original's handle, even when the path no longer opens: the client takes an errno as "never opened" and would release nothing.
+    #[test]
+    fn a_resent_open_answers_from_the_handle_its_original_kept() {
+        let (dir, ops) = fixture();
+        fs::write(dir.path().join("f"), b"contents").unwrap();
+        let open = || Request::Open {
+            fh: 1,
+            path: path("f"),
+            flags: libc::O_RDWR,
+        };
+        let original = expect_attr(dispatch(&ops, open()));
+        fs::remove_file(dir.path().join("f")).unwrap();
+        let resent = expect_attr(dispatch(&ops, open()));
+        assert_eq!(resent.ino, original.ino);
+        assert_eq!(ops.handles.len(), 1);
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Read {
+                    fh: 1,
+                    offset: 0,
+                    size: 100
+                }
+            ),
+            Response::Read(b"contents".to_vec())
+        );
+        assert_eq!(dispatch(&ops, Request::Release { fh: 1 }), Response::Ok);
         assert!(ops.handles.is_empty());
     }
 
@@ -1951,7 +1999,7 @@ mod tests {
         );
         assert!(
             matches!(dispatch(&ops, open(1)), Response::Opened { .. }),
-            "replacing an existing id is still allowed"
+            "a resend under an id already held answers from its handle, full pool or not"
         );
         assert_eq!(dispatch(&ops, Request::Release { fh: 1 }), Response::Ok);
         assert_eq!(pool.used(), 1);

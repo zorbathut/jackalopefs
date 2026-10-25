@@ -87,7 +87,7 @@ module session_small {
     .then(finish(1, false)).expect(reqs.get(1).answer == ErrnoReply)
     .then(receive(1)).expect(conns.get(1).cancels == 0 and seenRefused and quiescent and okSoFar)
 
-  /// The hovering race: a retried open keeps the entry's slot, the entry is released while the retry is open, and the retry is refused rather than kept under a released id.
+  /// The hovering race: a retried open finds the original's entry, the entry is released while the retry runs, and the retry, answering from what it found, keeps nothing.
   run hoveringTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1)
     .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect)
@@ -98,7 +98,7 @@ module session_small {
     .then(receive(3))
     .then(finish(2, false)).expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
 
-  /// The hovering race once the window has forgotten the id: `insert`'s guard on a kept slot whose entry is gone refuses the retry, and the pool count stays right.
+  /// The hovering race once the window has forgotten the id: the retry still keeps nothing, and the pool count stays right.
   run forgottenGuardTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false))
     .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect)
@@ -108,14 +108,14 @@ module session_small {
     .then(releasedForget(1, 1)).expect(sessions.get(1).released == Set())
     .then(finish(2, false)).expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
 
-  /// G3: the original open was kept, its reply lost; the resend fails with an errno, the caller takes that as final, and the original's handle stays. S3 allows for it; S3 without the allowance does not.
-  run g3Test = init
+  /// The original open was kept and its reply lost; the resend finds the original's handle under the id and answers from it, opening nothing (it cannot fail with an errno as opening again could), and the client holds what the server holds.
+  run resentOpenTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1))
     .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect)
     .then(send(1)).then(arrive(2)).then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1)
-    .then(drain(2)).then(begin(2)).expect(reqs.get(2).slot == Kept)
-    .then(finish(2, true)).then(receive(2)).expect(calls.get(1).outcome == Errno and client.held.get(1) == 0)
-    .expect(quiescent and S3 and not(S3noG3) and S3noG4 and S3noG5 and okSoFar)
+    .then(drain(2)).then(begin(2)).expect(reqs.get(2).slot == Kept and pool == 1)
+    .then(finish(2, false)).then(receive(2)).expect(calls.get(1).outcome == Replied and client.held.get(1) == 2 and sessions.get(1).handles.get(1).by == 1)
+    .expect(quiescent and S3 and S3noG4 and S3noG5 and okSoFar)
 
   /// G4: an open given up on while it ran, its orphan release landing first and the window then forgetting the id, so the open lands and keeps its handle. S3 allows for it; S3 without the allowance does not.
   run g4Test = init
@@ -123,14 +123,14 @@ module session_small {
     .then(giveUp(1)).then(seeCancel(1)).then(receive(1)).expect(phaseOf(1) == Abandoned)
     .then(orphanSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(sessions.get(1).released == Set(1))
     .then(releasedForget(1, 1)).expect(sessions.get(1).released == Set())
-    .then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1 and sessions.get(1).handles.get(1).evicted and quiescent and S3 and not(S3noG4) and S3noG3 and okSoFar)
+    .then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1 and sessions.get(1).handles.get(1).evicted and quiescent and S3 and not(S3noG4) and okSoFar)
 
   /// G5: a release given up on before its frame was written is owed, and nothing sends it until the session next resumes, while the server holds the handle. S3 allows for it; without the allowance it fails until the resume sends the release.
   run g5Test = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1)).expect(client.held.get(1) == 1)
     .then(start(2, Release(1), true)).expect(client.held.get(1) == 0)
     .then(giveUp(2)).expect(client.owed == Set(1) and calls.get(2).outcome == GaveUp)
-    .expect(quiescent and S3 and not(S3noG5) and S3noG3 and okSoFar)
+    .expect(quiescent and S3 and not(S3noG5) and okSoFar)
     .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect).expect(conns.get(2).owedToSend == Set(1))
     .then(owedSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(client.owed == Set() and sessions.get(1).handles.get(1).by == 0 and quiescent and S3noG5 and okSoFar)
 

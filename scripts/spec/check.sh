@@ -8,7 +8,7 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 SPEC=$ROOT/spec
 APALACHE_VERSION=0.62.1
 MUST_HOLD="S1 S2 S3 S3identity countsConsistent poolConsistent aliveIsCurrent"
-MUST_FAIL="S1strong S3noG3 S3noG4 S3noG5"
+MUST_FAIL="S1strong S3noG4 S3noG5"
 WITNESSES="neverFenced neverSuperseded neverResendRan neverTakeover neverRefused neverOrphanRan neverReopenSettled neverOwedSettled neverQuiescentHolding"
 # The fewest states TLC may report for the tiny instance: a model change that collapses the state space would otherwise pass as "no violation".
 TINY_STATES_AT_LEAST=10000000

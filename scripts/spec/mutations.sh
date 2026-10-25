@@ -62,15 +62,15 @@ mutate resume_forgets_running S1 \
 mutate begin_ignores_epoch S2 \
   'if (orderedReq(q) and ses.epoch != q.epoch) all {' \
   'if (false) all {'
-mutate opens_unordered S3identity \
+mutate opens_unordered S3 \
   'pure def ordered(kind: Kind): bool = match kind { Release(_) => false | _ => true }' \
   'pure def ordered(kind: Kind): bool = match kind { Change => true | _ => false }'
 mutate no_released_window S3 \
-  'q.slot == Refused or errno or ses.released.contains(fh) or (q.slot == Kept and ses.handles.get(fh).by == 0)' \
-  'q.slot == Refused or errno or (q.slot == Kept and ses.handles.get(fh).by == 0)'
-mutate insert_without_kept_guard poolConsistent \
-  'q.slot == Refused or errno or ses.released.contains(fh) or (q.slot == Kept and ses.handles.get(fh).by == 0)' \
-  'q.slot == Refused or errno or ses.released.contains(fh)'
+  'q.slot == Refused or errno or ses.released.contains(fh) or ses.handles.get(fh).by != 0' \
+  'q.slot == Refused or errno or ses.handles.get(fh).by != 0'
+mutate resend_opens_again S3 \
+  'else if (ses.handles.get(fh).by != 0) Kept' \
+  'else if (false) Kept'
 
 echo
 if [[ $failures -eq 0 ]]; then echo "every mutation was caught"; else echo "$failures mutation(s) not caught"; exit 1; fi

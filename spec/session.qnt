@@ -577,7 +577,7 @@ module session {
     }
   }
 
-  /// `Handles::reserve`, as the open begins: refused if the id was released and is still remembered, else the slot of the entry already under the id, else a slot of the pool.
+  /// `Handles::reserve`, as the open begins: refused if the id was released and is still remembered, else the entry already under the id (`Reserved::Held`: a resend whose original kept it, which answers from it and opens nothing), else a slot of the pool.
   def reserve(q: Req): Slot = {
     val ses = sessions.get(q.session)
     val fh = fhOf(q)
@@ -612,21 +612,19 @@ module session {
     }
   }
 
-  /// `Slot::insert` refuses, giving the slot back, when the id was released meanwhile and is still remembered, or when the entry a retried open relied on is gone; before that, the open itself may have failed with an errno (`errno`), or `reserve` refused it.
+  /// `Slot::insert` refuses, giving the slot back, when the id was released meanwhile and is still remembered, or when another open of the id got there first; before that, the open itself may have failed with an errno (`errno`), or `reserve` refused it. Not asked of a `Kept` open, which inserts nothing.
   def insertRefused(ses: Session, q: Req, errno: bool): bool = {
     val fh = fhOf(q)
-    q.slot == Refused or errno or ses.released.contains(fh) or (q.slot == Kept and ses.handles.get(fh).by == 0)
+    q.slot == Refused or errno or ses.released.contains(fh) or ses.handles.get(fh).by != 0
   }
 
-  /// `Slot::insert`: the entry is kept under the id, replacing one already there and giving the second slot back; refused, the slot taken is given back. The entry notes whether the id had been released and then forgotten (G4).
+  /// `Slot::insert`: the entry is kept under the id, the slot becoming its; refused, the slot is given back. A `Kept` open changes nothing. The entry notes whether the id had been released and then forgotten (G4).
   def inserted(ses: Session, q: Req, r: int, errno: bool): (Session, int) = {
     val fh = fhOf(q)
     val taken = if (q.slot == Taken) 1 else 0
-    if (insertRefused(ses, q, errno)) Tup(ses, pool - taken)
-    else Tup(
-      ses.with("handles", ses.handles.set(fh, { by: r, evicted: ses.releasedEver.contains(fh) and not(ses.released.contains(fh)) })),
-      if (ses.handles.get(fh).by != 0) pool - taken else pool
-    )
+    if (q.slot == Kept) Tup(ses, pool)
+    else if (insertRefused(ses, q, errno)) Tup(ses, pool - taken)
+    else Tup(ses.with("handles", ses.handles.set(fh, { by: r, evicted: ses.releasedEver.contains(fh) and not(ses.released.contains(fh)) })), pool)
   }
 
   /// `Handles::remove`: the id is remembered, and the handle under it, if any, closed and its slot given back; a release of an unknown handle is no error.
@@ -638,11 +636,11 @@ module session {
     )
   }
 
-  /// The work ends, with a reply or an errno (an open refused at `reserve` or at `insert` with EBADF), and `GuardChange::drop` uncounts the change under the epoch it began at; one given up on sends no reply, but its work stands. The reply goes nowhere on a connection the server has lost.
+  /// The work ends, with a reply or an errno (an open refused at `reserve` or at `insert` with EBADF; a release, or an open answered from the handle under its id, never fails), and `GuardChange::drop` uncounts the change under the epoch it began at; one given up on sends no reply, but its work stands. The reply goes nowhere on a connection the server has lost.
   action finish(r: int, errno: bool): bool = {
     val q = reqs.get(r)
     val ses = sessions.get(q.session)
-    val failed = errno or (opensReq(q) and insertRefused(ses, q, errno))
+    val failed = errno or (opensReq(q) and q.slot != Kept and insertRefused(ses, q, errno))
     val worked = if (opensReq(q)) inserted(ses, q, r, errno) else if (releasesReq(q)) released(ses, q) else Tup(ses, pool)
     val counted = if (not(orderedReq(q))) worked._1
       else if (ses.epoch == q.epoch) worked._1.with("running", ses.running - 1).with("abandoned", if (q.phase == Abandoned) ses.abandoned - 1 else ses.abandoned)
@@ -650,7 +648,7 @@ module session {
     val answer = if (q.phase == Abandoned) q.answer else if (not(conns.get(q.conn).serverAlive)) Lost else if (failed) ErrnoReply else Reply
     all {
       q.phase == Running or q.phase == Abandoned,
-      not(releasesReq(q)) or not(errno),
+      not(releasesReq(q) or q.slot == Kept) or not(errno),
       reqs' = reqs.set(r, ended(q, Finished).with("answer", answer)),
       sessions' = sessions.set(q.session, counted),
       pool' = worked._2,
@@ -786,30 +784,28 @@ module session {
       and client.orphansDue == Set()
   }
 
-  /// The server holds `fh` for the client's session as the client holds it. With `g3` or `g4` allowed, that gap may explain a handle the server alone holds: the open's resend failed with an errno after its original was kept (G3), or the id was released and forgotten before the open landed (G4).
-  def handleAgrees(fh: int, g3: bool, g4: bool): bool = {
+  /// The server holds `fh` for the client's session as the client holds it. With `g4` allowed, that gap may explain a handle the server alone holds: the id was released and forgotten before the open landed (G4).
+  def handleAgrees(fh: int, g4: bool): bool = {
     val entry = sessions.get(sid).handles.get(fh)
     val serverHas = entry.by != 0
     val clientHas = client.held.get(fh) != 0
-    val byResend = reqs.get(entry.by).origin == OfCall(fh) and calls.get(fh).outcome == Errno
     and {
       clientHas implies serverHas,
-      serverHas implies (clientHas or (g3 and byResend) or (g4 and entry.evicted)),
+      serverHas implies (clientHas or (g4 and entry.evicted)),
     }
   }
 
   /// S3, handles, with the known gaps allowed for: once nothing is in flight, the server's handles for the session are the client's live ones, apart from those whose release is owed (G5).
-  val S3 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true, true) or client.owed.contains(fh))
+  val S3 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true) or client.owed.contains(fh))
 
   /// Each gap on its own: S3 with one allowance dropped. Each expected to fail, with the gap's trace.
-  val S3noG3 = quiescent implies CALLS.forall(fh => handleAgrees(fh, false, true) or client.owed.contains(fh))
-  val S3noG4 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true, false) or client.owed.contains(fh))
-  val S3noG5 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true, true))
+  val S3noG4 = quiescent implies CALLS.forall(fh => handleAgrees(fh, false) or client.owed.contains(fh))
+  val S3noG5 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true))
 
-  /// An open's handle is never replaced by another file's: whatever the client holds under an id, the server's entry for its session under that id is the request the client accepted.
+  /// An open's handle is never replaced by another file's: whatever the client holds under an id, the server's entry for its session under that id was opened by the request the client accepted, or by an earlier attempt of the same call, whose handle a resend answers from.
   val S3identity = CALLS.forall(fh => {
     val entry = sessions.get(sid).handles.get(fh)
-    (client.held.get(fh) != 0 and entry.by != 0) implies entry.by == client.held.get(fh)
+    (client.held.get(fh) != 0 and entry.by != 0) implies reqs.get(entry.by).origin == reqs.get(client.held.get(fh)).origin
   })
 
   /// The attachment's counts are what the request phases say they are, through every resume and takeover.
