@@ -1,3 +1,4 @@
 /target
 *.swp
 /validation
+/_apalache-out
