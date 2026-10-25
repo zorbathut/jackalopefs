@@ -290,12 +290,12 @@ impl Sessions {
         Some((state, epoch))
     }
 
-    /// Mark the session detached, unless a newer connection has already taken it over.
     /// Drop a session no client can resume: one whose Ack, with its id and token, never reached the client.
     fn forget(&self, id: u64) {
         self.map.lock().remove(&id);
     }
 
+    /// Mark the session detached, unless a newer connection has already taken it over.
     pub fn detach(&self, id: u64, epoch: u64) {
         let Some(state) = self.map.lock().get(&id).cloned() else {
             return;
