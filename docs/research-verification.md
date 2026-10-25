@@ -1,6 +1,6 @@
 # Verifying jackalopefs: model checking and formal verification options
 
-*Research notes, October 2026. They survey tools and say what each could check here; nothing in them is built. The failure model they refer to is the "Failure model" section of `design.md`.*
+*Research notes, October 2026. They survey tools and say what each could check here. The failure model they refer to is the "Failure model" section of `design.md`. Of the recommendation at the end, step 1 is built: `spec/` holds the Quint model and `spec/README.md` what was learned building it; the rest is not.*
 
 ## What there is to check
 

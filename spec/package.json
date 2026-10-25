@@ -1,0 +1,8 @@
+{
+  "name": "jackalopefs-spec",
+  "private": true,
+  "description": "The pinned Quint that scripts/spec/check.sh runs the session model with.",
+  "devDependencies": {
+    "@informalsystems/quint": "0.33.0"
+  }
+}

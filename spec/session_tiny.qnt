@@ -1,5 +1,4 @@
-// The instance TLC explores completely; one instance per file, since the checkers take the whole file's compiled form and Apalache refuses one past 20 MB.
-/// Small enough for TLC to explore completely: two calls, two connections.
+// The instance TLC explores completely: two calls, three requests, two connections. Every gap, witness and mutation needs at most three requests. One instance per file: see README.md.
 module session_tiny {
-  import session(N = 2, R = 4, MAX_GEN = 2, RELEASED_KEPT = 1).* from "./session"
+  import session(N = 2, R = 3, MAX_GEN = 2).* from "./session"
 }
