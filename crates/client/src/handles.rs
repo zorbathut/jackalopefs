@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::watch;
 
 /// The process that opened a handle: its thread group's id and name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -136,8 +137,10 @@ impl HandleRec {
 pub struct HandleTable {
     next: AtomicU64,
     map: Mutex<HashMap<u64, Arc<HandleRec>>>,
-    /// Releases that failed for want of a connection; the session that holds their ids gets them if it resumes.
+    /// Releases that failed for want of a connection, or timed out: the connection's release task sends them as they are owed, and a session that resumes gets those its last connection could not deliver.
     owed: Mutex<Vec<Request>>,
+    /// Counts the releases ever owed, so the connection's release task wakes for each.
+    owed_count: watch::Sender<u64>,
     /// The handles in `map` of each kind, changed under its lock.
     files: AtomicU64,
     dirs: AtomicU64,
@@ -215,6 +218,12 @@ impl HandleTable {
 
     pub fn owe_release(&self, release: Request) {
         self.owed.lock().push(release);
+        self.owed_count.send_modify(|count| *count += 1);
+    }
+
+    /// Changes whenever a release is owed from now on.
+    pub fn owed_changes(&self) -> watch::Receiver<u64> {
+        self.owed_count.subscribe()
     }
 
     pub fn take_owed(&self) -> Vec<Request> {

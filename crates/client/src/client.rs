@@ -898,7 +898,7 @@ impl Caller {
         }
     }
 
-    /// An open whose reply was not received may have succeeded on the server; tell it to let go of that id, in the background. Spawned, so it carries no kernel request: the cleanup after an interrupted open must not itself be interrupted. Bounded by the offline deadline, so best-effort releases cannot pile up against a server that never answers.
+    /// An open whose reply was not received may have succeeded on the server; tell it to let go of that id, in the background. Spawned, so it carries no kernel request: the cleanup after an interrupted open must not itself be interrupted. Bounded by the offline deadline, after which it is owed and the connection's release task sends it again.
     fn release_orphan(&self, req: Request) {
         let mut caller = self.clone();
         caller.op_timeout = self.op_timeout.or(Some(self.offline_timeout));
@@ -909,7 +909,7 @@ impl Caller {
         });
     }
 
-    /// Release a handle on the server. One that fails for want of a connection is owed: without it the server would hold the descriptor for as long as the session lives, so it is sent again if the session resumes.
+    /// Release a handle on the server. One that fails for want of a connection, or times out, is owed: without it the server would hold the descriptor for as long as the session lives, so the connection's release task sends it again, on this connection or the session's next.
     async fn release(&self, req: Request) -> Result<(), Error> {
         match self.call(req.clone()).await {
             Ok(Response::Ok) => Ok(()),

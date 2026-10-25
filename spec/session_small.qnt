@@ -115,7 +115,7 @@ module session_small {
     .then(send(1)).then(arrive(2)).then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1)
     .then(drain(2)).then(begin(2)).expect(reqs.get(2).slot == Kept and pool == 1)
     .then(finish(2, false)).then(receive(2)).expect(calls.get(1).outcome == Replied and client.held.get(1) == 2 and sessions.get(1).handles.get(1).by == 1)
-    .expect(quiescent and S3 and S3noG4 and S3noG5 and okSoFar)
+    .expect(quiescent and S3 and S3noG4 and okSoFar)
 
   /// G4: an open given up on while it ran, its orphan release landing first and the window then forgetting the id, so the open lands and keeps its handle. S3 allows for it; S3 without the allowance does not.
   run g4Test = init
@@ -125,14 +125,21 @@ module session_small {
     .then(releasedForget(1, 1)).expect(sessions.get(1).released == Set())
     .then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1 and sessions.get(1).handles.get(1).evicted and quiescent and S3 and not(S3noG4) and okSoFar)
 
-  /// G5: a release given up on before its frame was written is owed, and nothing sends it until the session next resumes, while the server holds the handle. S3 allows for it; without the allowance it fails until the resume sends the release.
-  run g5Test = init
+  /// A release given up on before its frame was written is owed and sent on the connection it was given up on, with no resume; until then nothing is quiescent.
+  run owedLiveTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1)).expect(client.held.get(1) == 1)
     .then(start(2, Release(1), true)).expect(client.held.get(1) == 0)
-    .then(giveUp(2)).expect(client.owed == Set(1) and calls.get(2).outcome == GaveUp)
-    .expect(quiescent and S3 and not(S3noG5) and okSoFar)
-    .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect).expect(conns.get(2).owedToSend == Set(1))
-    .then(owedSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(client.owed == Set() and sessions.get(1).handles.get(1).by == 0 and quiescent and S3noG5 and okSoFar)
+    .then(giveUp(2)).expect(client.owed == Set(1) and calls.get(2).outcome == GaveUp and not(quiescent))
+    .then(owedSend(1)).expect(reqs.get(2).conn == 1)
+    .then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(client.owed == Set() and sessions.get(1).handles.get(1).by == 0 and quiescent and S3 and okSoFar)
+
+  /// An owed release whose connection is lost before the answer stays owed and goes out again on the resumed connection.
+  run owedAgainTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
+    .then(start(2, Release(1), true)).then(giveUp(2)).then(owedSend(1)).expect(reqs.get(2).origin == OwedRelease(1))
+    .then(loseClient(1, Set())).then(loseServer(1)).expect(phaseOf(2) == Dropped and client.owed == Set(1))
+    .then(reconnect).then(owedSend(1)).expect(reqs.get(3).conn == 2)
+    .then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3)).expect(client.owed == Set() and quiescent and S3 and okSoFar)
 
   /// A session dropped twice while a change given up on by losing its connection still runs is resumed both times, and the client's next change waits for that one: S1 across sessions.
   run droppedResumedTest = init
@@ -154,7 +161,7 @@ module session_small {
     .then(reopenSend(1)).expect(client.held.get(1) == 2)
     .then(arrive(2)).then(begin(2)).expect(reqs.get(2).slot == Taken and pool == 2)
     .then(finish(2, false)).then(receive(2)).expect(client.reopened == Set(1) and S3identity)
-    .then(publish).expect(canSend(2) and conns.get(2).owedToSend == Set())
+    .then(publish).expect(canSend(2) and client.owed == Set())
     .then(send(2)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
     .then(closeSession(1)).expect(pool == 1 and quiescent and okSoFar)
 
@@ -164,7 +171,7 @@ module session_small {
     .then(loseClient(1, Set())).then(loseServer(1)).then(dropSession(1)).then(newSession)
     .then(reopenSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, true)).expect(reqs.get(2).answer == ErrnoReply and pool == 1)
     .then(receive(2)).expect(client.held.get(1) == 0 and client.dead == Set(1) and client.owed == Set(1))
-    .then(publish).expect(conns.get(2).owedToSend == Set(1))
+    .then(publish).expect(client.owed == Set(1))
     .then(owedSend(1)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3)).expect(client.owed == Set())
     .then(closeSession(1)).expect(pool == 0 and quiescent and okSoFar)
 }

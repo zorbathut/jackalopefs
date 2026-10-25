@@ -2372,6 +2372,42 @@ async fn a_release_failed_in_an_outage_is_sent_once_the_session_resumes() {
     client.shutdown().await;
 }
 
+/// A release that times out on a live connection is owed and sent again on that connection, not left for a resume that may never come while the server holds its descriptor.
+#[tokio::test]
+async fn a_release_that_times_out_on_a_live_connection_is_sent_again_on_it() {
+    let export = tempfile::tempdir().unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let gate = Gate::install(&server);
+    gate.arm("release", Hold::Running);
+    let mut config = server.config(Duration::from_secs(5));
+    config.op_timeout = Some(Duration::from_millis(200));
+    let client = jackalopefs_client::Client::connect(config).await.unwrap();
+    let err = client.release(7).await.unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    wait_for(
+        Duration::from_secs(5),
+        "the owed release to be sent again",
+        || {
+            gate.log()
+                .iter()
+                .any(|d| d.op == "release" && d.fh == Some(7))
+                .then_some(())
+        },
+    )
+    .await;
+    assert!(
+        gate.taken().is_some_and(|taken| taken.ran.is_none()),
+        "the first send is still held, so this was the second"
+    );
+    assert!(
+        matches!(&*client.state().borrow(), ConnState::Connected(attached) if attached.generation == 1),
+        "sent again on the connection it timed out on"
+    );
+    gate.release();
+    client.shutdown().await;
+    server.stop().await;
+}
+
 /// The outage's deadline belongs to that outage: once the connection is back calls succeed, and the next loss gives them a full wait again.
 #[tokio::test]
 async fn calls_wait_again_once_the_connection_is_back() {

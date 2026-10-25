@@ -1,6 +1,6 @@
 //! The connection manager: one background task that owns the QUIC connection, reconnects with backoff when it drops, resumes (or reopens) the handle table, and forwards the server's event stream.
 
-use crate::client::{exchange, Error, KeyRoot, Tapping, Timing};
+use crate::client::{exchange, Error, ErrorExchange, KeyRoot, Tapping, Timing};
 use crate::handles::{HandleKind, HandleTable};
 use crate::ids::{IdMap, ModeIds};
 use crate::perf::{Perf, Slowpath};
@@ -9,7 +9,7 @@ use jackalopefs_perf::hub::{IdsEvent, Side};
 use jackalopefs_proto::control::{HandlesProcess, HandlesTotals};
 use jackalopefs_proto::{
     read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply,
-    NoticeHandles, Resume, PROTO_REVISION,
+    NoticeHandles, Request, Response, Resume, PROTO_REVISION,
 };
 use quinn::{Connection, Endpoint};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -316,6 +316,8 @@ async fn run(
             ids,
             cancels: watch::Sender::new(0),
         });
+        // Watched from before any call can use the connection, so no release owed on it goes unnoticed.
+        let owed = handles.owed_changes();
         if state.send(ConnState::Connected(attached)).is_err() {
             break;
         }
@@ -324,7 +326,7 @@ async fn run(
                 tracing::debug!("nobody waiting for the first connection result");
             }
         }
-        // The handles this client no longer has are released once the connection is published, so a server slow to answer holds up no call: their ids are never reused, and nothing on this side waits on them. The next connection waits for the releases to end, so one owed again is there for its resume to send.
+        // The handles this client no longer has are released once the connection is published, so a server slow to answer holds up no call: their ids are never reused, and nothing on this side waits on them. Each release owed from then on is sent on this connection too. The next connection waits for the releasing to end, so one this connection could not deliver is owed again for its resume to send.
         let releases = if resumed { handles.take_owed() } else { stale };
         let releasing = {
             let (conn, root, handles, hub) =
@@ -336,7 +338,7 @@ async fn run(
                     session,
                     conn: conn_key,
                 };
-                send_releases(&conn, &root, ids, &handles, releases, tapping).await;
+                send_releases(&conn, &root, ids, &handles, releases, owed, tapping).await;
             })
         };
         let reader = tokio::spawn(read_events(
@@ -638,21 +640,18 @@ async fn reopen_handles(
     stale
 }
 
-/// Send releases concurrently, for as long as the connection lasts; one the server did not answer is owed again, for the next resume of this session.
+/// Send releases concurrently for as long as the connection lasts: `releases` at once, then each one owed from then on (`owed`: a release that timed out, or found no connection while this one was coming up). One the server does not answer on this connection is owed again once the connection has ended, for the next resume of this session: owing it at once would wake this loop to send it again on the connection that just failed it.
 async fn send_releases(
     conn: &Connection,
     root: &KeyRoot,
     ids: IdMap,
     handles: &HandleTable,
     releases: Vec<jackalopefs_proto::Request>,
+    mut owed: watch::Receiver<u64>,
     tapping: Tapping<'_>,
 ) {
-    if releases.is_empty() {
-        return;
-    }
-    tracing::debug!(count = releases.len(), "sending releases");
     let mut sends = tokio::task::JoinSet::new();
-    for release in releases {
+    let send = |sends: &mut tokio::task::JoinSet<_>, release: jackalopefs_proto::Request| {
         let (conn, root, hub) = (conn.clone(), root.clone(), tapping.hub.clone());
         let (session, conn_key) = (tapping.session, tapping.conn);
         sends.spawn(async move {
@@ -674,16 +673,46 @@ async fn send_releases(
             .await;
             (release, sent)
         });
+    };
+    if !releases.is_empty() {
+        tracing::debug!(count = releases.len(), "sending releases");
+    }
+    for release in releases {
+        send(&mut sends, release);
+    }
+    let mut undelivered = Vec::new();
+    let mut settle = |joined: Result<
+        (Request, Result<Response, ErrorExchange>),
+        tokio::task::JoinError,
+    >| match joined {
+        Ok((_, Ok(_))) => {}
+        Ok((release, Err(e))) => {
+            tracing::debug!(?release, "release failed: {e:?}");
+            undelivered.push(release);
+        }
+        Err(e) => tracing::error!("release task failed: {e}"),
+    };
+    loop {
+        tokio::select! {
+            changed = owed.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let releases = handles.take_owed();
+                tracing::debug!(count = releases.len(), "sending releases owed");
+                for release in releases {
+                    send(&mut sends, release);
+                }
+            }
+            Some(joined) = sends.join_next() => settle(joined),
+            _ = conn.closed() => break,
+        }
     }
     while let Some(joined) = sends.join_next().await {
-        match joined {
-            Ok((_, Ok(_))) => {}
-            Ok((release, Err(e))) => {
-                tracing::debug!(?release, "release failed: {e:?}");
-                handles.owe_release(release);
-            }
-            Err(e) => tracing::error!("release task failed: {e}"),
-        }
+        settle(joined);
+    }
+    for release in undelivered {
+        handles.owe_release(release);
     }
 }
 

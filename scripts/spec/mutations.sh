@@ -74,6 +74,9 @@ mutate resend_opens_again S3 \
 mutate drop_forgets_living_sessions S1strong \
   'def resumable(s: int): bool = sessions.get(s).live or alive(s)' \
   'def resumable(s: int): bool = sessions.get(s).live'
+mutate owed_never_sent owedNeverStuck \
+  'client.owed.contains(fh) and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh)' \
+  'false and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh)'
 
 echo
 if [[ $failures -eq 0 ]]; then echo "every mutation was caught"; else echo "$failures mutation(s) not caught"; exit 1; fi

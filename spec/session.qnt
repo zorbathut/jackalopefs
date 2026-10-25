@@ -59,8 +59,8 @@ module session {
     slot: Slot
   }
 
-  /// One connection, by the client's generation. `clientAlive` and `serverAlive` are each end's view; `published` is the connection manager's: the reopens are done and calls may use it. `cancels` is `Attached::cancels`; `owedToSend` is what the manager handed `send_releases`, not yet sent.
-  type Conn = { session: int, epoch: int, clientAlive: bool, serverAlive: bool, published: bool, cancels: int, owedToSend: Set[int] }
+  /// One connection, by the client's generation. `clientAlive` and `serverAlive` are each end's view; `published` is the connection manager's: the reopens are done and calls may use it. `cancels` is `Attached::cancels`.
+  type Conn = { session: int, epoch: int, clientAlive: bool, serverAlive: bool, published: bool, cancels: int }
 
   /// A handle the server holds: the request that inserted it (0 for none), and whether the id had been released and then forgotten by the window when it was inserted, which is G4.
   type Entry = { by: int, evicted: bool }
@@ -104,8 +104,8 @@ module session {
   pure val idleCall: Call = { kind: Change, status: Idle, resendable: false, attempt: 0, minGen: 1, lostOnce: false, req: 0, outcome: NoOutcome, endedBefore: Set() }
   pure val absentReq: Req = { origin: NoOrigin, attempt: 0, phase: Absent, conn: 0, epoch: 0, session: 0, cancelSent: false, counted: false, answer: NoAnswer, slot: NoSlot }
   pure def newReq(origin: Origin, attempt: int, g: int, k: Conn): Req = { origin: origin, attempt: attempt, phase: Transit, conn: g, epoch: k.epoch, session: k.session, cancelSent: false, counted: false, answer: NoAnswer, slot: NoSlot }
-  pure val noConn: Conn = { session: 0, epoch: 0, clientAlive: false, serverAlive: false, published: false, cancels: 0, owedToSend: Set() }
-  pure def liveConn(s: int, epoch: int, published: bool, owedToSend: Set[int]): Conn = { session: s, epoch: epoch, clientAlive: true, serverAlive: true, published: published, cancels: 0, owedToSend: owedToSend }
+  pure val noConn: Conn = { session: 0, epoch: 0, clientAlive: false, serverAlive: false, published: false, cancels: 0 }
+  pure def liveConn(s: int, epoch: int, published: bool): Conn = { session: s, epoch: epoch, clientAlive: true, serverAlive: true, published: published, cancels: 0 }
   pure val noEntry: Entry = { by: 0, evicted: false }
   pure val noSession: Session = { epoch: 0, running: 0, abandoned: 0, runningOlder: 0, live: false, detached: false, handshakeLost: false, handles: CALLS.mapBy(fh => noEntry), released: Set(), releasedEver: Set() }
   pure val freshSession: Session = noSession.with("epoch", 1).with("live", true)
@@ -334,7 +334,7 @@ module session {
     }
   }
 
-  /// Every reopen has ended and every held handle is reopened or dead: the connection is published, and the releases of the handles the reopens killed go out behind it (`reopen_handles`' second return, sent by `send_releases`). What was owed to the old session is moot (`conn.rs`, the new-session branch), and anything owed since waits for a resume.
+  /// Every reopen has ended and every held handle is reopened or dead: the connection is published, and the releases of the handles the reopens killed go out behind it (`reopen_handles`' second return, owed here, sent by `send_releases`). What was owed to the old session is moot (`conn.rs`, the new-session branch).
   action publish: bool = {
     val conn = conns.get(gen)
     all {
@@ -342,7 +342,7 @@ module session {
       not(conn.published),
       heldNow.subseteq(client.reopened),
       REQS.forall(r => not(isReopen(reqs.get(r).origin) and reqs.get(r).conn == gen and not(terminal(reqs.get(r).phase)))),
-      conns' = conns.set(gen, conn.with("published", true).with("owedToSend", client.owed.intersect(client.dead))),
+      conns' = conns.set(gen, conn.with("published", true)),
       keepCalls,
       keepReqs,
       gen' = gen,
@@ -353,17 +353,18 @@ module session {
     }
   }
 
-  /// `send_releases`: a release owed is sent with no cancel and no give-up; one the server does not answer stays owed, for the next resume.
+  /// `send_releases`: the connection's release task sends each release owed, whenever it is owed, with no cancel and no give-up, once at a time on one connection; one the server does not answer stays owed, for the next connection.
+  def owedSendable(fh: int): bool = {
+    val conn = conns.get(gen)
+    conn.clientAlive and conn.published and client.owed.contains(fh) and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh) and reqs.get(x).conn == gen and unsettled(reqs.get(x)))) and lowestFree <= R
+  }
   action owedSend(fh: int): bool = {
     val conn = conns.get(gen)
     val r = lowestFree
     all {
-      conn.clientAlive,
-      conn.published,
-      conn.owedToSend.contains(fh),
-      r <= R,
+      owedSendable(fh),
       reqs' = reqs.set(r, newReq(OwedRelease(fh), 1, gen, conn)),
-      conns' = conns.set(gen, conn.with("owedToSend", conn.owedToSend.exclude(Set(fh)))),
+      conns' = conns,
       keepCalls,
       gen' = gen,
       sid' = sid,
@@ -423,7 +424,7 @@ module session {
       sid' = sid,
       sessions' = sessions.set(sid, ses.with("epoch", ses.epoch + 1).with("runningOlder", ses.runningOlder + ses.running).with("running", 0).with("abandoned", 0).with("live", true).with("detached", false).with("handshakeLost", false)),
       pool' = pool,
-      conns' = conns.set(g, liveConn(sid, ses.epoch + 1, true, client.owed)).setBy(gen, k => k.with("serverAlive", false)),
+      conns' = conns.set(g, liveConn(sid, ses.epoch + 1, true)).setBy(gen, k => k.with("serverAlive", false)),
       reqs' = REQS.mapBy(r => if (reqs.get(r).conn == gen and old.serverAlive) cutOff(reqs.get(r)) else reqs.get(r)),
       overtook' = overtook,
       overtookAcross' = overtookAcross,
@@ -446,7 +447,7 @@ module session {
       sid' = s,
       sessions' = sessions.set(s, freshSession),
       pool' = pool,
-      conns' = conns.set(g, liveConn(s, 1, heldNow == Set(), Set())),
+      conns' = conns.set(g, liveConn(s, 1, heldNow == Set())),
       client' = client.with("owed", Set()).with("reopened", Set()),
       keepCalls,
       keepReqs,
@@ -694,7 +695,7 @@ module session {
   action init = all {
     calls' = CALLS.mapBy(c => idleCall),
     reqs' = REQS.mapBy(r => absentReq),
-    conns' = GENS.mapBy(g => if (g == 1) liveConn(1, 1, true, Set()) else noConn),
+    conns' = GENS.mapBy(g => if (g == 1) liveConn(1, 1, true) else noConn),
     gen' = 1,
     sessions' = SIDS.mapBy(s => if (s == 1) freshSession else noSession),
     sid' = 1,
@@ -781,14 +782,20 @@ module session {
     ran.size() <= 2 and (ran.size() == 2 implies calls.get(c).resendable)
   })
 
-  /// Nothing is in flight or about to be: every request has ended and every answer on a live connection been read, every call is idle or ended, the current connection is up at both ends and published with no cancel pending and nothing left to send, and no orphan release is due. S3 compares the two handle tables here.
-  val quiescent = {
+  /// Nothing is in flight: every request has ended and every answer on a live connection been read, every call is idle or ended, the current connection is up at both ends and published with no cancel pending, and no orphan release is due.
+  val quiet = {
     val conn = conns.get(gen)
     REQS.forall(r => terminal(reqs.get(r).phase) and (reqs.get(r).answer == NoAnswer or not(conns.get(reqs.get(r).conn).clientAlive)))
       and CALLS.forall(c => calls.get(c).status == Idle or calls.get(c).status == Ended)
-      and conn.clientAlive and conn.serverAlive and conn.published and conn.cancels == 0 and conn.owedToSend == Set()
+      and conn.clientAlive and conn.serverAlive and conn.published and conn.cancels == 0
       and client.orphansDue == Set()
   }
+
+  /// Quiet, and no release owed either: nothing is about to be sent. S3 compares the two handle tables here.
+  val quiescent = quiet and client.owed == Set()
+
+  /// No release owed is stuck: once all else is quiet, one of them can go out on the connection that is up (G5 was a release owed there waiting for a later connection). S3 holds only at quiescence, which a stuck release would keep out of reach, so this is what sees one.
+  val owedNeverStuck = (quiet and lowestFree <= R and client.owed != Set()) implies client.owed.exists(fh => owedSendable(fh))
 
   /// The server holds `fh` for the client's session as the client holds it. With `g4` allowed, that gap may explain a handle the server alone holds: the id was released and forgotten before the open landed (G4).
   def handleAgrees(fh: int, g4: bool): bool = {
@@ -801,12 +808,11 @@ module session {
     }
   }
 
-  /// S3, handles, with the known gaps allowed for: once nothing is in flight, the server's handles for the session are the client's live ones, apart from those whose release is owed (G5).
-  val S3 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true) or client.owed.contains(fh))
+  /// S3, handles, with the known gap allowed for: once nothing is in flight, no release owed included, the server's handles for the session are the client's live ones.
+  val S3 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true))
 
-  /// Each gap on its own: S3 with one allowance dropped. Each expected to fail, with the gap's trace.
-  val S3noG4 = quiescent implies CALLS.forall(fh => handleAgrees(fh, false) or client.owed.contains(fh))
-  val S3noG5 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true))
+  /// S3 without the allowance, expected to fail with the gap's trace.
+  val S3noG4 = quiescent implies CALLS.forall(fh => handleAgrees(fh, false))
 
   /// An open's handle is never replaced by another file's: whatever the client holds under an id, the server's entry for its session under that id was opened by the request the client accepted, or by an earlier attempt of the same call, whose handle a resend answers from.
   val S3identity = CALLS.forall(fh => {
@@ -861,5 +867,5 @@ module session {
 
   def reqOf(c: int): int = calls.get(c).req
   def phaseOf(r: int): Phase = reqs.get(r).phase
-  def okSoFar: bool = S1 and S2 and S3 and S3identity and countsConsistent and poolConsistent and aliveIsCurrent
+  def okSoFar: bool = S1 and S2 and S3 and S3identity and owedNeverStuck and countsConsistent and poolConsistent and aliveIsCurrent
 }
