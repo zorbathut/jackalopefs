@@ -103,7 +103,8 @@ module session {
 
   pure val idleCall: Call = { kind: Change, status: Idle, resendable: false, attempt: 0, minGen: 1, lostOnce: false, req: 0, outcome: NoOutcome, endedBefore: Set() }
   pure val absentReq: Req = { origin: NoOrigin, attempt: 0, phase: Absent, conn: 0, epoch: 0, session: 0, cancelSent: false, counted: false, answer: NoAnswer, slot: NoSlot }
-  pure def newReq(origin: Origin, attempt: int, g: int, k: Conn): Req = { origin: origin, attempt: attempt, phase: Transit, conn: g, epoch: k.epoch, session: k.session, cancelSent: false, counted: false, answer: NoAnswer, slot: NoSlot }
+  /// A request written on connection `k`; one the server has lost already is never read, so nothing of it holds the session.
+  pure def newReq(origin: Origin, attempt: int, g: int, k: Conn): Req = { origin: origin, attempt: attempt, phase: if (k.serverAlive) Transit else Dropped, conn: g, epoch: k.epoch, session: k.session, cancelSent: false, counted: false, answer: NoAnswer, slot: NoSlot }
   pure val noConn: Conn = { session: 0, epoch: 0, clientAlive: false, serverAlive: false, published: false, cancels: 0 }
   pure def liveConn(s: int, epoch: int, published: bool): Conn = { session: s, epoch: epoch, clientAlive: true, serverAlive: true, published: published, cancels: 0 }
   pure val noEntry: Entry = { by: 0 }
@@ -113,11 +114,8 @@ module session {
 
   /// A request ends in `phase`; a reset the server has not acted on is moot from here.
   pure def ended(q: Req, phase: Phase): Req = q.with("phase", phase).with("cancelSent", false)
-  /// The connection is gone on the server's side: an answer not yet read never arrives, and a request not yet decoded, or held in `SessionState::drain`, is dropped.
-  pure def cutOff(q: Req): Req = {
-    val lost = if (q.answer == NoAnswer) q else q.with("answer", Lost)
-    if (q.phase == Transit or q.phase == Held) ended(lost, Dropped) else lost
-  }
+  /// The connection is gone on the server's side: an answer not yet read never arrives. Its requests' tasks outlive the connection's, so one not yet decoded, or held in `SessionState::drain`, goes on until it notices (`dropCut`).
+  pure def cutOff(q: Req): Req = if (q.answer == NoAnswer) q else q.with("answer", Lost)
 
   def kindOf(c: int): Kind = calls.get(c).kind
   /// Whether a request takes part in the ordering (`Request::changes`): a call's change or open, a reopen, and a release the client sends on its own (orphan or owed, `ordered`); not the kernel's release.
@@ -549,13 +547,27 @@ module session {
 
   // ---- The server's requests (`crates/server/src/session.rs` `handle_request`, `crates/server/src/ops.rs`, `crates/server/src/handles.rs`) ----
 
-  /// The request is decoded and, for a change, the fence read once: held in `SessionState::drain` if it is above zero, else straight to the blocking pool. Nothing arrives on a connection the server has lost.
+  /// The request is decoded and, for a change, the fence read once: held in `SessionState::drain` if it is above zero, else straight to the blocking pool. A request read whole before its connection went is decoded all the same.
   action arrive(r: int): bool = {
     val q = reqs.get(r)
     all {
       q.phase == Transit,
-      conns.get(q.conn).serverAlive,
       reqs' = reqs.set(r, q.with("phase", if (orderedReq(q) and fencing(q.session, q.epoch) > 0) Held else Ready)),
+      keepCalls,
+      keepConns,
+      keepSessions,
+      keepClient,
+      keepGhosts,
+    }
+  }
+
+  /// A request on a connection the server has lost, not yet decoded or held, notices and is dropped: its stream fails, or `handle_request`'s wait in `SessionState::drain` sees it stopped. Until then it may still be decoded, or drain (the wait races the two).
+  action dropCut(r: int): bool = {
+    val q = reqs.get(r)
+    all {
+      q.phase == Transit or q.phase == Held,
+      not(conns.get(q.conn).serverAlive),
+      reqs' = reqs.set(r, ended(q, Dropped)),
       keepCalls,
       keepConns,
       keepSessions,
@@ -754,6 +766,7 @@ module session {
   action stepDropSession = { nondet s = SIDS.oneOf()  dropSession(s) }
   action stepCloseSession = { nondet s = SIDS.oneOf()  closeSession(s) }
   action stepArrive = { nondet r = REQS.oneOf()  arrive(r) }
+  action stepDropCut = { nondet r = REQS.oneOf()  dropCut(r) }
   action stepDrain = { nondet r = REQS.oneOf()  drain(r) }
   action stepBegin = { nondet r = REQS.oneOf()  begin(r) }
   action stepFinish = {
@@ -783,6 +796,7 @@ module session {
     stepDropSession,
     stepCloseSession,
     stepArrive,
+    stepDropCut,
     stepDrain,
     stepBegin,
     stepFinish,

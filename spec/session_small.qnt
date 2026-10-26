@@ -51,11 +51,29 @@ module session_small {
     .then(finish(1, false)).expect(sessions.get(1).abandoned == 0 and reqs.get(1).answer == NoAnswer)
     .then(drain(2)).then(begin(2)).expect(phaseOf(1) == Finished and okSoFar)
 
-  /// A takeover: the client reconnects while the server still holds the old connection; what the old one had not decoded goes with it, and the resend runs on the new one.
+  /// A takeover: the client reconnects while the server still holds the old connection; what the old one had not decoded is dropped once its task notices, and the resend runs on the new one.
   run takeoverTest = init
     .then(start(1, Change, true)).then(send(1))
-    .then(loseClient(1, Set())).then(reconnect).expect(phaseOf(1) == Dropped and seenTakeover)
+    .then(loseClient(1, Set())).then(reconnect).expect(seenTakeover)
+    .then(dropCut(1)).expect(phaseOf(1) == Dropped)
     .then(send(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(calls.get(1).outcome == Replied and okSoFar)
+
+  /// A request read whole before a takeover is decoded after it, and the epoch check refuses it; the resend runs on the new connection.
+  run lateDecodeTest = init
+    .then(start(1, Change, true)).then(send(1))
+    .then(loseClient(1, Set())).then(reconnect).expect(seenTakeover and calls.get(1).status == Waiting)
+    .then(arrive(1)).expect(phaseOf(1) == Ready)
+    .then(begin(1)).expect(phaseOf(1) == Superseded)
+    .then(send(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(calls.get(1).outcome == Replied and okSoFar)
+
+  /// A change held on a connection the server has lost may still drain before its task notices, and run: no resume has moved the epoch, so nothing of the session runs beside it.
+  run heldAfterLossTest = init
+    .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))
+    .then(giveUp(1)).then(seeCancel(1)).then(receive(1)).expect(phaseOf(1) == Abandoned and conns.get(1).cancels == 0)
+    .then(start(2, Change, false)).then(send(2)).then(arrive(2)).expect(phaseOf(2) == Held)
+    .then(loseServer(1)).then(finish(1, false)).then(drain(2)).expect(phaseOf(2) == Ready)
+    .then(begin(2)).expect(phaseOf(2) == Running and okSoFar)
+    .then(finish(2, false)).expect(reqs.get(2).answer == Lost and okSoFar)
 
   /// A change held behind one given up on can be given up on too, at once, and never runs; a third change goes through once the first has finished.
   run heldGivenUpTest = init
@@ -130,7 +148,7 @@ module session_small {
   run owedAgainTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
     .then(start(2, Release(1), true)).then(giveUp(2)).then(owedSend(1)).expect(reqs.get(2).origin == OwedRelease(1))
-    .then(loseClient(1, Set())).then(loseServer(1)).expect(phaseOf(2) == Dropped and client.owed == Set(1))
+    .then(loseClient(1, Set())).then(loseServer(1)).then(dropCut(2)).expect(phaseOf(2) == Dropped and client.owed == Set(1))
     .then(reconnect).then(owedSend(1)).expect(reqs.get(3).conn == 2)
     .then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3)).expect(client.owed == Set() and quiescent and S3 and okSoFar)
 
