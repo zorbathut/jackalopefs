@@ -31,6 +31,9 @@ fn fuse_available() -> bool {
     dev && fusermount
 }
 
+/// How long an unmount that nothing holds up may take: fusermount3 alone takes a second or two while the suite's other tests mount and unmount beside it, and longer on a loaded machine. An unmount the abort has to free never completes without it, so this only has to end the test; a test whose server is gone must keep its offline timeout above this, since running out frees the unmount as the abort would.
+const UNMOUNT_DEADLINE: Duration = Duration::from_secs(30);
+
 struct Mounted {
     mount: Option<Mount>,
     server: Option<TestServer>,
@@ -163,7 +166,7 @@ impl Mounted {
     /// The way down for a mount whose server will never answer: fusermount unmounts lazily, so the mount lives while any process is blocked in a request against it (on a desktop, something probes every new mount), and only an abort ends that. A test that panics before this drops the mount instead, which aborts on its own.
     async fn abort_and_finish(self) {
         self.mount.as_ref().unwrap().aborter().abort();
-        tokio::time::timeout(Duration::from_secs(3), self.finish())
+        tokio::time::timeout(UNMOUNT_DEADLINE, self.finish())
             .await
             .expect("unmount did not complete after the abort");
     }
@@ -2547,7 +2550,7 @@ async fn an_unmount_from_outside_ends_the_mount() {
     tokio::time::timeout(Duration::from_secs(5), m.mount.as_ref().unwrap().ended())
         .await
         .expect("the mount did not notice it was unmounted");
-    tokio::time::timeout(Duration::from_secs(5), m.finish())
+    tokio::time::timeout(UNMOUNT_DEADLINE, m.finish())
         .await
         .expect("the unmount after an outside unmount did not complete");
 }
@@ -2582,7 +2585,7 @@ async fn an_abort_fails_pending_requests_and_frees_the_unmount() {
         !status.success(),
         "cat succeeded against a server that never answered"
     );
-    tokio::time::timeout(Duration::from_secs(3), m.finish())
+    tokio::time::timeout(UNMOUNT_DEADLINE, m.finish())
         .await
         .expect("unmount did not complete after the abort");
 }
