@@ -26,7 +26,7 @@ module session {
     // `retry_safe`: a reply lost with its connection may be asked for once more.
     resendable: bool,
     attempt: int,
-    // `Caller::attempt`'s `min_generation`: the call takes no connection older than this.
+    // The generation `Caller::wait_connected` is asked for at least: the call takes no connection older than this.
     minGen: int,
     lostOnce: bool,
     // The request of the attempt in flight, 0 when none is.
@@ -38,7 +38,7 @@ module session {
 
   /// Where a request came from: a call's attempt, or the client's own traffic: the reopen of a held handle after a new session, the release of an open whose outcome the caller never learned (`release_orphan`), or a release owed from before.
   type Origin = NoOrigin | OfCall(int) | Reopen(int) | OrphanRelease(int) | OwedRelease(int)
-  /// A request as the server has it. `Transit`: written by the client, not decoded. `Held`: decoded with a fence above zero, waiting in `drain`. `Ready`: decoded with a fence of zero, or drained, waiting for a blocking thread; the fence is not read again from here. `Cancelled`: dropped unrun on the client's cancel. `Superseded`: refused by the epoch check in `drain` or `begin`. `Dropped`: gone with the connection on the server's side. `Abandoned`: running, and given up on.
+  /// A request as the server has it. `Transit`: written by the client, not decoded. `Held`: decoded with a fence above zero, waiting in `SessionState::drain`. `Ready`: decoded with a fence of zero, or drained, waiting for a blocking thread; the fence is not read again from here. `Cancelled`: dropped unrun on the client's cancel. `Superseded`: refused by the epoch check in `SessionState::drain` or `SessionState::begin`. `Dropped`: gone with the connection on the server's side. `Abandoned`: running, and given up on.
   type Phase = Absent | Transit | Held | Ready | Cancelled | Superseded | Dropped | Running | Abandoned | Finished
   /// What the server sent back on the stream and the client has not yet read; `Lost` when the connection was gone on the server's side, so nothing went out.
   type Answer = NoAnswer | Reply | ErrnoReply | Unrun | Fenced | Lost
@@ -113,7 +113,7 @@ module session {
 
   /// A request ends in `phase`; a reset the server has not acted on is moot from here.
   pure def ended(q: Req, phase: Phase): Req = q.with("phase", phase).with("cancelSent", false)
-  /// The connection is gone on the server's side: an answer not yet read never arrives, and a request not yet decoded, or held in `drain`, is dropped.
+  /// The connection is gone on the server's side: an answer not yet read never arrives, and a request not yet decoded, or held in `SessionState::drain`, is dropped.
   pure def cutOff(q: Req): Req = {
     val lost = if (q.answer == NoAnswer) q else q.with("answer", Lost)
     if (q.phase == Transit or q.phase == Held) ended(lost, Dropped) else lost
@@ -173,7 +173,7 @@ module session {
     keepGhosts,
   }
 
-  /// `Caller::attempt`: the call takes the current connection once it is published and at least `min_generation`; a change waits first for the connection's pending cancels to be answered; `exchange` writes the request.
+  /// `Caller::attempt`: the call takes the current connection once it is published and at least the generation it waits for (`Caller::wait_connected`); a change waits first for the connection's pending cancels to be answered; `client::exchange` writes the request.
   def canSend(c: int): bool = {
     val call = calls.get(c)
     val conn = conns.get(gen)
@@ -193,7 +193,7 @@ module session {
     }
   }
 
-  /// The kernel interrupts the request, or `op_timeout` passes (`give_up`): the call returns at once (L1). A give-up before the frame was written leaves nothing on the wire, which `Waiting` stands for here, `send` being one step. After it, `exchange` resets a change's send side and counts it on `Attached::cancels` in the same step as the return (M2's client half); a release's streams are dropped unanswered and its request runs on. An open of unknown outcome gets an orphan release (the open path); a release that timed out is owed (`release`).
+  /// The kernel interrupts the request, or `op_timeout` passes (`give_up`): the call returns at once (L1). A give-up before the frame was written leaves nothing on the wire, which `Waiting` stands for here, `send` being one step. After it, `client::exchange` resets a change's send side and counts it on `Attached::cancels` in the same step as the return (M2's client half); a release's streams are dropped unanswered and its request runs on. An open of unknown outcome gets an orphan release (the open path); a release that timed out is owed (`release`).
   action giveUp(c: int): bool = {
     val call = calls.get(c)
     val q = reqs.get(call.req)
@@ -215,12 +215,12 @@ module session {
     }
   }
 
-  /// `attempt`: a reply lost with its connection is asked for once more on a newer connection if `retry_safe` and not already resent (M3); otherwise the call fails with EIO.
+  /// `Caller::attempt`: a reply lost with its connection is asked for once more on a newer connection if `retry_safe` and not already resent (M3); otherwise the call fails with EIO.
   pure def lostCall(call: Call, g: int): Call =
     if (call.resendable and not(call.lostOnce)) call.with("status", Waiting).with("minGen", g + 1).with("lostOnce", true).with("req", 0)
     else call.with("status", Ended).with("outcome", Failed).with("req", 0)
 
-  /// `ConnManager` sees the connection end: every exchange on it fails. The calls in `notSent`, whose frames the stream may not have carried whole, go to the next connection untouched (`attempt`, `NotSent`); the rest lost their reply, `lostCall`, an open that fails getting an orphan release and a release being owed. The readers of the pending cancels fail too, so their count goes with the connection. Reopens not yet accepted fail with it (`apply_reopen` on `Err`): their handles are dead and their releases owed. An orphan or owed release without its reply is owed, for the next resume; the code sends an orphan's once more first, which only shortens the wait.
+  /// `ConnManager` sees the connection end: every exchange on it fails. The calls in `notSent`, whose frames the stream may not have carried whole, go to the next connection untouched (`Caller::attempt`, `NotSent`); the rest lost their reply, `lostCall`, an open that fails getting an orphan release and a release being owed. The readers of the pending cancels fail too, so their count goes with the connection. Reopens not yet accepted fail with it (`apply_reopen` on `Err`): their handles are dead and their releases owed. An orphan or owed release without its reply is owed, for the next resume; the code sends an orphan's once more first, which only shortens the wait.
   action loseClient(g: int, notSent: Set[int]): bool = {
     val inflight = CALLS.filter(c => calls.get(c).status == InFlight and reqs.get(calls.get(c).req).conn == g)
     val failing = inflight.exclude(notSent).filter(c => not(calls.get(c).resendable and not(calls.get(c).lostOnce)))
@@ -253,7 +253,7 @@ module session {
     }
   }
 
-  /// The answer reaches the client (`exchange`; for a change given up on, its background reader): a reply ends the call still waiting for it, an open's keeping the handle; an answer to a cancel, whatever it says, uncounts the change on `cancels`. A reopen's reply keeps the handle alive, an errno kills it (`apply_reopen`) and its release is owed (`reopen_handles`); an owed release's reply settles it (`send_releases`); an orphan release's reply settles nothing more.
+  /// The answer reaches the client (`client::exchange`; for a change given up on, its background reader): a reply ends the call still waiting for it, an open's keeping the handle; an answer to a cancel, whatever it says, uncounts the change on `cancels`. A reopen's reply keeps the handle alive, an errno kills it (`apply_reopen`) and its release is owed (`reopen_handles`); an owed release's reply settles it (`send_releases`); an orphan release's reply settles nothing more.
   action receive(r: int): bool = {
     val q = reqs.get(r)
     all {
@@ -303,7 +303,7 @@ module session {
     }
   }
 
-  // ---- The client's own traffic (`crates/client/src/conn.rs`, `release_orphan` in `client.rs`) ----
+  // ---- The client's own traffic (`crates/client/src/conn.rs`, `release_orphan` in `crates/client/src/client.rs`) ----
 
   /// `reopen_handles`: after a new session, each held handle is opened again under its id before the connection is published, each by a task of its own; the client expects the server's entry from this request. The kernel may release the handle meanwhile, and the task goes on all the same.
   action reopenSend(fh: int): bool = {
@@ -325,7 +325,7 @@ module session {
     }
   }
 
-  /// A reopen's deadline passes (`reopen_handles`), its reply not yet read: `exchange` resets its send side and counts it on the connection's `cancels`, made before the reopens, and reads the server's answer in the background; the handle, if still held, is dead, and its release owed (`apply_reopen`, and the stale list, which takes a handle the kernel released meanwhile too), to be sent once that answer is in.
+  /// A reopen's deadline passes (`reopen_handles`), its reply not yet read: `client::exchange` resets its send side and counts it on the connection's `cancels`, made before the reopens, and reads the server's answer in the background; the handle, if still held, is dead, and its release owed (`apply_reopen`, and the stale list, which takes a handle the kernel released meanwhile too), to be sent once that answer is in.
   action reopenGiveUp(r: int): bool = {
     val q = reqs.get(r)
     val fh = fhOf(q)
@@ -547,9 +547,9 @@ module session {
     }
   }
 
-  // ---- The server's requests (`crates/server/src/session.rs` `handle_request`, `ops.rs`, `handles.rs`) ----
+  // ---- The server's requests (`crates/server/src/session.rs` `handle_request`, `crates/server/src/ops.rs`, `crates/server/src/handles.rs`) ----
 
-  /// The request is decoded and, for a change, the fence read once: held in `drain` if it is above zero, else straight to the blocking pool. Nothing arrives on a connection the server has lost.
+  /// The request is decoded and, for a change, the fence read once: held in `SessionState::drain` if it is above zero, else straight to the blocking pool. Nothing arrives on a connection the server has lost.
   action arrive(r: int): bool = {
     val q = reqs.get(r)
     all {
@@ -564,7 +564,7 @@ module session {
     }
   }
 
-  /// `SessionState::drain`: the held change goes on once nothing is left of the earlier connections' changes and of those given up on; one whose session has resumed elsewhere meanwhile is let go, and `begin` then refuses it.
+  /// `SessionState::drain`: the held change goes on once nothing is left of the earlier connections' changes and of those given up on; one whose session has resumed elsewhere meanwhile is let go, and `SessionState::begin` then refuses it.
   def canDrain(r: int): bool = {
     val q = reqs.get(r)
     val ses = sessions.get(q.session)
@@ -666,7 +666,7 @@ module session {
     )
   }
 
-  /// The work ends, with a reply or an errno (an open refused at `insert` with EBADF; a release, or an open answered from the handle under its id, never fails), and `GuardChange::drop` uncounts the change under the epoch it began at; one given up on sends no reply, but its work stands. The reply goes nowhere on a connection the server has lost.
+  /// The work ends, with a reply or an errno (an open refused at `Slot::insert` with EBADF; a release, or an open answered from the handle under its id, never fails), and `GuardChange::drop` uncounts the change under the epoch it began at; one given up on sends no reply, but its work stands. The reply goes nowhere on a connection the server has lost.
   action finish(r: int, errno: bool): bool = {
     val q = reqs.get(r)
     val ses = sessions.get(q.session)

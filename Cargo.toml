@@ -33,6 +33,7 @@ socket2 = "0.6"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 sha2 = "0.10"
 subtle = "2"
+syn = { version = "2", features = ["full", "visit"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "io-util", "net"] }

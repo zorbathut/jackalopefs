@@ -1,4 +1,6 @@
 //! The typed request API. A request on a live connection is waited for as long as that connection lives, or up to an optional deadline; only the wait for a connection is always bounded. A call whose reply was lost to a dropped connection is retried once on the next connection only when that is safe, and a call made for a kernel request is abandoned when the kernel interrupts that request.
+//!
+//! How a call is sent, given up on and resent, with the open and release paths, is modelled in `spec/session.qnt`; a change to it updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
 use crate::conn::{Attached, ConfigConn, ConnManager, ConnState};
 use crate::handles::Opener;

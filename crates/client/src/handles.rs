@@ -1,4 +1,6 @@
 //! Client-side table of open handles. The client chooses handle ids and never reuses one, so when an open's outcome is unknown (timeout, lost connection) the client can simply ask the server to release that id: releasing an id the server never opened is harmless, and releasing one it did closes the fd the client would otherwise never learn about.
+//!
+//! The table's held, dead and owed handles are modelled in `spec/session.qnt`; a change to them updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
 use crate::inodes::KeyNode;
 use jackalopefs_proto::control::{HandlesProcess, HandlesTotals};

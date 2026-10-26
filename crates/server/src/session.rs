@@ -1,4 +1,6 @@
 //! Connection handling: the hello handshake, session resumption, the event stream, and one task per request stream.
+//!
+//! The session protocol here (sessions and their epochs, the fence, the phases of a request) is modelled in `spec/session.qnt`; a change to it updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
 use crate::export::Export;
 use crate::handles::{HandlePool, Handles};

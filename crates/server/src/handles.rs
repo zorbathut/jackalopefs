@@ -1,4 +1,6 @@
 //! Per-session table of open files and directories, keyed by the client-chosen handle id.
+//!
+//! Reserving, inserting and removing handles is modelled in `spec/session.qnt`; a change to it updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
 use crate::watch::Armed;
 use jackalopefs_proto::control::HandlesTotals;

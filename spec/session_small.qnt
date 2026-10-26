@@ -2,7 +2,7 @@
 module session_small {
   import session(N = 3, R = 6, MAX_GEN = 3).* from "./session"
 
-  /// `reply_lost`: the original ran, its reply went with the connection, and the resend on the next connection waits behind it and then runs once.
+  /// `Fault::ReplyLost`: the original ran, its reply went with the connection, and the resend on the next connection waits behind it and then runs once.
   run replyLostTest = init
     .then(start(1, Change, true)).then(send(1)).then(arrive(1)).then(begin(1))
     .then(loseClient(1, Set())).expect(calls.get(1).status == Waiting and calls.get(1).lostOnce and calls.get(1).minGen == 2)
@@ -13,7 +13,7 @@ module session_small {
     .then(drain(2)).then(begin(2)).expect(phaseOf(1) == Finished and okSoFar)
     .then(finish(2, false)).then(receive(2)).expect(calls.get(1).outcome == Replied and okSoFar)
 
-  /// `original_late`: the original had not begun when its connection was lost and the session resumed elsewhere; it is refused by the epoch check, and the call's resend runs alone.
+  /// `Fault::OriginalLate`: the original had not begun when its connection was lost and the session resumed elsewhere; it is refused by the epoch check, and the call's resend runs alone.
   run originalLateTest = init
     .then(start(1, Change, true)).then(send(1)).then(arrive(1)).expect(phaseOf(1) == Ready)
     .then(loseClient(1, Set())).then(reconnect).expect(conns.get(1).serverAlive == false and phaseOf(1) == Ready and seenTakeover)
@@ -21,7 +21,7 @@ module session_small {
     .then(send(1)).then(arrive(2)).expect(phaseOf(2) == Ready)
     .then(begin(2)).then(finish(2, false)).then(receive(2)).expect(calls.get(1).outcome == Replied and okSoFar)
 
-  /// `original_running`: the original was running when the session resumed; the next connection's change is held until it finishes.
+  /// `Fault::OriginalRunning`: the original was running when the session resumed; the next connection's change is held until it finishes.
   run originalRunningTest = init
     .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))
     .then(loseClient(1, Set())).expect(calls.get(1).outcome == Failed)
@@ -30,7 +30,7 @@ module session_small {
     .then(send(2)).then(arrive(2)).expect(phaseOf(2) == Held)
     .then(finish(1, false)).then(drain(2)).then(begin(2)).expect(phaseOf(1) == Finished and okSoFar)
 
-  /// `cancelled`: a change given up on before it began is dropped unrun and answered so; the next change waits for that answer and then runs, with nothing to be held behind.
+  /// `Fault::Cancelled`: a change given up on before it began is dropped unrun and answered so; the next change waits for that answer and then runs, with nothing to be held behind.
   run cancelledTest = init
     .then(start(1, Change, false)).then(send(1)).then(arrive(1))
     .then(giveUp(1)).expect(conns.get(1).cancels == 1 and reqs.get(1).cancelSent)
@@ -41,7 +41,7 @@ module session_small {
     .then(send(2)).then(arrive(2)).expect(phaseOf(2) == Ready)
     .then(begin(2)).then(finish(2, false)).then(receive(2)).expect(calls.get(2).outcome == Replied and okSoFar)
 
-  /// `cancelled_running`: a change given up on while it ran is fenced; the next change is held behind it and begins only once it has finished.
+  /// `Fault::CancelledRunning`: a change given up on while it ran is fenced; the next change is held behind it and begins only once it has finished.
   run cancelledRunningTest = init
     .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))
     .then(giveUp(1)).then(seeCancel(1)).expect(phaseOf(1) == Abandoned and sessions.get(1).abandoned == 1)

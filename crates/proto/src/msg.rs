@@ -1,4 +1,6 @@
 //! Messages: the control-stream handshake, per-request bidi stream payloads, and the server-to-client event stream.
+//!
+//! Which requests are ordered (`Request::changes`) is modelled in `spec/session.qnt`; a change to it updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
 use crate::types::*;
 

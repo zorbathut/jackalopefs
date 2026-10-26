@@ -637,6 +637,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "subtle",
+ "syn 2.0.119",
  "tempfile",
  "thiserror",
  "tokio",

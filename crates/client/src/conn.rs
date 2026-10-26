@@ -1,4 +1,6 @@
 //! The connection manager: one background task that owns the QUIC connection, reconnects with backoff when it drops, resumes (or reopens) the handle table, and forwards the server's event stream.
+//!
+//! Connections by generation, reopens, publishing and the releases sent in the background are modelled in `spec/session.qnt`; a change to them updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
 use crate::client::{exchange, release_request, Error, ErrorExchange, KeyRoot, Tapping, Timing};
 use crate::handles::HandleTable;

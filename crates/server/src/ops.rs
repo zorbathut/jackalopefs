@@ -1,4 +1,6 @@
 //! One synchronous function per request, run on the blocking pool. Every path goes through [`Export`]; every open file goes through [`Handles`].
+//!
+//! What an open and a release do to the handle table is modelled in `spec/session.qnt`; a change to it updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
 use crate::dirents::read_dir_fd;
 use crate::export::{kind_from_mode, proc_path, Export};
