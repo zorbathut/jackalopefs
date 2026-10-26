@@ -446,12 +446,12 @@ pub fn fmt_handles(handles: &Handles) -> String {
             let mut rows: Vec<_> = rows.iter().collect();
             rows.sort_by_key(|r| std::cmp::Reverse(r.files + r.dirs));
             for r in &rows {
-                let state = if r.detached { "detached" } else { "attached" };
                 writeln!(
                     out,
-                    "{:>8} {:<40} {state:<9} {:>8} {:>8}",
+                    "{:>8} {:<40} {:<9} {:>8} {:>8}",
                     r.session,
                     clean(&r.remote),
+                    r.state.as_str(),
                     r.files,
                     r.dirs
                 )
@@ -753,7 +753,9 @@ pub async fn read_record<R: AsyncRead + Unpin>(input: &mut R) -> Result<Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jackalopefs_proto::control::{HandlesProcess, HandlesSession, HandlesTotals, TotalOp};
+    use jackalopefs_proto::control::{
+        HandlesProcess, HandlesSession, HandlesTotals, StateSession, TotalOp,
+    };
 
     #[test]
     fn only_listening_control_sockets_of_this_user_are_targets() {
@@ -992,16 +994,16 @@ mod tests {
             "a total: {processes}"
         );
 
-        let session = |session, detached, dirs| HandlesSession {
+        let session = |session, state, dirs| HandlesSession {
             session,
             remote: format!("192.0.2.{session}:4433"),
-            detached,
+            state,
             files: 2,
             dirs,
         };
         let sessions = fmt_handles(&Handles::Sessions(vec![
-            session(1, false, 3),
-            session(2, false, 7),
+            session(1, StateSession::Attached, 3),
+            session(2, StateSession::Attached, 7),
         ]));
         let first = sessions
             .lines()
@@ -1016,11 +1018,17 @@ mod tests {
             sessions.lines().any(|l| l.contains("14")),
             "a total: {sessions}"
         );
-        assert_ne!(
-            fmt_handles(&Handles::Sessions(vec![session(1, false, 3)])),
-            fmt_handles(&Handles::Sessions(vec![session(1, true, 3)])),
-            "attached and detached read differently"
-        );
+        let states = [
+            StateSession::Attached,
+            StateSession::Detached,
+            StateSession::Dropped,
+        ]
+        .map(|state| fmt_handles(&Handles::Sessions(vec![session(1, state, 3)])));
+        for (i, a) in states.iter().enumerate() {
+            for b in &states[i + 1..] {
+                assert_ne!(a, b, "each state reads differently");
+            }
+        }
         assert_ne!(fmt_handles(&Handles::Sessions(vec![])), "");
     }
 

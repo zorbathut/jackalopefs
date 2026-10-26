@@ -13,7 +13,7 @@ use jackalopefs_perf::{
     fmt_duration, line_process, line_quic, line_udp, lines_link, verdict, MeterLink, MeterProcess,
     MeterUdp, SampleLink, TrackerQuic,
 };
-use jackalopefs_proto::control::{HandlesSession, HandlesTotals, Summary};
+use jackalopefs_proto::control::{HandlesSession, HandlesTotals, StateSession, Summary};
 use jackalopefs_proto::{
     code_reset, encode, read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello,
     HelloReply, NoticeHandles, Request, Response, PROTO_REVISION,
@@ -374,21 +374,40 @@ impl Sessions {
         self.map.lock().get(&id).cloned()
     }
 
-    /// Every session's handles by kind, its client's last address and whether it is detached, in id order.
+    /// Every session that holds handles: those in the table, and the dropped ones something still holds, with whether each was dropped. Returned rather than used under the table's lock, since the snapshot may hold a dropped session's last reference, whose drop closes its handles.
+    fn snapshot(&self) -> Vec<(Arc<SessionState>, bool)> {
+        let map = self.map.lock();
+        let mut sessions: Vec<_> = map.values().map(|s| (s.clone(), false)).collect();
+        sessions.extend(
+            self.dropped
+                .lock()
+                .values()
+                .filter_map(Weak::upgrade)
+                .map(|s| (s, true)),
+        );
+        sessions
+    }
+
+    /// Every session's handles by kind, its client's last address and where it stands, in id order; a dropped session is listed while something of it still runs, since its handles stay open until then.
     pub fn handle_rows(&self) -> Vec<HandlesSession> {
         let mut rows: Vec<HandlesSession> = self
-            .map
-            .lock()
+            .snapshot()
             .iter()
-            .map(|(id, s)| {
+            .map(|(s, dropped)| {
                 let totals = s.handles.totals();
                 let attachment = s.attachment.lock();
                 HandlesSession {
-                    session: *id,
+                    session: s.id,
                     remote: attachment
                         .remote
                         .map_or_else(String::new, |remote| remote.to_string()),
-                    detached: attachment.detached_at.is_some(),
+                    state: if *dropped {
+                        StateSession::Dropped
+                    } else if attachment.detached_at.is_some() {
+                        StateSession::Detached
+                    } else {
+                        StateSession::Attached
+                    },
                     files: totals.files,
                     dirs: totals.dirs,
                 }
@@ -398,15 +417,15 @@ impl Sessions {
         rows
     }
 
-    /// The handles every session holds, by kind.
+    /// The handles every session holds, by kind, the dropped sessions' still open included.
     pub fn handle_totals(&self) -> HandlesTotals {
-        self.map.lock().values().map(|s| s.handles.totals()).fold(
-            HandlesTotals::default(),
-            |sum, t| HandlesTotals {
+        self.snapshot()
+            .iter()
+            .map(|(s, _)| s.handles.totals())
+            .fold(HandlesTotals::default(), |sum, t| HandlesTotals {
                 files: sum.files + t.files,
                 dirs: sum.dirs + t.dirs,
-            },
-        )
+            })
     }
 }
 
@@ -517,8 +536,7 @@ impl Server {
             Err(e) => tracing::warn!("counting open file descriptors: {e}"),
         }
         for row in self.sessions.handle_rows() {
-            let state = if row.detached { "detached" } else { "attached" };
-            tracing::info!(target: TRACE_TARGET, "perf handles session={} open={} files={} dirs={} state={state} remote={}", row.session, row.files + row.dirs, row.files, row.dirs, row.remote);
+            tracing::info!(target: TRACE_TARGET, "perf handles session={} open={} files={} dirs={} state={} remote={}", row.session, row.files + row.dirs, row.files, row.dirs, row.state.as_str(), row.remote);
         }
         let pool = self.sessions.pool();
         tracing::info!(target: TRACE_TARGET, "perf handles pool used={} capacity={}", pool.used(), pool.capacity());
@@ -1530,15 +1548,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(sessions.pool().used(), 1);
+        assert_eq!(sessions.handle_totals().files, 1);
         sessions.detach(state.id, epoch);
+        assert_eq!(sessions.handle_rows()[0].state, StateSession::Detached);
         assert_eq!(sessions.reap(Duration::ZERO), 1);
         assert_eq!(
             sessions.pool().used(),
             1,
             "the request holding it still runs"
         );
+        assert_eq!(
+            sessions.handle_totals().files,
+            1,
+            "a dropped session's handles are still open and counted"
+        );
+        let rows = sessions.handle_rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].session, state.id);
+        assert_eq!(rows[0].state, StateSession::Dropped);
+        assert_eq!(rows[0].files, 1);
         drop(state);
         assert_eq!(sessions.pool().used(), 0);
+        assert_eq!(sessions.handle_totals().files, 0);
+        assert!(sessions.handle_rows().is_empty());
     }
 
     #[test]
@@ -1616,6 +1648,9 @@ mod tests {
             sessions.get(state.id).is_some(),
             "back in the table, to be detached and reaped as before"
         );
+        let rows = sessions.handle_rows();
+        assert_eq!(rows.len(), 1, "listed once: {rows:?}");
+        assert_eq!(rows[0].state, StateSession::Attached);
         assert_eq!(
             state.fencing(second),
             1,

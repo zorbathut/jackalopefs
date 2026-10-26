@@ -5,6 +5,7 @@ use jackalopefs_client::ids::{IdMap, ModeIds as ModeIdsClient};
 use jackalopefs_client::{
     ConnState, Error, ErrorConnect, ErrorConnectKind, PhaseCall, RequestKernel, ServerTrust,
 };
+use jackalopefs_proto::control::StateSession;
 use jackalopefs_proto::owners::NOBODY;
 use jackalopefs_proto::{
     Auth, Hello, HelloReply, Path, Request, SetAttr, TimeOrNow, TimeSpec, PROTO_REVISION,
@@ -1429,7 +1430,7 @@ async fn a_resume_that_fails_before_its_ack_leaves_the_session_detached() {
             .sessions
             .handle_rows()
             .iter()
-            .any(|row| row.session == session_id && row.detached)
+            .any(|row| row.session == session_id && row.state == StateSession::Detached)
     };
     wait_for(
         Duration::from_secs(3),
@@ -1549,7 +1550,7 @@ async fn a_dropped_session_whose_change_still_runs_is_resumed() {
                 .sessions
                 .handle_rows()
                 .iter()
-                .any(|row| row.session == session_id && row.detached)
+                .any(|row| row.session == session_id && row.state == StateSession::Detached)
                 .then_some(())
         },
     )

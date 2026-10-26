@@ -130,13 +130,23 @@ struct HandlesProcess {
 }
 
 # On a server, the sessions holding handles, one row each, with the address
-# of the session's client when it was last attached.
+# of the session's client when it was last attached and where the session
+# stands.
 struct HandlesSession {
   session @0 :UInt64;
   remote @1 :Text;
-  detached @2 :Bool;
+  state @2 :StateSession;
   files @3 :UInt64;
   dirs @4 :UInt64;
+}
+
+# Detached: in its grace period, waiting for its client to resume it.
+# Dropped: past its grace (or evicted), kept, handles and all, while
+# requests of it still run; a client that names it still resumes it.
+enum StateSession {
+  attached @0;
+  detached @1;
+  dropped @2;
 }
 
 # At most 256 rows, the largest first.

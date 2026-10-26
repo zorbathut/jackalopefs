@@ -124,9 +124,29 @@ pub struct HandlesProcess {
 pub struct HandlesSession {
     pub session: u64,
     pub remote: String,
-    pub detached: bool,
+    pub state: StateSession,
     pub files: u64,
     pub dirs: u64,
+}
+
+/// Where a session stands on its server; see `StateSession` in the schema.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StateSession {
+    #[default]
+    Attached,
+    Detached,
+    Dropped,
+}
+
+impl StateSession {
+    /// The word a listing or log line shows for it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StateSession::Attached => "attached",
+            StateSession::Detached => "detached",
+            StateSession::Dropped => "dropped",
+        }
+    }
 }
 
 /// Most rows a [`Handles`] reply carries; the largest are kept.
@@ -597,7 +617,11 @@ fn parse_handles(r: schema::handles::Reader<'_>) -> Result<Handles, ErrorDecode>
                     Ok(HandlesSession {
                         session: r.get_session(),
                         remote: text(r.get_remote()?)?,
-                        detached: r.get_detached(),
+                        state: match r.get_state()? {
+                            schema::StateSession::Attached => StateSession::Attached,
+                            schema::StateSession::Detached => StateSession::Detached,
+                            schema::StateSession::Dropped => StateSession::Dropped,
+                        },
                         files: r.get_files(),
                         dirs: r.get_dirs(),
                     })
@@ -674,7 +698,11 @@ impl Message for ControlReply {
                             let mut b = list.reborrow().get(i as u32);
                             b.set_session(row.session);
                             b.set_remote(row.remote.as_str());
-                            b.set_detached(row.detached);
+                            b.set_state(match row.state {
+                                StateSession::Attached => schema::StateSession::Attached,
+                                StateSession::Detached => schema::StateSession::Detached,
+                                StateSession::Dropped => schema::StateSession::Dropped,
+                            });
                             b.set_files(row.files);
                             b.set_dirs(row.dirs);
                         }
@@ -822,13 +850,18 @@ mod tests {
             HandlesSession {
                 session: 1,
                 remote: "192.0.2.1:4433".into(),
-                detached: false,
+                state: StateSession::Attached,
                 files: 2,
                 dirs: 3,
             },
             HandlesSession {
                 session: 2,
-                detached: true,
+                state: StateSession::Detached,
+                ..HandlesSession::default()
+            },
+            HandlesSession {
+                session: 3,
+                state: StateSession::Dropped,
                 ..HandlesSession::default()
             },
         ])));
