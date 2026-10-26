@@ -146,14 +146,17 @@ impl From<Errno> for Failure {
     }
 }
 
-/// Run one request; every failure becomes an errno for the client. The owner policy (`--ids`) is checked before anything is touched and applied to what goes back. Running out of handles or file descriptors, whether the server's pool or the process's limit, is logged with what this session holds, since the handles of every session share both.
-pub fn dispatch(ops: &Ops, req: Request) -> Response {
+/// What [`Ops::reserve`] took for a request: for an open, a slot of the pool or the handle already under its id; for any other request, nothing.
+pub type Reservation = Result<Option<Reserved>, ErrorReserve>;
+
+/// Run one request, with what [`Ops::reserve`] reserved for it as it began; every failure becomes an errno for the client. The owner policy (`--ids`) is checked before anything is touched and applied to what goes back. Running out of handles or file descriptors, whether the server's pool or the process's limit, is logged with what this session holds, since the handles of every session share both.
+pub fn dispatch(ops: &Ops, req: Request, reserved: Reservation) -> Response {
     let op = req.op_name();
     if let Err(errno) = ops.ids.admit(&req) {
         return Response::Err(errno as i32);
     }
     let posix_acl_read = reads_posix_acl(&req);
-    match ops.run(req) {
+    match ops.run(req, reserved) {
         Ok(mut resp) => {
             ops.ids.reply(posix_acl_read, &mut resp);
             resp
@@ -324,8 +327,22 @@ impl Ops {
         );
     }
 
+    /// What an open reserves under its id as it begins ([`Handles::reserve`]), before anything is opened; nothing for any other request.
+    pub fn reserve(&self, req: &Request) -> Reservation {
+        match req {
+            Request::Open { fh, .. } | Request::Create { fh, .. } | Request::Opendir { fh, .. } => {
+                self.handles.reserve(*fh).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// A request that keeps a handle can fail for want of a slot in the pool; every one can fail with an errno.
-    fn run(&self, req: Request) -> Result<Response, Failure> {
+    fn run(&self, req: Request, reserved: Reservation) -> Result<Response, Failure> {
+        // What `Ops::reserve` took for the opens below (Open, Create, Opendir), the requests it reserves for.
+        let reserved = || -> Result<Reserved, Failure> {
+            Ok(reserved?.expect("Ops::reserve reserves for every open"))
+        };
         match req {
             Request::Lookup { parent, name } => {
                 let dir = self.export.resolve_dir(&parent)?;
@@ -446,8 +463,8 @@ impl Ops {
                 )?;
                 Ok(Response::Entry(self.attr_in(&new_dir, &newname)?))
             }
-            Request::Open { fh, path, flags } => {
-                let slot = match self.handles.reserve(fh)? {
+            Request::Open { path, flags, .. } => {
+                let slot = match reserved()? {
                     Reserved::Slot(slot) => slot,
                     Reserved::Held(handle) => return self.opened_already(&handle),
                 };
@@ -470,13 +487,13 @@ impl Ops {
                 Ok(Response::Opened { attr })
             }
             Request::Create {
-                fh,
                 parent,
                 name,
                 mode,
                 flags,
+                ..
             } => {
-                let slot = match self.handles.reserve(fh)? {
+                let slot = match reserved()? {
                     Reserved::Slot(slot) => slot,
                     Reserved::Held(handle) => return self.opened_already(&handle),
                 };
@@ -613,8 +630,8 @@ impl Ops {
                 }
                 Ok(Response::Ok)
             }
-            Request::Opendir { fh, path } => {
-                let slot = match self.handles.reserve(fh)? {
+            Request::Opendir { path, .. } => {
+                let slot = match reserved()? {
                     Reserved::Slot(slot) => slot,
                     Reserved::Held(handle) => return self.opened_already(&handle),
                 };
@@ -890,6 +907,12 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    /// [`dispatch`] as a request runs once it has begun: an open reserves its slot first.
+    fn dispatch_begun(ops: &Ops, req: Request) -> Response {
+        let reserved = ops.reserve(&req);
+        dispatch(ops, req, reserved)
+    }
+
     fn fixture() -> (tempfile::TempDir, Ops) {
         nix::sys::stat::umask(Mode::empty());
         let dir = tempfile::tempdir().unwrap();
@@ -898,10 +921,10 @@ mod tests {
             dir,
             Ops {
                 export,
-                handles: Arc::new(Handles::new(
+                handles: Handles::new(
                     crate::handles::SHARE_MAX,
                     Arc::new(HandlePool::new(usize::MAX)),
-                )),
+                ),
                 session_id: 1,
                 conn: None,
                 changes: Arc::new(ChangeLog::default()),
@@ -935,7 +958,7 @@ mod tests {
     #[test]
     fn create_write_read_release() {
         let (dir, ops) = fixture();
-        let created = expect_attr(dispatch(
+        let created = expect_attr(dispatch_begun(
             &ops,
             Request::Create {
                 fh: 1,
@@ -951,7 +974,7 @@ mod tests {
             "server umask must not apply on top of the client's"
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Write {
                     fh: 1,
@@ -962,7 +985,7 @@ mod tests {
             Response::Written(11)
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Read {
                     fh: 1,
@@ -974,7 +997,7 @@ mod tests {
         );
         assert_eq!(fs::read(dir.path().join("f")).unwrap(), b"hello world");
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Release {
                     fh: 1,
@@ -985,7 +1008,7 @@ mod tests {
         );
         assert!(ops.handles.is_empty());
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Read {
                     fh: 1,
@@ -996,7 +1019,7 @@ mod tests {
             Response::Err(Errno::EBADF as i32)
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Release {
                     fh: 1,
@@ -1018,13 +1041,13 @@ mod tests {
             path: path("f"),
             flags: libc::O_RDWR,
         };
-        let original = expect_attr(dispatch(&ops, open()));
+        let original = expect_attr(dispatch_begun(&ops, open()));
         fs::remove_file(dir.path().join("f")).unwrap();
-        let resent = expect_attr(dispatch(&ops, open()));
+        let resent = expect_attr(dispatch_begun(&ops, open()));
         assert_eq!(resent.ino, original.ino);
         assert_eq!(ops.handles.len(), 1);
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Read {
                     fh: 1,
@@ -1035,7 +1058,7 @@ mod tests {
             Response::Read(b"contents".to_vec())
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Release {
                     fh: 1,
@@ -1048,7 +1071,7 @@ mod tests {
     }
 
     fn open(ops: &Ops, fh: u64, file: &str, flags: i32) {
-        expect_attr(dispatch(
+        expect_attr(dispatch_begun(
             ops,
             Request::Open {
                 fh,
@@ -1066,7 +1089,7 @@ mod tests {
         offset_out: u64,
         len: u64,
     ) -> Response {
-        dispatch(
+        dispatch_begun(
             ops,
             Request::CopyFileRange {
                 fh_in,
@@ -1091,7 +1114,7 @@ mod tests {
             b"abcd23456jklmnop"
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Read {
                     fh: 2,
@@ -1134,7 +1157,7 @@ mod tests {
         open(&ops, 1, "src", libc::O_RDONLY);
         open(&ops, 2, "dst", libc::O_RDWR);
         open(&ops, 3, "dst", libc::O_RDONLY);
-        dispatch(
+        dispatch_begun(
             &ops,
             Request::Opendir {
                 fh: 4,
@@ -1183,7 +1206,7 @@ mod tests {
     }
 
     fn fallocate(ops: &Ops, fh: u64, offset: u64, len: u64, mode: i32) -> Response {
-        dispatch(
+        dispatch_begun(
             ops,
             Request::Fallocate {
                 fh,
@@ -1255,7 +1278,7 @@ mod tests {
     }
 
     fn seek(ops: &Ops, fh: u64, offset: u64, whence: Whence) -> Response {
-        dispatch(ops, Request::Lseek { fh, offset, whence })
+        dispatch_begun(ops, Request::Lseek { fh, offset, whence })
     }
 
     /// Where a filesystem draws the line between data and hole is its own business, so the server's answer is held against the same `lseek` on the export's file.
@@ -1305,7 +1328,7 @@ mod tests {
             refused(Errno::EBADF),
             "unknown handle"
         );
-        dispatch(
+        dispatch_begun(
             &ops,
             Request::Opendir {
                 fh: 2,
@@ -1319,7 +1342,7 @@ mod tests {
         );
         // A seek moves the descriptor's position, which nothing reads: a read still starts where it says.
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Read {
                     fh: 1,
@@ -1337,7 +1360,7 @@ mod tests {
         fs::write(dir.path().join("f"), b"0123456789").unwrap();
         open(&ops, 1, "f", libc::O_RDWR);
         open(&ops, 2, "f", libc::O_RDONLY);
-        dispatch(
+        dispatch_begun(
             &ops,
             Request::Opendir {
                 fh: 3,
@@ -1387,7 +1410,7 @@ mod tests {
     fn append_handle_ignores_offset() {
         let (dir, ops) = fixture();
         fs::write(dir.path().join("log"), b"start-").unwrap();
-        dispatch(
+        dispatch_begun(
             &ops,
             Request::Open {
                 fh: 5,
@@ -1395,7 +1418,7 @@ mod tests {
                 flags: libc::O_WRONLY | libc::O_APPEND,
             },
         );
-        dispatch(
+        dispatch_begun(
             &ops,
             Request::Write {
                 fh: 5,
@@ -1409,7 +1432,7 @@ mod tests {
     #[test]
     fn directory_ops_and_lookup() {
         let (dir, ops) = fixture();
-        let made = expect_attr(dispatch(
+        let made = expect_attr(dispatch_begun(
             &ops,
             Request::Mkdir {
                 parent: Path::root(),
@@ -1426,7 +1449,7 @@ mod tests {
                 & 0o7777,
             0o777
         );
-        let looked = expect_attr(dispatch(
+        let looked = expect_attr(dispatch_begun(
             &ops,
             Request::Lookup {
                 parent: Path::root(),
@@ -1435,7 +1458,7 @@ mod tests {
         ));
         assert_eq!(looked.ino, made.ino);
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Lookup {
                     parent: Path::root(),
@@ -1445,7 +1468,7 @@ mod tests {
             Response::Err(Errno::ENOENT as i32)
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Rmdir {
                     parent: Path::root(),
@@ -1461,7 +1484,7 @@ mod tests {
     fn symlink_link_rename_unlink() {
         let (dir, ops) = fixture();
         fs::write(dir.path().join("a"), b"A").unwrap();
-        let linked = expect_attr(dispatch(
+        let linked = expect_attr(dispatch_begun(
             &ops,
             Request::Symlink {
                 parent: Path::root(),
@@ -1471,11 +1494,11 @@ mod tests {
         ));
         assert_eq!(linked.kind, FileKind::Symlink);
         assert_eq!(
-            dispatch(&ops, Request::Readlink { path: path("s") }),
+            dispatch_begun(&ops, Request::Readlink { path: path("s") }),
             Response::Readlink(b"a".to_vec())
         );
 
-        let hard = expect_attr(dispatch(
+        let hard = expect_attr(dispatch_begun(
             &ops,
             Request::Link {
                 path: path("a"),
@@ -1487,7 +1510,7 @@ mod tests {
         assert_eq!(hard.ino, fs::metadata(dir.path().join("a")).unwrap().ino());
 
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Rename {
                     parent: Path::root(),
@@ -1500,7 +1523,7 @@ mod tests {
             Response::Err(Errno::EEXIST as i32)
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Rename {
                     parent: Path::root(),
@@ -1514,7 +1537,7 @@ mod tests {
         );
         assert!(dir.path().join("c").exists() && !dir.path().join("b").exists());
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Rename {
                     parent: Path::root(),
@@ -1527,7 +1550,7 @@ mod tests {
             Response::Err(Errno::EINVAL as i32)
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Unlink {
                     parent: Path::root(),
@@ -1537,7 +1560,7 @@ mod tests {
             Response::Ok
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Unlink {
                     parent: Path::root(),
@@ -1547,7 +1570,7 @@ mod tests {
             Response::Ok
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Link {
                     path: Path::root(),
@@ -1563,7 +1586,7 @@ mod tests {
     fn setattr_by_path_and_by_handle() {
         let (dir, ops) = fixture();
         fs::write(dir.path().join("f"), b"0123456789").unwrap();
-        let attr = expect_attr(dispatch(
+        let attr = expect_attr(dispatch_begun(
             &ops,
             Request::Setattr {
                 path: Some(path("f")),
@@ -1589,7 +1612,7 @@ mod tests {
             }
         );
 
-        dispatch(
+        dispatch_begun(
             &ops,
             Request::Open {
                 fh: 9,
@@ -1598,7 +1621,7 @@ mod tests {
             },
         );
         fs::remove_file(dir.path().join("f")).unwrap();
-        let after = expect_attr(dispatch(
+        let after = expect_attr(dispatch_begun(
             &ops,
             Request::Setattr {
                 path: None,
@@ -1614,7 +1637,7 @@ mod tests {
             "an unlinked open file is still reachable through its handle"
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Getattr {
                     path: None,
@@ -1624,7 +1647,7 @@ mod tests {
             Response::Attr(after)
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Setattr {
                     path: None,
@@ -1639,7 +1662,7 @@ mod tests {
             "an unknown handle never falls back to a path"
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Getattr {
                     path: None,
@@ -1648,14 +1671,14 @@ mod tests {
             ),
             Response::Err(Errno::EINVAL as i32)
         );
-        dispatch(
+        dispatch_begun(
             &ops,
             Request::Opendir {
                 fh: 10,
                 path: Path::root(),
             },
         );
-        let dir_touched = expect_attr(dispatch(
+        let dir_touched = expect_attr(dispatch_begun(
             &ops,
             Request::Setattr {
                 path: None,
@@ -1674,7 +1697,7 @@ mod tests {
             "directory handles work for setattr too"
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Getattr {
                     path: Some(path("f")),
@@ -1686,7 +1709,7 @@ mod tests {
 
         std::os::unix::fs::symlink("f", dir.path().join("l")).unwrap();
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Setattr {
                     path: Some(path("l")),
@@ -1699,7 +1722,7 @@ mod tests {
             ),
             Response::Err(Errno::EOPNOTSUPP as i32)
         );
-        let touched = expect_attr(dispatch(
+        let touched = expect_attr(dispatch_begun(
             &ops,
             Request::Setattr {
                 path: Some(path("l")),
@@ -1725,7 +1748,7 @@ mod tests {
     fn readdir_and_opendir() {
         let (dir, ops) = fixture();
         fs::write(dir.path().join("x"), b"").unwrap();
-        let attr = expect_attr(dispatch(
+        let attr = expect_attr(dispatch_begun(
             &ops,
             Request::Opendir {
                 fh: 2,
@@ -1734,7 +1757,7 @@ mod tests {
         ));
         let root_ino = fs::metadata(dir.path()).unwrap().ino();
         assert_eq!(attr.ino, root_ino);
-        match dispatch(
+        match dispatch_begun(
             &ops,
             Request::Readdir {
                 fh: 2,
@@ -1758,7 +1781,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Releasedir {
                     fh: 2,
@@ -1768,7 +1791,7 @@ mod tests {
             Response::Ok
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Opendir {
                     fh: 3,
@@ -1783,7 +1806,7 @@ mod tests {
     fn xattr_statfs_access() {
         let (dir, ops) = fixture();
         fs::write(dir.path().join("f"), b"").unwrap();
-        let set = dispatch(
+        let set = dispatch_begun(
             &ops,
             Request::Setxattr {
                 path: path("f"),
@@ -1797,7 +1820,7 @@ mod tests {
         } else {
             assert_eq!(set, Response::Ok);
             // The attributes carry the names, from every reply shape that has them.
-            let by_path = expect_attr(dispatch(
+            let by_path = expect_attr(dispatch_begun(
                 &ops,
                 Request::Getattr {
                     path: Some(path("f")),
@@ -1805,7 +1828,7 @@ mod tests {
                 },
             ));
             assert_eq!(by_path.xattr_names, Some(vec![b"user.k".to_vec()]));
-            let by_lookup = expect_attr(dispatch(
+            let by_lookup = expect_attr(dispatch_begun(
                 &ops,
                 Request::Lookup {
                     parent: Path::root(),
@@ -1814,7 +1837,7 @@ mod tests {
             ));
             assert_eq!(by_lookup.xattr_names, Some(vec![b"user.k".to_vec()]));
             fs::write(dir.path().join("plain"), b"").unwrap();
-            let plain = expect_attr(dispatch(
+            let plain = expect_attr(dispatch_begun(
                 &ops,
                 Request::Lookup {
                     parent: Path::root(),
@@ -1827,7 +1850,7 @@ mod tests {
                 "no names is a statement, not an unknown"
             );
             assert_eq!(
-                dispatch(
+                dispatch_begun(
                     &ops,
                     Request::Getxattr {
                         path: path("f"),
@@ -1837,11 +1860,11 @@ mod tests {
                 Response::Xattr(b"v".to_vec())
             );
             assert_eq!(
-                dispatch(&ops, Request::Listxattr { path: path("f") }),
+                dispatch_begun(&ops, Request::Listxattr { path: path("f") }),
                 Response::Xattr(b"user.k\0".to_vec())
             );
             assert_eq!(
-                dispatch(
+                dispatch_begun(
                     &ops,
                     Request::Removexattr {
                         path: path("f"),
@@ -1851,7 +1874,7 @@ mod tests {
                 Response::Ok
             );
             assert_eq!(
-                dispatch(
+                dispatch_begun(
                     &ops,
                     Request::Getxattr {
                         path: path("f"),
@@ -1861,14 +1884,14 @@ mod tests {
                 Response::Err(Errno::ENODATA as i32)
             );
         }
-        match dispatch(&ops, Request::Statfs { path: Path::root() }) {
+        match dispatch_begun(&ops, Request::Statfs { path: Path::root() }) {
             Response::Statfs(s) => assert!(
                 s.blocks > 0 && s.bsize > 0 && s.namelen > 0 && s.namelen <= NAME_MAX as u32
             ),
             other => panic!("{other:?}"),
         }
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Access {
                     path: path("f"),
@@ -1878,7 +1901,7 @@ mod tests {
             Response::Ok
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Access {
                     path: path("f"),
@@ -1913,7 +1936,7 @@ mod tests {
     #[test]
     fn special_files_cannot_park_a_thread_or_be_served() {
         let (dir, ops) = fixture();
-        let made = expect_attr(dispatch(
+        let made = expect_attr(dispatch_begun(
             &ops,
             Request::Mknod {
                 parent: Path::root(),
@@ -1925,7 +1948,7 @@ mod tests {
         assert_eq!(made.kind, FileKind::Fifo);
         let started = std::time::Instant::now();
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Open {
                     fh: 1,
@@ -1941,7 +1964,7 @@ mod tests {
         );
         assert!(ops.handles.is_empty());
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Setattr {
                     path: Some(path("fifo")),
@@ -1955,7 +1978,7 @@ mod tests {
             Response::Err(Errno::EOPNOTSUPP as i32)
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Mknod {
                     parent: Path::root(),
@@ -1970,24 +1993,76 @@ mod tests {
     }
 
     #[test]
+    fn an_open_takes_its_slot_as_it_begins_and_gives_it_back_if_it_fails() {
+        let (dir, mut ops) = fixture();
+        let pool = Arc::new(HandlePool::new(1));
+        ops.handles = Handles::new(1, pool.clone());
+        fs::write(dir.path().join("f"), b"").unwrap();
+        let open = |fh, name| Request::Open {
+            fh,
+            path: path(name),
+            flags: libc::O_RDONLY,
+        };
+        let missing = open(1, "missing");
+        let reserved = ops.reserve(&missing);
+        assert_eq!(pool.used(), 1, "taken before anything is opened");
+        assert_eq!(
+            dispatch(&ops, missing, reserved),
+            Response::Err(Errno::ENOENT as i32)
+        );
+        assert_eq!(pool.used(), 0, "given back by the open that failed");
+        let first = open(2, "f");
+        let reserved = ops.reserve(&first);
+        let refused = open(3, "f");
+        let refused_reserved = ops.reserve(&refused);
+        assert!(refused_reserved.is_err(), "the pool is full");
+        assert_eq!(
+            dispatch(&ops, refused, refused_reserved),
+            Response::Err(Errno::EMFILE as i32)
+        );
+        assert!(matches!(
+            dispatch(&ops, first, reserved),
+            Response::Opened { .. }
+        ));
+        assert_eq!(pool.used(), 1);
+        assert!(
+            matches!(ops.reserve(&open(2, "f")), Ok(Some(Reserved::Held(_)))),
+            "a resend finds the handle"
+        );
+        assert!(matches!(
+            ops.reserve(&Request::Release {
+                fh: 2,
+                ordered: false
+            }),
+            Ok(None)
+        ));
+    }
+
+    #[test]
     fn a_session_past_its_share_still_opens_until_the_pool_is_full() {
         let (dir, mut ops) = fixture();
         let pool = Arc::new(HandlePool::new(2));
-        ops.handles = Arc::new(Handles::new(1, pool.clone()));
+        ops.handles = Handles::new(1, pool.clone());
         fs::write(dir.path().join("f"), b"").unwrap();
         let open = |fh| Request::Open {
             fh,
             path: path("f"),
             flags: libc::O_RDONLY,
         };
-        assert!(matches!(dispatch(&ops, open(1)), Response::Opened { .. }));
+        assert!(matches!(
+            dispatch_begun(&ops, open(1)),
+            Response::Opened { .. }
+        ));
         assert!(
-            matches!(dispatch(&ops, open(2)), Response::Opened { .. }),
+            matches!(dispatch_begun(&ops, open(2)), Response::Opened { .. }),
             "past its share"
         );
-        assert_eq!(dispatch(&ops, open(3)), Response::Err(Errno::EMFILE as i32));
         assert_eq!(
-            dispatch(
+            dispatch_begun(&ops, open(3)),
+            Response::Err(Errno::EMFILE as i32)
+        );
+        assert_eq!(
+            dispatch_begun(
                 &ops,
                 Request::Opendir {
                     fh: 4,
@@ -1997,11 +2072,11 @@ mod tests {
             Response::Err(Errno::EMFILE as i32)
         );
         assert!(
-            matches!(dispatch(&ops, open(1)), Response::Opened { .. }),
+            matches!(dispatch_begun(&ops, open(1)), Response::Opened { .. }),
             "a resend under an id already held answers from its handle, full pool or not"
         );
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Release {
                     fh: 1,
@@ -2011,9 +2086,12 @@ mod tests {
             Response::Ok
         );
         assert_eq!(pool.used(), 1);
-        assert!(matches!(dispatch(&ops, open(3)), Response::Opened { .. }));
+        assert!(matches!(
+            dispatch_begun(&ops, open(3)),
+            Response::Opened { .. }
+        ));
         assert_eq!(
-            dispatch(
+            dispatch_begun(
                 &ops,
                 Request::Create {
                     fh: 5,
@@ -2094,35 +2172,38 @@ mod tests {
     fn flatten_refuses_an_acl_naming_another_user_that_the_kernel_would_allow() {
         let (dir, ops) = fixture();
         fs::write(dir.path().join("f"), b"").unwrap();
-        let direct = dispatch(&ops, set_acl("f", acl_naming(4242)));
+        let direct = dispatch_begun(&ops, set_acl("f", acl_naming(4242)));
         if direct == Response::Err(Errno::EOPNOTSUPP as i32) {
             eprintln!("skipping: filesystem does not support POSIX ACLs");
             return;
         }
         assert_eq!(direct, Response::Ok);
         assert_eq!(
-            dispatch(&ops, get_acl("f")),
+            dispatch_begun(&ops, get_acl("f")),
             Response::Xattr(acl_naming(4242))
         );
 
         let ops = flattening(ops);
         assert_eq!(
-            dispatch(&ops, get_acl("f")),
+            dispatch_begun(&ops, get_acl("f")),
             Response::Xattr(acl_naming(NOBODY))
         );
         fs::write(dir.path().join("g"), b"").unwrap();
         assert_eq!(
-            dispatch(&ops, set_acl("g", acl_naming(4243))),
+            dispatch_begun(&ops, set_acl("g", acl_naming(4243))),
             Response::Err(Errno::EPERM as i32)
         );
         assert_eq!(
-            dispatch(&ops, set_acl("g", acl_naming(NOBODY))),
+            dispatch_begun(&ops, set_acl("g", acl_naming(NOBODY))),
             Response::Err(Errno::EPERM as i32)
         );
         let own = nix::unistd::geteuid().as_raw();
-        assert_eq!(dispatch(&ops, set_acl("g", acl_naming(own))), Response::Ok);
         assert_eq!(
-            dispatch(&ops, get_acl("g")),
+            dispatch_begun(&ops, set_acl("g", acl_naming(own))),
+            Response::Ok
+        );
+        assert_eq!(
+            dispatch_begun(&ops, get_acl("g")),
             Response::Xattr(acl_naming(own))
         );
     }
@@ -2154,7 +2235,7 @@ mod tests {
         let refresh = |mode| fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
 
         refresh(0o644);
-        let attr = expect_attr(dispatch(&ops, chgrp(other.as_raw())));
+        let attr = expect_attr(dispatch_begun(&ops, chgrp(other.as_raw())));
         assert_eq!(
             (attr.gid, attr.perm & 0o7777),
             (other.as_raw(), 0o600),
@@ -2164,7 +2245,7 @@ mod tests {
         let ops = flattening(ops);
         refresh(0o644);
         assert_eq!(
-            dispatch(&ops, chgrp(other.as_raw())),
+            dispatch_begun(&ops, chgrp(other.as_raw())),
             Response::Err(Errno::EPERM as i32)
         );
         assert_eq!(
@@ -2172,7 +2253,7 @@ mod tests {
             0o644,
             "nothing of a refused setattr is applied"
         );
-        let attr = expect_attr(dispatch(&ops, chgrp(egid.as_raw())));
+        let attr = expect_attr(dispatch_begun(&ops, chgrp(egid.as_raw())));
         assert_eq!((attr.gid, attr.perm & 0o7777), (egid.as_raw(), 0o600));
     }
 }

@@ -86,24 +86,24 @@ impl HandlePool {
 }
 
 /// What an open under some id goes on with: a slot for the handle it is about to open, or the handle already under the id.
-pub enum Reserved<'a> {
-    Slot(Slot<'a>),
+pub enum Reserved {
+    Slot(Slot),
     /// The open is a resend whose original ran and kept this handle: M1 has the original finish before its resend begins, and the client never reuses an id, so nothing else can be under it. The resend answers from it and opens nothing again.
     Held(Handle),
 }
 
 /// A slot of the pool held for one open until its handle is inserted; given back if it never is.
-pub struct Slot<'a> {
-    handles: &'a Handles,
+pub struct Slot {
+    handles: Arc<Handles>,
     fh: u64,
     /// Whether the slot is still this open's own, which the handle takes over once inserted.
     taken: bool,
 }
 
-impl Slot<'_> {
+impl Slot {
     /// Register `handle` under the slot's `fh`. The answer is the number of handles held when that just crossed a report threshold (the share, then each doubling), for the dispatcher to log with the rest of the session's state. Refused, and `handle` closed, when another open of the same id got there first, which a client keeping to the protocol never sends.
     pub fn insert(mut self, handle: Handle) -> Result<Option<u64>, ErrorReserve> {
-        let handles = self.handles;
+        let handles = self.handles.clone();
         let mut map = handles.map.lock();
         if map.contains_key(&self.fh) {
             tracing::error!(
@@ -130,7 +130,7 @@ impl Slot<'_> {
     }
 }
 
-impl Drop for Slot<'_> {
+impl Drop for Slot {
     fn drop(&mut self) {
         if self.taken {
             self.handles.pool.give(1);
@@ -172,8 +172,8 @@ impl Handle {
 }
 
 impl Handles {
-    pub fn new(share: usize, pool: Arc<HandlePool>) -> Handles {
-        Handles {
+    pub fn new(share: usize, pool: Arc<HandlePool>) -> Arc<Handles> {
+        Arc::new(Handles {
             map: Mutex::new(HashMap::new()),
             share,
             pool,
@@ -183,7 +183,7 @@ impl Handles {
             notice: watch::Sender::new(None),
             #[cfg(feature = "spec-trace")]
             traced: std::sync::OnceLock::new(),
-        }
+        })
     }
 
     #[cfg(feature = "spec-trace")]
@@ -239,7 +239,7 @@ impl Handles {
     }
 
     /// A slot of the pool for an open under `fh`, taken before anything is opened so that a refusal has changed nothing; past the session's share too. A resend of an open whose original kept its handle gets that handle instead ([`Reserved::Held`]). No open comes under an id after the client released it: a release of an id whose open may still land is ordered behind that open (`Request::Release`).
-    pub fn reserve(&self, fh: u64) -> Result<Reserved<'_>, ErrorReserve> {
+    pub fn reserve(self: &Arc<Self>, fh: u64) -> Result<Reserved, ErrorReserve> {
         {
             let map = self.map.lock();
             if let Some(handle) = map.get(&fh) {
@@ -254,7 +254,7 @@ impl Handles {
         #[cfg(feature = "spec-trace")]
         self.traced_reserve(fh, false);
         Ok(Reserved::Slot(Slot {
-            handles: self,
+            handles: self.clone(),
             fh,
             taken: true,
         }))
@@ -262,13 +262,13 @@ impl Handles {
 
     /// [`Handles::reserve`] and [`Slot::insert`] at once.
     #[cfg(test)]
-    pub fn insert(&self, fh: u64, handle: Handle) -> Result<Option<u64>, ErrorReserve> {
+    pub fn insert(self: &Arc<Self>, fh: u64, handle: Handle) -> Result<Option<u64>, ErrorReserve> {
         self.slot(fh)?.insert(handle)
     }
 
     /// [`Handles::reserve`] of an id not held.
     #[cfg(test)]
-    pub fn slot(&self, fh: u64) -> Result<Slot<'_>, ErrorReserve> {
+    pub fn slot(self: &Arc<Self>, fh: u64) -> Result<Slot, ErrorReserve> {
         match self.reserve(fh)? {
             Reserved::Slot(slot) => Ok(slot),
             Reserved::Held(_) => panic!("{fh} is held"),
@@ -415,9 +415,7 @@ mod tests {
     #[test]
     fn the_pool_counts_every_slot_under_concurrent_use() {
         let pool = Arc::new(HandlePool::new(64));
-        let tables: Vec<Arc<Handles>> = (0..4)
-            .map(|_| Arc::new(Handles::new(4, pool.clone())))
-            .collect();
+        let tables: Vec<Arc<Handles>> = (0..4).map(|_| Handles::new(4, pool.clone())).collect();
         let threads: Vec<_> = tables
             .iter()
             .cloned()

@@ -494,7 +494,7 @@ impl Sessions {
         let state = Arc::new(SessionState {
             id,
             resume_token: rand::random(),
-            handles: Arc::new(Handles::new(self.handle_share, self.pool.clone())),
+            handles: Handles::new(self.handle_share, self.pool.clone()),
             attachment: Mutex::new(Attachment {
                 epoch: 1,
                 ..Attachment::default()
@@ -1615,6 +1615,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
             // Running from here to the end of the closure, hook included, so a test can hold a change that has begun.
             #[cfg_attr(not(feature = "spec-trace"), allow(unused_mut))]
             let mut running_guard = session.begin(epoch, &begun)?;
+            let reserved = ops.reserve(&req);
             if let Some(hooked) = hooked.as_mut() {
                 hooked(PhaseDispatch::Running);
             }
@@ -1623,7 +1624,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
             running.arming(tid);
             let armed = ops.watches.arm_request(&req);
             running.running(tid);
-            let resp = ops::dispatch(&ops, req);
+            let resp = ops::dispatch(&ops, req, reserved);
             let finished = Instant::now();
             #[cfg(feature = "spec-trace")]
             {
