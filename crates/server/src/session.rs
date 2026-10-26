@@ -251,6 +251,8 @@ impl Sessions {
             }),
             drained: tokio::sync::Notify::new(),
         });
+        // Declared before the guard, so what was retired is dropped after the lock is released.
+        let mut retired = Vec::new();
         let mut map = self.map.lock();
         let mut detached: Vec<(u64, Instant)> = map
             .iter()
@@ -267,7 +269,7 @@ impl Sessions {
                     limit = MAX_DETACHED_SESSIONS,
                     "too many detached sessions; dropping the oldest"
                 );
-                self.retire(&mut map, *old);
+                retired.extend(self.retire(&mut map, *old));
             }
         }
         map.insert(id, state.clone());
@@ -282,6 +284,8 @@ impl Sessions {
             None => (self.dropped.lock().get(&id)?.upgrade()?, true),
         };
         if !bool::from(state.resume_token.ct_eq(token)) {
+            // A dropped session's last reference may be this one, and dropping it closes its handles: not under the table's lock.
+            drop(map);
             return None;
         }
         if dropped {
@@ -306,14 +310,17 @@ impl Sessions {
         Some((state, epoch))
     }
 
-    /// Move `id` from the table to the dropped sessions, forgetting those of them with nothing left.
-    fn retire(&self, map: &mut HashMap<u64, Arc<SessionState>>, id: u64) {
-        let Some(state) = map.remove(&id) else {
-            return;
-        };
+    /// Move `id` from the table to the dropped sessions, forgetting those of them with nothing left. The session is returned for the caller to drop once the table's lock is released: it is often the last reference, and its drop closes every handle the session holds.
+    fn retire(
+        &self,
+        map: &mut HashMap<u64, Arc<SessionState>>,
+        id: u64,
+    ) -> Option<Arc<SessionState>> {
+        let state = map.remove(&id)?;
         let mut dropped = self.dropped.lock();
         dropped.retain(|_, state| state.strong_count() > 0);
         dropped.insert(id, Arc::downgrade(&state));
+        Some(state)
     }
 
     /// Drop a session no client can resume: one whose Ack, with its id and token, never reached the client.
@@ -335,6 +342,8 @@ impl Sessions {
     /// Drop sessions detached for longer than `grace`, closing their handles once nothing of theirs runs.
     pub fn reap(&self, grace: Duration) -> usize {
         let now = Instant::now();
+        // Declared before the guard, so what was retired is dropped after the lock is released.
+        let mut retired = Vec::new();
         let mut map = self.map.lock();
         let expired: Vec<u64> = map
             .iter()
@@ -348,7 +357,7 @@ impl Sessions {
             .map(|(id, _)| *id)
             .collect();
         for id in &expired {
-            self.retire(&mut map, *id);
+            retired.extend(self.retire(&mut map, *id));
         }
         expired.len()
     }
