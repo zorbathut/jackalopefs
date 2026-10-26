@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks the Quint model of the session protocol (spec/) as spec/README.md describes: typecheck, the scenario runs, and TLC on the tiny instance finding each reachability witness. With FULL=1 it also has TLC explore the tiny instance's whole state space for the invariants that must hold (about two and a half hours) and simulates the small instance. Every outcome is asserted; last, it prints the drift report (`scripts/spec/drift.sh`).
+# Checks the Quint model of the session protocol (spec/) as spec/README.md describes: typecheck, the scenario runs, trace validation's own check (spec/replay_test.qnt), and TLC on the tiny instance finding each reachability witness. With FULL=1 it also has TLC explore the tiny instance's whole state space for the invariants that must hold (about two and a half hours) and simulates the small instance. Every outcome is asserted; last, it prints the drift report (`scripts/spec/drift.sh`).
 #
 # Needs Node and a JDK. The first run installs the pinned Quint into spec/node_modules (from spec/package-lock.json) and downloads the pinned Apalache, which carries TLC, into ~/.quint; `quint run` under FULL=1 also fetches its own evaluator binary. TLC is given an 8 GB heap.
 set -euo pipefail
@@ -62,12 +62,24 @@ expect() {
 tlc() { "$QUINT" verify --backend=tlc --apalache-version="$APALACHE_VERSION" --server-endpoint="$(endpoint)" "$@"; }
 
 section "typecheck"
-for f in session session_small session_tiny; do
+for f in session session_small session_tiny replay replay_test; do
   "$QUINT" typecheck "$SPEC/$f.qnt" >/dev/null && echo "ok         $f.qnt" || fail "typecheck $f.qnt"
 done
 
 section "scenario runs"
 if out=$("$QUINT" test "$SPEC/session_small.qnt" 2>&1); then echo "ok         session_small.qnt: $(grep -o '[0-9]* passing' <<<"$out")"; else echo "$out" >&2; fail "quint test session_small.qnt"; fi
+
+section "trace validation's own check (spec/replay_test.qnt)"
+if out=$("$QUINT" test "$SPEC/replay_test.qnt" --match='^replyLostTest$' 2>&1) && grep -q '1 passing' <<<"$out"; then echo "ok         a recorded trace replays"; else echo "$out" >&2; fail "replay_test.qnt: replyLostTest"; fi
+# Each corrupted trace must stop at the event that gives it away: step n is event n - 1.
+for expected in heldFlippedTest:28 resendOvertakesTest:27 unsentRanTest:36; do
+  run=${expected%:*} step=${expected#*:}
+  out=$("$QUINT" test "$SPEC/replay_test.qnt" --match="^$run\$" 2>&1) || true
+  if grep -q "after iteration #$step " <<<"$out"; then echo "stopped    $run at event $((step - 1))"; else echo "$out" >&2; fail "replay_test.qnt: $run must stop at step $step"; fi
+done
+
+# Nothing else builds the recording, so this keeps it from rotting between runs of scripts/spec/traces.sh.
+if out=$(cargo check --manifest-path "$ROOT/Cargo.toml" -p jackalopefs-client --tests --features spec-trace,jackalopefs-server/spec-trace 2>&1); then echo "ok         the client and server build with spec-trace"; else echo "$out" >&2; fail "cargo check --features spec-trace"; fi
 
 section "TLC on session_tiny: each witness must be found"
 for inv in $WITNESSES; do

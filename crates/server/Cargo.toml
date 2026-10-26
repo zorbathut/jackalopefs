@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Records what this end does in the session model's terms (`jackalopefs_perf::spec_trace`), for the trace-validation tests.
+spec-trace = []
 
 [dependencies]
 anyhow = { workspace = true }

@@ -1,5 +1,6 @@
 mod common;
 
+use common::traced::Traced;
 use common::*;
 use jackalopefs_client::ids::{IdMap, ModeIds as ModeIdsClient};
 use jackalopefs_client::{
@@ -352,7 +353,8 @@ async fn an_abandoned_exchange_is_captured_with_its_outcome() {
 async fn file_lifecycle() {
     let export = tempfile::tempdir().unwrap();
     let server = TestServer::start(export.path(), None).await;
-    let client = server.client().await;
+    let traced = Traced::start(&server, "");
+    let client = traced.client(server.config(Duration::from_secs(10))).await;
 
     let (fh, attr) = client
         .create(
@@ -431,6 +433,7 @@ async fn file_lifecycle() {
     assert!(!export.path().join("f").exists());
     client.shutdown().await;
     server.stop().await;
+    traced.finish();
 }
 
 #[tokio::test]
@@ -871,9 +874,10 @@ async fn an_orphan_release_waits_for_the_open_given_up_on_while_it_ran() {
     let server = TestServer::start(export.path(), None).await;
     let gate = Gate::install(&server);
     gate.arm("open", Hold::Running);
+    let traced = Traced::start(&server, "");
     let mut config = server.config(Duration::from_secs(5));
     config.op_timeout = Some(Duration::from_millis(300));
-    let client = jackalopefs_client::Client::connect(config).await.unwrap();
+    let client = traced.client(config).await;
     let err = client
         .open(path("f"), libc::O_RDONLY, None, |attr| Ok(attr.ino))
         .await
@@ -903,6 +907,7 @@ async fn an_orphan_release_waits_for_the_open_given_up_on_while_it_ran() {
     .await;
     client.shutdown().await;
     server.stop().await;
+    traced.finish();
 }
 
 /// A reopen given up on after a new session is counted like any change given up on, so the release of its now dead handle waits for the server's answer and then behind the reopen, instead of landing first and leaving the reopened file open.
@@ -1656,7 +1661,8 @@ async fn truncated_request_is_ignored_by_the_server() {
 async fn session_resumes_after_a_connection_drop() {
     let export = tempfile::tempdir().unwrap();
     let server = TestServer::start(export.path(), None).await;
-    let client = server.client().await;
+    let traced = Traced::start(&server, "");
+    let client = traced.client(server.config(Duration::from_secs(10))).await;
 
     let (fh, _) = client
         .create(
@@ -1700,6 +1706,7 @@ async fn session_resumes_after_a_connection_drop() {
     client.release(fh).await.unwrap();
     client.shutdown().await;
     server.stop().await;
+    traced.finish();
 }
 
 /// A server that comes back serving another directory is another export, whatever its paths lead to. The file here is even the same file, hardlinked into the second directory, so reopening it by path would find nothing amiss: it is the root that says the mount is no longer where it was.
@@ -2813,7 +2820,8 @@ async fn a_change_held_behind_one_given_up_on_can_be_given_up_on_too() {
     let export = tempfile::tempdir().unwrap();
     let server = TestServer::start(export.path(), None).await;
     let gate = Gate::install(&server);
-    let client = std::sync::Arc::new(server.client().await);
+    let traced = Traced::start(&server, "");
+    let client = std::sync::Arc::new(traced.client(server.config(Duration::from_secs(10))).await);
     gate.arm("mkdir", Hold::Running);
     let (first, pending) = call_interruptible(&client, mkdir("a"));
     gate.wait_parked().await;
@@ -2851,6 +2859,7 @@ async fn a_change_held_behind_one_given_up_on_can_be_given_up_on_too() {
     assert!(export.path().join("c").is_dir());
     client.shutdown().await;
     server.stop().await;
+    traced.finish();
 }
 
 /// What the stall watchdog reads off a kernel request: the call it is making, which phase that is in and on which connection and stream, and nothing once the call is over.

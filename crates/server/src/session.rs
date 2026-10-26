@@ -11,6 +11,11 @@ use crate::watch::{ChangeLog, EventBatch, Watches};
 use crate::{Limits, SESSION_GRACE};
 use jackalopefs_perf::event;
 use jackalopefs_perf::hub::{elided, Hub, IdsEvent, Side};
+use jackalopefs_perf::spec_trace;
+#[cfg(feature = "spec-trace")]
+use jackalopefs_perf::spec_trace::{
+    Begun, CauseUndecoded, EndHeld, EventSpec, KeyExchange, Recorder, Verdict as VerdictSpec,
+};
 use jackalopefs_perf::{
     fmt_duration, line_process, line_quic, line_udp, lines_link, verdict, MeterLink, MeterProcess,
     MeterUdp, SampleLink, TrackerQuic,
@@ -67,6 +72,8 @@ pub struct SessionState {
     attachment: Mutex<Attachment>,
     /// Woken when the last change a later one waits for finishes: the last of an earlier connection's, or the last the client gave up on.
     drained: tokio::sync::Notify,
+    #[cfg(feature = "spec-trace")]
+    recorder: Option<Arc<jackalopefs_perf::spec_trace::Recorder>>,
 }
 
 #[derive(Default)]
@@ -81,8 +88,25 @@ struct Attachment {
     running_older: usize,
 }
 
+#[cfg(feature = "spec-trace")]
+impl Attachment {
+    fn counts(&self) -> jackalopefs_perf::spec_trace::Counts {
+        jackalopefs_perf::spec_trace::Counts {
+            epoch: self.epoch,
+            running: self.running,
+            abandoned: self.abandoned,
+            running_older: self.running_older,
+        }
+    }
+}
+
 /// One change, from decoding to its end, as the client giving up on it finds it. Moved only under its session's attachment lock, with the counts it is part of.
-pub(crate) struct Change(Mutex<PhaseChange>);
+pub(crate) struct Change {
+    phase: Mutex<PhaseChange>,
+    /// The exchange and operation it is, for the events recorded under the attachment lock.
+    #[cfg(feature = "spec-trace")]
+    traced: std::sync::OnceLock<(jackalopefs_perf::spec_trace::KeyExchange, &'static str)>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PhaseChange {
@@ -97,7 +121,19 @@ enum PhaseChange {
 
 impl Change {
     pub(crate) fn new() -> Arc<Change> {
-        Arc::new(Change(Mutex::new(PhaseChange::Queued)))
+        Arc::new(Change {
+            phase: Mutex::new(PhaseChange::Queued),
+            #[cfg(feature = "spec-trace")]
+            traced: std::sync::OnceLock::new(),
+        })
+    }
+
+    #[cfg(feature = "spec-trace")]
+    fn key(&self) -> jackalopefs_perf::spec_trace::KeyExchange {
+        self.traced
+            .get()
+            .expect("a change is keyed when it is decoded")
+            .0
     }
 }
 
@@ -116,24 +152,46 @@ impl SessionState {
     /// Count `change`, from the connection attached at `epoch`, as running, unless the client gave up on it, or the session has resumed on a newer connection since: then the client has already resent the change or failed it. Either way it must not run.
     fn begin(self: &Arc<Self>, epoch: u64, change: &Arc<Change>) -> Option<GuardChange> {
         let mut attachment = self.attachment.lock();
-        let mut phase = change.0.lock();
+        let mut phase = change.phase.lock();
         if attachment.epoch != epoch || *phase == PhaseChange::Cancelled {
+            spec_trace!(
+                self.recorder.as_ref(),
+                EventSpec::Began {
+                    key: change.key(),
+                    begun: if *phase == PhaseChange::Cancelled {
+                        Begun::Cancelled
+                    } else {
+                        Begun::Superseded
+                    },
+                    counts: Some(attachment.counts()),
+                }
+            );
             return None;
         }
         *phase = PhaseChange::Running;
         attachment.running += 1;
+        spec_trace!(
+            self.recorder.as_ref(),
+            EventSpec::Began {
+                key: change.key(),
+                begun: Begun::Running,
+                counts: Some(attachment.counts()),
+            }
+        );
         Some(GuardChange {
             session: self.clone(),
             epoch,
             change: change.clone(),
+            #[cfg(feature = "spec-trace")]
+            errno: false,
         })
     }
 
     /// The client gave up on `change`, from the connection attached at `epoch`. One that has not begun never will; one running holds the session's later changes until it ends, unless an earlier connection's change already does.
     fn abandon(&self, epoch: u64, change: &Change) -> Verdict {
         let mut attachment = self.attachment.lock();
-        let mut phase = change.0.lock();
-        match *phase {
+        let mut phase = change.phase.lock();
+        let verdict = match *phase {
             PhaseChange::Queued => {
                 *phase = PhaseChange::Cancelled;
                 Verdict::Unrun
@@ -149,30 +207,74 @@ impl SessionState {
                 unreachable!("a change is given up on once")
             }
             PhaseChange::Finished => Verdict::Finished,
-        }
+        };
+        spec_trace!(
+            self.recorder.as_ref(),
+            EventSpec::Abandoned {
+                key: change.key(),
+                verdict: match verdict {
+                    Verdict::Unrun => VerdictSpec::Unrun,
+                    Verdict::Fenced => VerdictSpec::Fenced,
+                    Verdict::Finished => VerdictSpec::Finished,
+                },
+                counts: attachment.counts(),
+            }
+        );
+        verdict
     }
 
     /// How many changes a change from the connection attached at `epoch` waits for: those still running from earlier connections, and those the client gave up on; none for a connection that is no longer current itself, whose changes will not run.
-    fn fencing(&self, epoch: u64) -> usize {
+    fn fencing(&self, epoch: u64, change: &Change) -> usize {
         let attachment = self.attachment.lock();
-        if attachment.epoch == epoch {
+        let fence = if attachment.epoch == epoch {
             attachment.running_older + attachment.abandoned
         } else {
             0
-        }
+        };
+        spec_trace!(self.recorder.as_ref(), {
+            let (key, op) = *change
+                .traced
+                .get()
+                .expect("a change is keyed when it is decoded");
+            EventSpec::Decoded {
+                key,
+                op,
+                change: true,
+                held: fence > 0,
+            }
+        });
+        #[cfg(not(feature = "spec-trace"))]
+        let _ = change;
+        fence
     }
 
     /// Wait until a change from the connection attached at `epoch` waits for nothing ([`SessionState::fencing`]); `false` when that connection stopped being current meanwhile, and its change will not run.
-    async fn drain(&self, epoch: u64) -> bool {
+    async fn drain(&self, epoch: u64, change: &Change) -> bool {
+        #[cfg(not(feature = "spec-trace"))]
+        let _ = change;
         loop {
             let notified = self.drained.notified();
             tokio::pin!(notified);
             {
                 let attachment = self.attachment.lock();
                 if attachment.epoch != epoch {
+                    spec_trace!(
+                        self.recorder.as_ref(),
+                        EventSpec::HeldEnded {
+                            key: change.key(),
+                            end: EndHeld::Superseded
+                        }
+                    );
                     return false;
                 }
                 if attachment.running_older + attachment.abandoned == 0 {
+                    spec_trace!(
+                        self.recorder.as_ref(),
+                        EventSpec::HeldEnded {
+                            key: change.key(),
+                            end: EndHeld::Drained
+                        }
+                    );
                     return true;
                 }
                 notified.as_mut().enable();
@@ -182,29 +284,56 @@ impl SessionState {
     }
 }
 
+#[cfg(feature = "spec-trace")]
+impl Drop for SessionState {
+    fn drop(&mut self) {
+        spec_trace!(
+            self.recorder.as_ref(),
+            EventSpec::SessionClosed { session: self.id }
+        );
+    }
+}
+
 /// A change counted as running by [`SessionState::begin`] until dropped.
 struct GuardChange {
     session: Arc<SessionState>,
     epoch: u64,
     change: Arc<Change>,
+    /// Whether the change's work ended in an errno, for the event of its end.
+    #[cfg(feature = "spec-trace")]
+    errno: bool,
 }
 
 impl Drop for GuardChange {
     fn drop(&mut self) {
         let mut attachment = self.session.attachment.lock();
         let abandoned = {
-            let mut phase = self.change.0.lock();
+            let mut phase = self.change.phase.lock();
             std::mem::replace(&mut *phase, PhaseChange::Finished) == PhaseChange::Abandoned
         };
-        let waited_for = if attachment.epoch == self.epoch {
+        let current = attachment.epoch == self.epoch;
+        if current {
             attachment.running -= 1;
+            if abandoned {
+                attachment.abandoned -= 1;
+            }
+        } else {
+            attachment.running_older -= 1;
+        }
+        spec_trace!(
+            self.session.recorder.as_ref(),
+            EventSpec::Finished {
+                key: self.change.key(),
+                errno: self.errno,
+                counts: Some(attachment.counts()),
+            }
+        );
+        let waited_for = if current {
             if !abandoned {
                 return;
             }
-            attachment.abandoned -= 1;
             attachment.abandoned
         } else {
-            attachment.running_older -= 1;
             attachment.running_older
         };
         if waited_for == 0 {
@@ -223,6 +352,9 @@ pub struct Sessions {
     handle_share: usize,
     /// The handles every session draws on.
     pool: Arc<HandlePool>,
+    /// Where the sessions' events in the model's terms go, set by a trace-validation test before any connection.
+    #[cfg(feature = "spec-trace")]
+    recorder: OnceLock<Arc<Recorder>>,
 }
 
 impl Sessions {
@@ -233,7 +365,17 @@ impl Sessions {
             next_id: AtomicU64::new(0),
             handle_share,
             pool,
+            #[cfg(feature = "spec-trace")]
+            recorder: OnceLock::new(),
         }
+    }
+
+    #[cfg(feature = "spec-trace")]
+    pub fn set_recorder(&self, recorder: Arc<Recorder>) {
+        assert!(
+            self.recorder.set(recorder).is_ok(),
+            "the sessions record for one test"
+        );
     }
 
     pub fn pool(&self) -> &HandlePool {
@@ -252,7 +394,13 @@ impl Sessions {
                 ..Attachment::default()
             }),
             drained: tokio::sync::Notify::new(),
+            #[cfg(feature = "spec-trace")]
+            recorder: self.recorder.get().cloned(),
         });
+        #[cfg(feature = "spec-trace")]
+        if let Some(recorder) = self.recorder.get() {
+            state.handles.trace(recorder.clone(), id);
+        }
         // Declared before the guard, so what was retired is dropped after the lock is released.
         let mut retired = Vec::new();
         let mut map = self.map.lock();
@@ -275,6 +423,7 @@ impl Sessions {
             }
         }
         map.insert(id, state.clone());
+        spec_trace!(self.recorder.get(), EventSpec::Created { session: id });
         (state, 1)
     }
 
@@ -304,6 +453,14 @@ impl Sessions {
         attachment.running_older += attachment.running;
         attachment.running = 0;
         attachment.abandoned = 0;
+        spec_trace!(
+            self.recorder.get(),
+            EventSpec::Resumed {
+                session: id,
+                counts: attachment.counts(),
+                dropped
+            }
+        );
         let epoch = attachment.epoch;
         drop(attachment);
         drop(map);
@@ -322,6 +479,10 @@ impl Sessions {
         let mut dropped = self.dropped.lock();
         dropped.retain(|_, state| state.strong_count() > 0);
         dropped.insert(id, Arc::downgrade(&state));
+        spec_trace!(
+            self.recorder.get(),
+            EventSpec::SessionDropped { session: id }
+        );
         Some(state)
     }
 
@@ -657,6 +818,14 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
         }
     };
     let conn_key = jackalopefs_perf::conn_key(&conn);
+    spec_trace!(
+        session.recorder.as_ref(),
+        EventSpec::Attached {
+            session: session.id,
+            epoch,
+            conn: conn_key.unwrap_or(0)
+        }
+    );
     tracing::info!(%remote, session = session.id, conn = conn_key, resumed, "session attached");
     {
         let mut attachment = session.attachment.lock();
@@ -683,6 +852,12 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     match taken_over {
         None => {
             tracing::info!(%remote, session = session.id, conn = conn_key, "the session resumed on a newer connection before this one attached; closing it");
+            spec_trace!(
+                session.recorder.as_ref(),
+                EventSpec::ConnEnded {
+                    conn: conn_key.unwrap_or(0)
+                }
+            );
             conn.close(close_code::SUPERSEDED.into(), b"session resumed elsewhere");
             return;
         }
@@ -763,6 +938,12 @@ impl Drop for DetachOnDrop {
             }
         }
         self.server.sessions.detach(self.session.id, self.epoch);
+        spec_trace!(
+            self.session.recorder.as_ref(),
+            EventSpec::ConnEnded {
+                conn: jackalopefs_perf::conn_key(&self.conn).unwrap_or(0)
+            }
+        );
         tracing::info!(remote = %self.remote, session = self.session.id, open_handles = self.session.handles.len(), "session detached");
         // The final window, with no port sample to judge it against: the totals are what matter here.
         log_quic(self.session.id, &self.conn, &self.tracker, &[]);
@@ -804,6 +985,13 @@ impl Drop for DetachUnlessAcked<'_> {
         if self.acked {
             return;
         }
+        spec_trace!(
+            self.sessions.recorder.get(),
+            EventSpec::HandshakeFailed {
+                session: self.id,
+                resumed: self.resumed
+            }
+        );
         if self.resumed {
             tracing::info!(
                 session = self.id,
@@ -1098,6 +1286,14 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
         stream: Some(stream),
         ..IdsEvent::default()
     };
+    #[cfg(feature = "spec-trace")]
+    let (recorder, key) = (
+        serving.session.recorder.clone(),
+        KeyExchange {
+            conn: ops.conn.unwrap_or(0),
+            stream,
+        },
+    );
     let (body, req) = match timeout(
         REQUEST_READ_TIMEOUT,
         read_frame_body::<_, Request>(&mut recv),
@@ -1119,6 +1315,13 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
                 ),
                 e => tracing::warn!("malformed request: {e}"),
             }
+            spec_trace!(
+                recorder.as_ref(),
+                EventSpec::Undecoded {
+                    key,
+                    cause: CauseUndecoded::Other
+                }
+            );
             return;
         }
         // The client finishes a stream early or resets it when it gives up on a call.
@@ -1126,6 +1329,13 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
             if e.is_eof()
                 || matches!(&e, jackalopefs_proto::ErrorCodec::Io(io) if io.kind() == std::io::ErrorKind::ConnectionReset) =>
         {
+            spec_trace!(
+                recorder.as_ref(),
+                EventSpec::Undecoded {
+                    key,
+                    cause: CauseUndecoded::Reset
+                }
+            );
             event!(
                 target: EVENT_TARGET,
                 perf.events,
@@ -1136,6 +1346,13 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
             return;
         }
         Ok(Err(jackalopefs_proto::ErrorCodec::Io(e))) => {
+            spec_trace!(
+                recorder.as_ref(),
+                EventSpec::Undecoded {
+                    key,
+                    cause: CauseUndecoded::Lost
+                }
+            );
             event!(
                 target: EVENT_TARGET,
                 perf.events,
@@ -1147,9 +1364,23 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
         }
         Ok(Err(e)) => {
             tracing::warn!("malformed request: {e}");
+            spec_trace!(
+                recorder.as_ref(),
+                EventSpec::Undecoded {
+                    key,
+                    cause: CauseUndecoded::Other
+                }
+            );
             return;
         }
         Err(_) => {
+            spec_trace!(
+                recorder.as_ref(),
+                EventSpec::Undecoded {
+                    key,
+                    cause: CauseUndecoded::Other
+                }
+            );
             event!(
                 target: EVENT_TARGET,
                 perf.events,
@@ -1186,16 +1417,31 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
     }
     drop(body);
     let change = req.changes().then(Change::new);
-    let fence = match change {
-        Some(_) => serving.session.fencing(serving.epoch),
+    #[cfg(feature = "spec-trace")]
+    match &change {
+        Some(change) => change.traced.set((key, op)).expect("keyed once"),
+        None => spec_trace!(
+            recorder.as_ref(),
+            EventSpec::Decoded {
+                key,
+                op,
+                change: false,
+                held: false
+            }
+        ),
+    }
+    let fence = match &change {
+        Some(change) => serving.session.fencing(serving.epoch, change),
         None => 0,
     };
     if fence > 0 {
         inflight.held();
         let held_since = Instant::now();
+        let held = change.as_ref().expect("only a change is held");
         let current = tokio::select! {
-            current = serving.session.drain(serving.epoch) => current,
+            current = serving.session.drain(serving.epoch, held) => current,
             code = cancel_asked(&mut recv) => {
+                spec_trace!(recorder.as_ref(), EventSpec::HeldEnded { key, end: EndHeld::Cancelled });
                 event!(
                     target: EVENT_TARGET,
                     perf.events,
@@ -1218,6 +1464,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
                 return;
             }
             stopped = send.stopped() => {
+                spec_trace!(recorder.as_ref(), EventSpec::HeldEnded { key, end: if stopped.is_ok() { EndHeld::Stopped } else { EndHeld::Lost } });
                 let why = match stopped {
                     Ok(code) => format!("the client gave up on it ({code:?})"),
                     Err(e) => format!("its stream ended ({e})"),
@@ -1265,9 +1512,20 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
     let mut blocking = tokio::task::spawn_blocking(move || {
         let mut hooked = hook.and_then(|hook| hook(&req));
         // Counted from here to the end of the closure, hook included, so a test can hold a change that has begun.
-        let _counted = match &counted {
+        #[cfg_attr(not(feature = "spec-trace"), allow(unused_mut))]
+        let mut counted = match &counted {
             Some(change) => Some(session.begin(epoch, change)?),
-            None => None,
+            None => {
+                spec_trace!(
+                    recorder.as_ref(),
+                    EventSpec::Began {
+                        key,
+                        begun: Begun::Running,
+                        counts: None
+                    }
+                );
+                None
+            }
         };
         if let Some(hooked) = hooked.as_mut() {
             hooked(PhaseDispatch::Running);
@@ -1279,9 +1537,22 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
         running.running(tid);
         let resp = ops::dispatch(&ops, req);
         let finished = Instant::now();
+        #[cfg(feature = "spec-trace")]
+        match counted.as_mut() {
+            Some(guard) => guard.errno = matches!(resp, Response::Err(_)),
+            None => spec_trace!(
+                recorder.as_ref(),
+                EventSpec::Finished {
+                    key,
+                    errno: matches!(resp, Response::Err(_)),
+                    counts: None
+                }
+            ),
+        }
         if let Some(mut hooked) = hooked {
             hooked(PhaseDispatch::Done(&resp));
         }
+        drop(counted);
         Some(Ran {
             started,
             finished,
@@ -1654,15 +1925,17 @@ mod tests {
         assert_eq!(rows.len(), 1, "listed once: {rows:?}");
         assert_eq!(rows[0].state, StateSession::Attached);
         assert_eq!(
-            state.fencing(second),
+            state.fencing(second, &Change::new()),
             1,
             "the change still running is waited for"
         );
-        assert!(pending(state.drain(second)).await);
+        assert!(pending(state.drain(second, &Change::new())).await);
         drop(running);
-        assert!(timeout(Duration::from_secs(1), state.drain(second))
-            .await
-            .unwrap());
+        assert!(
+            timeout(Duration::from_secs(1), state.drain(second, &Change::new()))
+                .await
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1718,21 +1991,23 @@ mod tests {
         let (state, first) = sessions.create();
         let old = state.begin(first, &Change::new()).unwrap();
         assert_eq!(
-            state.fencing(first),
+            state.fencing(first, &Change::new()),
             0,
             "nothing is older than the first connection"
         );
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
         let own = state.begin(second, &Change::new()).unwrap();
-        assert_eq!(state.fencing(second), 1);
+        assert_eq!(state.fencing(second, &Change::new()), 1);
         assert!(
-            pending(state.drain(second)).await,
+            pending(state.drain(second, &Change::new())).await,
             "an older change is still running"
         );
         drop(old);
-        assert!(timeout(Duration::from_secs(1), state.drain(second))
-            .await
-            .unwrap());
+        assert!(
+            timeout(Duration::from_secs(1), state.drain(second, &Change::new()))
+                .await
+                .unwrap()
+        );
         drop(own);
 
         let (_, third) = sessions.resume(state.id, &state.resume_token).unwrap();
@@ -1740,7 +2015,7 @@ mod tests {
         let (_, fourth) = sessions.resume(state.id, &state.resume_token).unwrap();
         let drained = tokio::spawn({
             let state = state.clone();
-            async move { state.drain(fourth).await }
+            async move { state.drain(fourth, &Change::new()).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!drained.is_finished());
@@ -1756,7 +2031,7 @@ mod tests {
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
         let held = tokio::spawn({
             let state = state.clone();
-            async move { state.drain(second).await }
+            async move { state.drain(second, &Change::new()).await }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -1772,13 +2047,13 @@ mod tests {
             "its change will not run"
         );
         assert_eq!(
-            state.fencing(second),
+            state.fencing(second, &Change::new()),
             0,
             "a superseded connection's change is not held"
         );
-        assert!(!pending(state.drain(second)).await);
+        assert!(!pending(state.drain(second, &Change::new())).await);
         assert!(
-            pending(state.drain(third)).await,
+            pending(state.drain(third, &Change::new())).await,
             "the first connection's change still runs"
         );
         assert!(
@@ -1795,7 +2070,11 @@ mod tests {
         let change = Change::new();
         assert_eq!(state.abandon(epoch, &change), Verdict::Unrun);
         assert!(state.begin(epoch, &change).is_none());
-        assert_eq!(state.fencing(epoch), 0, "nothing ran, so nothing waits");
+        assert_eq!(
+            state.fencing(epoch, &Change::new()),
+            0,
+            "nothing ran, so nothing waits"
+        );
     }
 
     #[tokio::test]
@@ -1805,16 +2084,25 @@ mod tests {
         let change = Change::new();
         let running = state.begin(epoch, &change).unwrap();
         let other = state.begin(epoch, &Change::new()).unwrap();
-        assert_eq!(state.fencing(epoch), 0, "changes in flight hold nothing");
+        assert_eq!(
+            state.fencing(epoch, &Change::new()),
+            0,
+            "changes in flight hold nothing"
+        );
         assert_eq!(state.abandon(epoch, &change), Verdict::Fenced);
-        assert_eq!(state.fencing(epoch), 1);
+        assert_eq!(state.fencing(epoch, &Change::new()), 1);
         drop(other);
-        assert!(pending(state.drain(epoch)).await, "it still runs");
+        assert!(
+            pending(state.drain(epoch, &Change::new())).await,
+            "it still runs"
+        );
         drop(running);
-        assert!(timeout(Duration::from_secs(1), state.drain(epoch))
-            .await
-            .unwrap());
-        assert_eq!(state.fencing(epoch), 0);
+        assert!(
+            timeout(Duration::from_secs(1), state.drain(epoch, &Change::new()))
+                .await
+                .unwrap()
+        );
+        assert_eq!(state.fencing(epoch, &Change::new()), 0);
     }
 
     #[test]
@@ -1824,7 +2112,7 @@ mod tests {
         let change = Change::new();
         drop(state.begin(epoch, &change).unwrap());
         assert_eq!(state.abandon(epoch, &change), Verdict::Finished);
-        assert_eq!(state.fencing(epoch), 0);
+        assert_eq!(state.fencing(epoch, &Change::new()), 0);
     }
 
     #[tokio::test]
@@ -1836,15 +2124,17 @@ mod tests {
         assert_eq!(state.abandon(first, &change), Verdict::Fenced);
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
         assert_eq!(
-            state.fencing(second),
+            state.fencing(second, &Change::new()),
             1,
             "an earlier connection's change, counted once"
         );
-        assert!(pending(state.drain(second)).await);
+        assert!(pending(state.drain(second, &Change::new())).await);
         drop(running);
-        assert!(timeout(Duration::from_secs(1), state.drain(second))
-            .await
-            .unwrap());
+        assert!(
+            timeout(Duration::from_secs(1), state.drain(second, &Change::new()))
+                .await
+                .unwrap()
+        );
         let attachment = state.attachment.lock();
         assert_eq!(
             (
@@ -1864,9 +2154,9 @@ mod tests {
         let running = state.begin(first, &change).unwrap();
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
         assert_eq!(state.abandon(first, &change), Verdict::Fenced);
-        assert_eq!(state.fencing(second), 1);
+        assert_eq!(state.fencing(second, &Change::new()), 1);
         drop(running);
-        assert_eq!(state.fencing(second), 0);
+        assert_eq!(state.fencing(second, &Change::new()), 0);
         let attachment = state.attachment.lock();
         assert_eq!(
             (

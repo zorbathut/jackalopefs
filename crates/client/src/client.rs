@@ -11,6 +11,10 @@ use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TR
 use crate::transport::ServerTrust;
 use jackalopefs_perf::event;
 use jackalopefs_perf::hub::{elided, Hub, IdsEvent, Side};
+use jackalopefs_perf::spec_trace;
+use jackalopefs_perf::spec_trace::Origin;
+#[cfg(feature = "spec-trace")]
+use jackalopefs_perf::spec_trace::{EventSpec, Failure, KeyExchange, KindCall, Recorder};
 use jackalopefs_perf::stall::ErrorLockHeld;
 use jackalopefs_proto::control::{Ids, Summary};
 use jackalopefs_proto::{
@@ -382,12 +386,23 @@ pub(crate) struct Timing<'a> {
     /// The QUIC stream the request went on, once one was opened.
     pub stream: Option<u64>,
     kernel: Option<&'a RequestKernel>,
+    /// What the exchange is sent for, for its events in the session model's terms, which only a `spec-trace` build records.
+    #[cfg_attr(not(feature = "spec-trace"), allow(dead_code))]
+    pub origin: Option<Origin>,
 }
 
 impl<'a> Timing<'a> {
     fn for_kernel(kernel: Option<&'a RequestKernel>) -> Timing<'a> {
         Timing {
             kernel,
+            ..Timing::default()
+        }
+    }
+
+    /// The timing of an exchange the client makes on its own, sent for `origin`.
+    pub(crate) fn for_origin(origin: Option<Origin>) -> Timing<'a> {
+        Timing {
+            origin,
             ..Timing::default()
         }
     }
@@ -476,14 +491,48 @@ pub(crate) async fn exchange(
     give_up: impl Future<Output = Error>,
 ) -> Result<Response, ErrorExchange> {
     tokio::pin!(give_up);
+    #[cfg(feature = "spec-trace")]
+    let (recorder, origin, conn_key) = (
+        tapping.hub.recorder(),
+        timing.origin,
+        tapping.conn.unwrap_or(0),
+    );
+    // Records an event of this exchange, when it is traced.
+    #[cfg(feature = "spec-trace")]
+    let record = |event: &dyn Fn(Origin) -> EventSpec| {
+        if let (Some(recorder), Some(origin)) = (recorder, origin) {
+            recorder.record(event(origin));
+        }
+    };
+    #[cfg(feature = "spec-trace")]
+    let failed = |stream: Option<u64>, failure: Failure| {
+        record(&|origin| EventSpec::Failed {
+            origin,
+            conn: Some(conn_key),
+            stream,
+            failure,
+        })
+    };
     let opened = tokio::select! {
         biased;
-        e = &mut give_up => return Err(ErrorExchange::GaveUp(e)),
+        e = &mut give_up => {
+            #[cfg(feature = "spec-trace")]
+            failed(None, Failure::GaveUp { written: false, counted: false });
+            return Err(ErrorExchange::GaveUp(e));
+        }
         opened = conn.open_bi() => opened,
     };
-    let (send, recv) =
-        opened.map_err(|e| ErrorExchange::NotSent(format!("cannot open a stream: {e}")))?;
+    let (send, recv) = opened.map_err(|e| {
+        #[cfg(feature = "spec-trace")]
+        failed(None, Failure::NotSent);
+        ErrorExchange::NotSent(format!("cannot open a stream: {e}"))
+    })?;
     let stream = u64::from(send.id());
+    #[cfg(feature = "spec-trace")]
+    let key = KeyExchange {
+        conn: conn_key,
+        stream,
+    };
     timing.stamp_opened(stream);
     let mut send = SideSend { send, done: false };
     let recv = SideRecv { recv, done: false };
@@ -495,7 +544,13 @@ pub(crate) async fn exchange(
         unique,
         op: Some(req.op_name()),
     };
-    let frame = encode(req).map_err(|e| ErrorExchange::Protocol(e.to_string()))?;
+    let frame = encode(req).map_err(|e| {
+        #[cfg(feature = "spec-trace")]
+        failed(Some(stream), Failure::Other);
+        ErrorExchange::Protocol(e.to_string())
+    })?;
+    #[cfg(feature = "spec-trace")]
+    record(&|origin| EventSpec::Stream { origin, key });
     let mut sampled = if tapping.hub.wants_frames() {
         tapping.hub.sample(Side::Client, tap_ids())
     } else {
@@ -507,14 +562,24 @@ pub(crate) async fn exchange(
     }
     tokio::select! {
         biased;
-        e = &mut give_up => return Err(ErrorExchange::GaveUp(e)),
+        e = &mut give_up => {
+            #[cfg(feature = "spec-trace")]
+            failed(Some(stream), Failure::GaveUp { written: false, counted: false });
+            return Err(ErrorExchange::GaveUp(e));
+        }
         written = send.send.write_all(&frame) => {
-            written.map_err(|e| ErrorExchange::NotSent(format!("the stream failed: {e}")))?
+            written.map_err(|e| {
+                #[cfg(feature = "spec-trace")]
+                failed(Some(stream), Failure::NotSent);
+                ErrorExchange::NotSent(format!("the stream failed: {e}"))
+            })?
         }
     }
     let changes = req.changes();
     if !changes {
         if let Err(e) = send.finish() {
+            #[cfg(feature = "spec-trace")]
+            failed(Some(stream), Failure::Lost);
             if let Some(sampled) = sampled.as_mut() {
                 sampled.outcome("lost");
             }
@@ -542,14 +607,21 @@ pub(crate) async fn exchange(
         read = &mut reply => read,
         e = &mut give_up => {
             let Some(cancels) = cancels.filter(|_| changes) else {
+                #[cfg(feature = "spec-trace")]
+                failed(Some(stream), Failure::GaveUp { written: true, counted: false });
                 return Err(ErrorExchange::GaveUp(e));
             };
             let pending = CancelPending::count(cancels);
+            #[cfg(feature = "spec-trace")]
+            failed(Some(stream), Failure::GaveUp { written: true, counted: true });
             send.cancel();
             let op = req.op_name();
+            #[cfg(feature = "spec-trace")]
+            let recorder = recorder.cloned();
             tokio::spawn(async move {
                 let read = reply.await;
                 let verdict = verdict_of(&read);
+                spec_trace!(recorder.as_ref(), EventSpec::CancelAnswered { key, verdict });
                 tracing::debug!(op, stream, verdict, "a change given up on was answered");
                 match (sampled, &read) {
                     (Some(sampled), Ok((body, Ok(resp)))) => {
@@ -569,12 +641,24 @@ pub(crate) async fn exchange(
             if let Some(sampled) = sampled.as_mut() {
                 sampled.outcome("lost");
             }
-            return Err(codec_error(e, ErrorExchange::Lost));
+            let e = codec_error(e, ErrorExchange::Lost);
+            #[cfg(feature = "spec-trace")]
+            failed(
+                Some(stream),
+                if matches!(e, ErrorExchange::Lost(_)) {
+                    Failure::Lost
+                } else {
+                    Failure::Other
+                },
+            );
+            return Err(e);
         }
     };
     let mut resp = match decoded {
         Ok(resp) => resp,
         Err(e) => {
+            #[cfg(feature = "spec-trace")]
+            failed(Some(stream), Failure::Other);
             match sampled {
                 Some(sampled) => sampled.undecodable(&body),
                 None if tapping.hub.wants_frames() => {
@@ -588,6 +672,12 @@ pub(crate) async fn exchange(
         }
     };
     timing.replied = Some(Instant::now());
+    #[cfg(feature = "spec-trace")]
+    record(&|origin| EventSpec::Answered {
+        origin,
+        key,
+        errno: matches!(resp, Response::Err(_)),
+    });
     if changes {
         if let Err(e) = send.finish() {
             tracing::trace!("finishing a change's request after its reply: {e}");
@@ -629,6 +719,24 @@ fn call_ids(req: &Request, attached: &Attached, timing: &Timing<'_>) -> IdsEvent
         stream: timing.stream,
         unique: timing.kernel.map(|kernel| kernel.unique),
         op: Some(req.op_name()),
+    }
+}
+
+/// What a call asks for, as the session model tells calls apart.
+#[cfg(feature = "spec-trace")]
+fn kind_call(req: &Request) -> KindCall {
+    match req {
+        Request::Open { fh, .. } | Request::Create { fh, .. } | Request::Opendir { fh, .. } => {
+            KindCall::Open { fh: *fh }
+        }
+        Request::Release { fh, ordered } | Request::Releasedir { fh, ordered } => {
+            KindCall::Release {
+                fh: *fh,
+                ordered: *ordered,
+            }
+        }
+        _ if req.changes() => KindCall::Change,
+        _ => KindCall::Other,
     }
 }
 
@@ -789,8 +897,35 @@ impl Caller {
         let handles = req.fhs().map(|fh| fh.and_then(|fh| self.handles.get(fh)));
         let mut min_generation = 0;
         let mut lost_once = false;
+        #[cfg(feature = "spec-trace")]
+        let recorder = self.perf.hub.recorder();
+        #[cfg(feature = "spec-trace")]
+        let origin = recorder.map(|recorder| {
+            let call = recorder.call();
+            recorder.record(EventSpec::CallStarted {
+                call,
+                op: req.op_name(),
+                kind: kind_call(req),
+                resendable: retry_safe(req, &handles),
+            });
+            Origin::Call(call)
+        });
+        // A failure of the call itself, before or between its exchanges.
+        #[cfg(feature = "spec-trace")]
+        let failed = |conn: Option<u64>, failure: Failure| {
+            if let (Some(recorder), Some(origin)) = (recorder, origin) {
+                recorder.record(EventSpec::Failed {
+                    origin,
+                    conn,
+                    stream: None,
+                    failure,
+                });
+            }
+        };
         loop {
             if handles.iter().flatten().any(|h| h.is_dead()) {
+                #[cfg(feature = "spec-trace")]
+                failed(None, Failure::Stale);
                 return Err(Error::Stale);
             }
             if let Some(kernel) = kernel {
@@ -803,14 +938,50 @@ impl Caller {
             )
             .await;
             account.phases.wait += waiting.elapsed();
+            #[cfg(feature = "spec-trace")]
+            if let Err(e) = &attached {
+                failed(
+                    None,
+                    if matches!(e, Error::Timeout | Error::Interrupted) {
+                        Failure::GaveUp {
+                            written: false,
+                            counted: false,
+                        }
+                    } else {
+                        Failure::Other
+                    },
+                );
+            }
             let attached = attached?;
             // Owners are put in server terms against the connection that carries the request, so a retry on the next one uses that one's.
-            let mapped = attached.ids.outgoing(req)?;
+            let mapped = attached.ids.outgoing(req).inspect_err(|_| {
+                #[cfg(feature = "spec-trace")]
+                failed(attached.conn_key, Failure::Other);
+            })?;
             let sent = mapped.as_ref().unwrap_or(req);
             let give_up = give_up(kernel, self.op_timeout);
             tokio::pin!(give_up);
+            // The call is ready to send, recorded while the connection's count of pending cancels is read, so that no other call's give-up comes between the two.
+            #[cfg(feature = "spec-trace")]
+            let ready = || {
+                if let (Some(recorder), Some(Origin::Call(call))) = (recorder, origin) {
+                    recorder.record(EventSpec::CallReady {
+                        call,
+                        conn: attached.conn_key.unwrap_or(0),
+                    });
+                }
+            };
+            let waits = {
+                let pending = attached.cancels.borrow();
+                let waits = req.changes() && *pending != 0;
+                #[cfg(feature = "spec-trace")]
+                if !waits {
+                    ready();
+                }
+                waits
+            };
             // A change goes out only once the server has said what became of every change this connection gave up on, so none of those can land after it.
-            if req.changes() && *attached.cancels.borrow() != 0 {
+            if waits {
                 if let Some(kernel) = kernel {
                     kernel.call_phase(PhaseCall::Cancel, Some(&attached), None);
                 }
@@ -820,17 +991,33 @@ impl Caller {
                     biased;
                     e = &mut give_up => Err(e),
                     answered = cancels.wait_for(|pending| *pending == 0) => {
-                        answered.expect("the connection's count lives as long as the connection");
+                        let _pending = answered.expect("the connection's count lives as long as the connection");
+                        #[cfg(feature = "spec-trace")]
+                        ready();
                         Ok(())
                     }
                 };
                 account.phases.wait += waiting.elapsed();
+                #[cfg(feature = "spec-trace")]
+                if answered.is_err() {
+                    failed(
+                        attached.conn_key,
+                        Failure::GaveUp {
+                            written: false,
+                            counted: false,
+                        },
+                    );
+                }
                 answered?;
             }
             if let Some(kernel) = kernel {
                 kernel.call_phase(PhaseCall::Open, Some(&attached), None);
             }
             let mut timing = Timing::for_kernel(kernel);
+            #[cfg(feature = "spec-trace")]
+            {
+                timing.origin = origin;
+            }
             let attempt = Instant::now();
             let exchanged = exchange(
                 &attached.conn,
@@ -949,8 +1136,24 @@ pub struct Client {
 impl Client {
     /// Connect and complete the hello; fails if the first attempt does, so a bad address, fingerprint or token is reported immediately.
     pub async fn connect(cfg: Config) -> anyhow::Result<Client> {
+        Client::connect_with(cfg, Perf::default()).await
+    }
+
+    /// [`Client::connect`], recording what the client does in the session model's terms with `recorder`.
+    #[cfg(feature = "spec-trace")]
+    pub async fn connect_recorded(cfg: Config, recorder: Arc<Recorder>) -> anyhow::Result<Client> {
+        let perf = Perf::default();
+        perf.hub.set_recorder(recorder);
+        Client::connect_with(cfg, perf).await
+    }
+
+    async fn connect_with(cfg: Config, perf: Perf) -> anyhow::Result<Client> {
+        let perf = Arc::new(perf);
         let handles = Arc::new(HandleTable::default());
-        let perf = Arc::new(Perf::default());
+        #[cfg(feature = "spec-trace")]
+        if let Some(recorder) = perf.hub.recorder() {
+            handles.trace(recorder.clone());
+        }
         let conn = ConnManager::start(
             ConfigConn {
                 server_addrs: cfg.server_addrs,

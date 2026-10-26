@@ -232,6 +232,8 @@ pub struct Hub {
     requests: AtomicU32,
     /// Taps that want frames.
     frames: AtomicU32,
+    /// Where this process's events in the session model's terms go, set by a trace-validation test before anything happens.
+    recorder: std::sync::OnceLock<Arc<crate::spec_trace::Recorder>>,
 }
 
 struct Tap {
@@ -340,6 +342,17 @@ impl TapReceiver {
 }
 
 impl Hub {
+    pub fn set_recorder(&self, recorder: Arc<crate::spec_trace::Recorder>) {
+        assert!(
+            self.recorder.set(recorder).is_ok(),
+            "a hub records for one test"
+        );
+    }
+
+    pub fn recorder(&self) -> Option<&Arc<crate::spec_trace::Recorder>> {
+        self.recorder.get()
+    }
+
     pub fn subscribe(self: &Arc<Self>, selection: Selection) -> (TapHandle, TapReceiver) {
         let (tx, rx) = mpsc::channel(TAP_RECORDS);
         let bytes = Arc::new(AtomicUsize::new(0));

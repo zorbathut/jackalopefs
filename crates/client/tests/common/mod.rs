@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod traced;
+
 use jackalopefs_client::ids::ModeIds as ModeIdsClient;
 use jackalopefs_client::{Client, Config, ServerTrust};
 use jackalopefs_proto::{read_frame, write_frame, Auth, Hello, HelloReply, Request, Response};

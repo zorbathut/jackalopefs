@@ -146,9 +146,20 @@ pub struct HandleTable {
     /// The handles in `map` of each kind, changed under its lock.
     files: AtomicU64,
     dirs: AtomicU64,
+    /// Where the releases owed are recorded in the session model's terms.
+    #[cfg(feature = "spec-trace")]
+    recorder: std::sync::OnceLock<Arc<jackalopefs_perf::spec_trace::Recorder>>,
 }
 
 impl HandleTable {
+    #[cfg(feature = "spec-trace")]
+    pub fn trace(&self, recorder: Arc<jackalopefs_perf::spec_trace::Recorder>) {
+        assert!(
+            self.recorder.set(recorder).is_ok(),
+            "a handle table is traced once"
+        );
+    }
+
     /// A fresh id; ids are never reused within a client's lifetime.
     pub fn alloc(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed) + 1
@@ -225,6 +236,10 @@ impl HandleTable {
             Request::Releasedir { fh, .. } => Request::Releasedir { fh, ordered: true },
             other => unreachable!("only releases are owed: {other:?}"),
         };
+        #[cfg(feature = "spec-trace")]
+        if let (Some(recorder), Some(fh)) = (self.recorder.get(), release.fhs()[0]) {
+            recorder.record(jackalopefs_perf::spec_trace::EventSpec::Owed { fh });
+        }
         self.owed.lock().push(release);
         self.owed_count.send_modify(|count| *count += 1);
     }

@@ -8,6 +8,7 @@ use crate::ids::{IdMap, ModeIds};
 use crate::perf::{Perf, Slowpath};
 use crate::transport::{client_config, ServerTrust};
 use jackalopefs_perf::hub::{Hub, IdsEvent, Side};
+use jackalopefs_perf::spec_trace::Origin;
 use jackalopefs_proto::control::{HandlesProcess, HandlesTotals};
 use jackalopefs_proto::{
     read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply,
@@ -263,6 +264,15 @@ async fn run(
         let (conn, resumed, root, ids) =
             (attached.conn, attached.resumed, attached.root, attached.ids);
         let conn_key = jackalopefs_perf::conn_key(&conn);
+        jackalopefs_perf::spec_trace!(
+            hub.recorder(),
+            jackalopefs_perf::spec_trace::EventSpec::Connected {
+                generation,
+                conn: conn_key.unwrap_or(0),
+                session: attached.session_id,
+                resumed,
+            }
+        );
         tracing::info!(
             session = attached.session_id,
             resumed,
@@ -332,6 +342,13 @@ async fn run(
         // Watched from before any call can use the connection, so no release owed on it goes unnoticed.
         let owed = handles.owed_changes();
         let releasing_on = attached.clone();
+        // Recorded first, since a call can take the connection as soon as it is published.
+        jackalopefs_perf::spec_trace!(
+            hub.recorder(),
+            jackalopefs_perf::spec_trace::EventSpec::Published {
+                conn: conn_key.unwrap_or(0)
+            }
+        );
         if state.send(ConnState::Connected(attached)).is_err() {
             break;
         }
@@ -358,6 +375,7 @@ async fn run(
         ));
         tokio::select! {
             reason = conn.closed() => {
+                jackalopefs_perf::spec_trace!(hub.recorder(), jackalopefs_perf::spec_trace::EventSpec::ConnLost { conn: conn_key.unwrap_or(0) });
                 offline_since = Instant::now();
                 tracing::warn!(generation, "connection lost: {reason}");
             }
@@ -614,13 +632,14 @@ async fn reopen_handles(
                 session,
                 conn: conn_key,
             };
+            let mut timing = Timing::for_origin(Some(Origin::Reopen(fh)));
             // A reopen given up on is a change given up on: its answer is read in the background and counted until it comes, so the release of its handle waits for it.
             let outcome = exchange(
                 &conn,
                 &root,
                 &ids,
                 &rec.reopen_request(fh),
-                &mut Timing::default(),
+                &mut timing,
                 tapping,
                 Some(&cancels),
                 async {
@@ -667,16 +686,27 @@ async fn send_releases(
                 conn: attached.conn_key,
             };
             let mut cancels = attached.cancels.subscribe();
-            cancels
-                .wait_for(|pending| *pending == 0)
-                .await
-                .expect("the connection's count lives as long as the connection");
+            {
+                let _pending = cancels
+                    .wait_for(|pending| *pending == 0)
+                    .await
+                    .expect("the connection's count lives as long as the connection");
+                // Recorded while the count is read, so no give-up comes between the two.
+                #[cfg(feature = "spec-trace")]
+                if let (Some(recorder), Some(fh)) = (hub.recorder(), release.fhs()[0]) {
+                    recorder.record(jackalopefs_perf::spec_trace::EventSpec::ReleaseReady {
+                        fh,
+                        conn: attached.conn_key.unwrap_or(0),
+                    });
+                }
+            }
+            let mut timing = Timing::for_origin(release.fhs()[0].map(Origin::Owed));
             let sent = exchange(
                 &attached.conn,
                 &attached.root,
                 &attached.ids,
                 &release,
-                &mut Timing::default(),
+                &mut timing,
                 tapping,
                 None,
                 std::future::pending(),

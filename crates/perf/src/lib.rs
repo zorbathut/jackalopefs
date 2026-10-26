@@ -5,7 +5,21 @@ pub mod events;
 pub mod histogram;
 pub mod hub;
 pub mod logging;
+pub mod spec_trace;
 pub mod stall;
+
+/// Records `$event` with `$recorder` (an `Option` of a reference to a `spec_trace::Recorder`) when the calling crate is built with its `spec-trace` feature; otherwise nothing is evaluated.
+#[macro_export]
+macro_rules! spec_trace {
+    ($recorder:expr, $event:expr) => {{
+        #[cfg(feature = "spec-trace")]
+        {
+            if let Some(recorder) = $recorder {
+                recorder.record($event);
+            }
+        }
+    }};
+}
 
 use histogram::Histogram;
 use jackalopefs_proto::control::{Resources, TotalOp};

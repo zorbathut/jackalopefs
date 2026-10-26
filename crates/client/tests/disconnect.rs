@@ -14,6 +14,7 @@
 
 mod common;
 
+use common::traced::Traced;
 use common::*;
 use jackalopefs_client::{Client, Error, RequestKernel};
 use jackalopefs_proto::{Path, SetAttr, Whence};
@@ -699,7 +700,8 @@ async fn run(case: Case, order: Order) -> Option<Run> {
     }
     let server = TestServer::start(export.path(), None).await;
     let gate = Gate::install(&server);
-    let client = server.client().await;
+    let traced = Traced::start(&server, &format!("{order:?}"));
+    let client = traced.client(server.config(Duration::from_secs(10))).await;
     let mut prep = case.prepare(&client).await;
     let blip = || async {
         gate.wait_parked().await;
@@ -834,6 +836,7 @@ async fn run(case: Case, order: Order) -> Option<Run> {
     );
     client.shutdown().await;
     server.stop().await;
+    traced.finish();
     Some(Run {
         op,
         follow,

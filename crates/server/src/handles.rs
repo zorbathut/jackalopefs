@@ -160,6 +160,9 @@ pub struct Handles {
     dirs: AtomicU64,
     /// What the session's client is asked to report: set at each threshold crossed, and cleared once it has been written to the session's connection or the session is back under half its share.
     notice: watch::Sender<Option<NoticeHandles>>,
+    /// Where `reserve`'s outcomes go in the session model's terms, and the session's id.
+    #[cfg(feature = "spec-trace")]
+    traced: std::sync::OnceLock<(Arc<jackalopefs_perf::spec_trace::Recorder>, u64)>,
 }
 
 impl Handle {
@@ -178,6 +181,31 @@ impl Handles {
             files: AtomicU64::new(0),
             dirs: AtomicU64::new(0),
             notice: watch::Sender::new(None),
+            #[cfg(feature = "spec-trace")]
+            traced: std::sync::OnceLock::new(),
+        }
+    }
+
+    #[cfg(feature = "spec-trace")]
+    pub(crate) fn trace(
+        &self,
+        recorder: Arc<jackalopefs_perf::spec_trace::Recorder>,
+        session: u64,
+    ) {
+        assert!(
+            self.traced.set((recorder, session)).is_ok(),
+            "a session's handles are traced once"
+        );
+    }
+
+    #[cfg(feature = "spec-trace")]
+    fn traced_reserve(&self, fh: u64, kept: bool) {
+        if let Some((recorder, session)) = self.traced.get() {
+            recorder.record(jackalopefs_perf::spec_trace::EventSpec::Reserved {
+                session: *session,
+                fh,
+                kept,
+            });
         }
     }
 
@@ -215,12 +243,16 @@ impl Handles {
         {
             let map = self.map.lock();
             if let Some(handle) = map.get(&fh) {
+                #[cfg(feature = "spec-trace")]
+                self.traced_reserve(fh, true);
                 return Ok(Reserved::Held(handle.clone()));
             }
         }
         if !self.pool.take() {
             return Err(ErrorReserve::PoolFull);
         }
+        #[cfg(feature = "spec-trace")]
+        self.traced_reserve(fh, false);
         Ok(Reserved::Slot(Slot {
             handles: self,
             fh,
