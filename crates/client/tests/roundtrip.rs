@@ -801,7 +801,7 @@ async fn rename_link_symlink_xattr_statfs_access() {
 }
 
 #[tokio::test]
-async fn timeout_against_a_blackhole_resets_and_releases() {
+async fn timeout_against_a_blackhole_resets_and_holds_the_release() {
     let blackhole = Blackhole::start().await;
     let mut cfg = blackhole.config(Duration::from_secs(5));
     cfg.op_timeout = Some(Duration::from_millis(500));
@@ -840,19 +840,114 @@ async fn timeout_against_a_blackhole_resets_and_releases() {
         client.handles().is_empty(),
         "a timed-out open registers no handle"
     );
-    let fh = wait_for(Duration::from_secs(3), "orphan release request", || {
-        let seen = blackhole.requests.lock();
-        let opened = seen.iter().find_map(|r| match r {
-            Request::Open { fh, .. } => Some(*fh),
-            _ => None,
-        })?;
-        seen.iter()
-            .any(|r| matches!(r, Request::Release { fh } if *fh == opened))
-            .then_some(opened)
+    // The open was sent and given up on; the server never answers its cancel, so whether it will still run is unknown, and its release, which could overtake it, is never sent. Past the release's own deadline it is owed, and still waits.
+    wait_for(Duration::from_secs(3), "the open to be sent", || {
+        blackhole
+            .requests
+            .lock()
+            .iter()
+            .any(|r| matches!(r, Request::Open { .. }))
+            .then_some(())
     })
     .await;
-    assert!(fh > 0);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !blackhole
+            .requests
+            .lock()
+            .iter()
+            .any(|r| matches!(r, Request::Release { .. })),
+        "a release went out while the open's fate was unknown"
+    );
     client.shutdown().await;
+}
+
+/// An open given up on while it runs holds its orphan release behind it, so the release closes what the open keeps rather than landing first and leaving it open.
+#[tokio::test]
+async fn an_orphan_release_waits_for_the_open_given_up_on_while_it_ran() {
+    let export = tempfile::tempdir().unwrap();
+    fs::write(export.path().join("f"), b"contents").unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let gate = Gate::install(&server);
+    gate.arm("open", Hold::Running);
+    let mut config = server.config(Duration::from_secs(5));
+    config.op_timeout = Some(Duration::from_millis(300));
+    let client = jackalopefs_client::Client::connect(config).await.unwrap();
+    let err = client
+        .open(path("f"), libc::O_RDONLY, None, |attr| Ok(attr.ino))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Timeout), "{err}");
+    gate.wait_parked().await;
+    wait_for(
+        Duration::from_secs(5),
+        "the orphan release to be held behind the open",
+        || server_holds_release(&server).then_some(()),
+    )
+    .await;
+    assert!(
+        !gate.log().iter().any(|d| d.op == "release"),
+        "the release ran while the open still did"
+    );
+    gate.release();
+    wait_for(
+        Duration::from_secs(5),
+        "the release to close what the open kept",
+        || {
+            (gate.log().iter().any(|d| d.op == "release")
+                && server.server.sessions.handle_totals().files == 0)
+                .then_some(())
+        },
+    )
+    .await;
+    client.shutdown().await;
+    server.stop().await;
+}
+
+/// A reopen given up on after a new session is counted like any change given up on, so the release of its now dead handle waits for the server's answer and then behind the reopen, instead of landing first and leaving the reopened file open.
+#[tokio::test]
+async fn the_release_of_a_reopen_given_up_on_waits_for_it() {
+    let export = tempfile::tempdir().unwrap();
+    fs::write(export.path().join("f"), b"contents").unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = jackalopefs_client::Client::connect(server.config(Duration::from_secs(1)))
+        .await
+        .unwrap();
+    let (fh, _) = client
+        .open(path("f"), libc::O_RDONLY, None, |attr| Ok(attr.ino))
+        .await
+        .unwrap();
+    let stopped = server.stop_held().await;
+    let server = stopped.start().await;
+    // Installed before this task next yields, so before the client can reach the new server.
+    let gate = Gate::install(&server);
+    gate.arm("open", Hold::Running);
+    gate.wait_parked().await;
+    let attached = wait_for_generation(&client, 2).await;
+    assert!(!attached.resumed);
+    assert!(
+        matches!(client.read(fh, 0, 10).await, Err(Error::Stale)),
+        "the reopen was given up on, so the handle is dead"
+    );
+    wait_for(
+        Duration::from_secs(5),
+        "the release of the dead handle to be held behind its reopen",
+        || server_holds_release(&server).then_some(()),
+    )
+    .await;
+    gate.release();
+    wait_for(
+        Duration::from_secs(5),
+        "the release to close what the reopen kept",
+        || {
+            (gate.log().iter().any(|d| d.op == "release")
+                && server.server.sessions.handle_totals().files == 0)
+                .then_some(())
+        },
+    )
+    .await;
+    client.shutdown().await;
+    server.stop().await;
 }
 
 fn owned_by(uid: u32, gid: u32) -> jackalopefs_proto::Attr {
@@ -1221,7 +1316,7 @@ async fn a_nonsense_reply_to_an_open_releases_the_handle() {
                 _ => None,
             })?;
             seen.iter()
-                .any(|r| matches!(r, Request::Release { fh } if *fh == opened))
+                .any(|r| matches!(r, Request::Release { fh, ordered: true } if *fh == opened))
                 .then_some(())
         },
     )
@@ -2361,7 +2456,15 @@ async fn a_release_failed_in_an_outage_is_sent_once_the_session_resumes() {
         hole.requests
             .lock()
             .iter()
-            .any(|req| matches!(req, Request::Release { fh: 7 }))
+            .any(|req| {
+                matches!(
+                    req,
+                    Request::Release {
+                        fh: 7,
+                        ordered: true
+                    }
+                )
+            })
             .then_some(())
     })
     .await;

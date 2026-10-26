@@ -65,18 +65,33 @@ mutate begin_ignores_epoch S2 \
 mutate opens_unordered S3 \
   'pure def ordered(kind: Kind): bool = match kind { Release(_) => false | _ => true }' \
   'pure def ordered(kind: Kind): bool = match kind { Change => true | _ => false }'
-mutate no_released_window S3 \
-  'q.slot == Refused or errno or ses.released.contains(fh) or ses.handles.get(fh).by != 0' \
-  'q.slot == Refused or errno or ses.handles.get(fh).by != 0'
 mutate resend_opens_again S3 \
-  'else if (ses.handles.get(fh).by != 0) Kept' \
-  'else if (false) Kept'
+  'if (ses.handles.get(fh).by != 0) Kept' \
+  'if (false) Kept'
 mutate drop_forgets_living_sessions S1strong \
   'def resumable(s: int): bool = sessions.get(s).live or alive(s)' \
   'def resumable(s: int): bool = sessions.get(s).live'
 mutate owed_never_sent owedNeverStuck \
   'client.owed.contains(fh) and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh)' \
   'false and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh)'
+mutate orphan_release_unordered S3 \
+  'OfCall(c) => ordered(kindOf(c)) | NoOrigin => false | _ => true }' \
+  'OfCall(c) => ordered(kindOf(c)) | Reopen(_) => true | OwedRelease(_) => true | _ => false }'
+mutate orphan_send_ignores_cancels S3 \
+  'conns.get(gen).published and conns.get(gen).cancels == 0 and client.orphansDue' \
+  'conns.get(gen).published and client.orphansDue'
+mutate owed_send_ignores_cancels S3 \
+  'conn.published and conn.cancels == 0 and client.owed.contains(fh)' \
+  'conn.published and client.owed.contains(fh)'
+mutate reopen_giveup_uncounted S3 \
+  'reqs'"'"' = reqs.set(r, q.with("cancelSent", true).with("counted", true)),
+      conns'"'"' = conns.setBy(q.conn, k => k.with("cancels", k.cancels + 1)),
+      client'"'"' = {
+        val done = client.with("reopening"' \
+  'reqs'"'"' = reqs.set(r, q.with("cancelSent", true)),
+      conns'"'"' = conns,
+      client'"'"' = {
+        val done = client.with("reopening"'
 
 echo
 if [[ $failures -eq 0 ]]; then echo "every mutation was caught"; else echo "$failures mutation(s) not caught"; exit 1; fi

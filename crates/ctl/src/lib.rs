@@ -1107,7 +1107,13 @@ mod tests {
     #[test]
     fn an_exchange_reads_as_what_was_asked_and_answered() {
         let body = |frame: Vec<u8>| frame[4..].to_vec();
-        let request = body(jackalopefs_proto::encode(&Request::Release { fh: 5 }).unwrap());
+        let request = body(
+            jackalopefs_proto::encode(&Request::Release {
+                fh: 5,
+                ordered: false,
+            })
+            .unwrap(),
+        );
         let replied = Exchange {
             side: "client".into(),
             every: 1,
@@ -1196,7 +1202,13 @@ mod tests {
             what: Happened::Exchange(Exchange {
                 side: "server".into(),
                 every: 1,
-                request: body(jackalopefs_proto::encode(&Request::Release { fh: 41 }).unwrap()),
+                request: body(
+                    jackalopefs_proto::encode(&Request::Release {
+                        fh: 41,
+                        ordered: false,
+                    })
+                    .unwrap(),
+                ),
                 reply: body(jackalopefs_proto::encode(&Response::Ok).unwrap()),
                 outcome: "replied".into(),
                 ..Exchange::default()

@@ -1505,7 +1505,10 @@ mod tests {
                 offset: 0,
                 max_bytes: 4096,
             },
-            Request::Release { fh: 1 },
+            Request::Release {
+                fh: 1,
+                ordered: false,
+            },
             Request::Statfs { path: path("a") },
         ] {
             assert!(named(req.clone()).is_empty(), "{req:?}");

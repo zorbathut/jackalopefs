@@ -300,7 +300,14 @@ mod tests {
                 offset: 0,
                 data: vec![1u8; 1000],
             },
-            Request::Release { fh: 1 },
+            Request::Release {
+                fh: 1,
+                ordered: false,
+            },
+            Request::Release {
+                fh: 2,
+                ordered: true,
+            },
             Request::Fsync {
                 fh: 1,
                 datasync: true,
@@ -314,7 +321,14 @@ mod tests {
                 offset: 0,
                 max_bytes: 65536,
             },
-            Request::Releasedir { fh: 3 },
+            Request::Releasedir {
+                fh: 3,
+                ordered: false,
+            },
+            Request::Releasedir {
+                fh: 4,
+                ordered: true,
+            },
             Request::Statfs { path: Path::root() },
             Request::Setxattr {
                 path: path("f"),
@@ -607,7 +621,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_frame_read_keeps_its_body_whether_or_not_it_decodes() {
-        let req = Request::Release { fh: 5 };
+        let req = Request::Release {
+            fh: 5,
+            ordered: false,
+        };
         let frame = encode(&req).unwrap();
         let (mut a, mut b) = tokio::io::duplex(8192);
         a.write_all(&frame).await.unwrap();
@@ -717,12 +734,18 @@ mod tests {
     #[test]
     fn decoding_from_a_misaligned_buffer_works() {
         // The body is decoded wherever it lands in memory; the crate's `unaligned` feature is what makes this legal.
-        let body = frame_body(&Request::Release { fh: 5 });
+        let body = frame_body(&Request::Release {
+            fh: 5,
+            ordered: false,
+        });
         let mut shifted = vec![0u8; 1];
         shifted.extend_from_slice(&body);
         assert_eq!(
             decode::<Request>(&shifted[1..]).unwrap(),
-            Request::Release { fh: 5 }
+            Request::Release {
+                fh: 5,
+                ordered: false
+            }
         );
     }
 
@@ -793,7 +816,10 @@ mod tests {
     #[test]
     fn unknown_discriminants_and_enum_values_are_errors_not_panics() {
         // Request's union tag is the first 16 bits of its data section; `release` is member 15.
-        let mut body = frame_body(&Request::Release { fh: 5 });
+        let mut body = frame_body(&Request::Release {
+            fh: 5,
+            ordered: false,
+        });
         assert_eq!(
             &body[ROOT_DATA..ROOT_DATA + 2],
             &15u16.to_le_bytes(),
@@ -927,7 +953,10 @@ mod tests {
         let text = String::from_utf8(capnp_convert(
             "binary:text",
             "Request",
-            &frame_body(&Request::Release { fh: 5 }),
+            &frame_body(&Request::Release {
+                fh: 5,
+                ordered: false,
+            }),
         ))
         .unwrap();
         assert!(

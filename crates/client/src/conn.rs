@@ -1,11 +1,11 @@
 //! The connection manager: one background task that owns the QUIC connection, reconnects with backoff when it drops, resumes (or reopens) the handle table, and forwards the server's event stream.
 
-use crate::client::{exchange, Error, ErrorExchange, KeyRoot, Tapping, Timing};
-use crate::handles::{HandleKind, HandleTable};
+use crate::client::{exchange, release_request, Error, ErrorExchange, KeyRoot, Tapping, Timing};
+use crate::handles::HandleTable;
 use crate::ids::{IdMap, ModeIds};
 use crate::perf::{Perf, Slowpath};
 use crate::transport::{client_config, ServerTrust};
-use jackalopefs_perf::hub::{IdsEvent, Side};
+use jackalopefs_perf::hub::{Hub, IdsEvent, Side};
 use jackalopefs_proto::control::{HandlesProcess, HandlesTotals};
 use jackalopefs_proto::{
     read_frame, read_frame_body, write_frame, Auth, Event, EventItem, Hello, HelloReply,
@@ -290,13 +290,24 @@ async fn run(
             session: attached.session_id,
             conn: conn_key,
         };
+        // Made before the reopens, which count on it the ones they give up on, so that a stale release waits for the answer.
+        let cancels = watch::Sender::new(0);
         let restore = async {
             if resumed {
                 Vec::new()
             } else {
                 // A new session holds none of the old one's handles, so the releases owed to that one are moot.
                 handles.take_owed();
-                reopen_handles(&conn, &root, ids, &handles, cfg.offline_timeout, tapping).await
+                reopen_handles(
+                    &conn,
+                    &root,
+                    ids,
+                    &handles,
+                    cfg.offline_timeout,
+                    &cancels,
+                    tapping,
+                )
+                .await
             }
         };
         let stale = tokio::select! {
@@ -314,10 +325,11 @@ async fn run(
             conn_key,
             root: root.clone(),
             ids,
-            cancels: watch::Sender::new(0),
+            cancels,
         });
         // Watched from before any call can use the connection, so no release owed on it goes unnoticed.
         let owed = handles.owed_changes();
+        let releasing_on = attached.clone();
         if state.send(ConnState::Connected(attached)).is_err() {
             break;
         }
@@ -329,16 +341,9 @@ async fn run(
         // The handles this client no longer has are released once the connection is published, so a server slow to answer holds up no call: their ids are never reused, and nothing on this side waits on them. Each release owed from then on is sent on this connection too. The next connection waits for the releasing to end, so one this connection could not deliver is owed again for its resume to send.
         let releases = if resumed { handles.take_owed() } else { stale };
         let releasing = {
-            let (conn, root, handles, hub) =
-                (conn.clone(), root.clone(), handles.clone(), hub.clone());
-            let session = tapping.session;
+            let (handles, hub) = (handles.clone(), hub.clone());
             tokio::spawn(async move {
-                let tapping = Tapping {
-                    hub: &hub,
-                    session,
-                    conn: conn_key,
-                };
-                send_releases(&conn, &root, ids, &handles, releases, owed, tapping).await;
+                send_releases(releasing_on, &handles, releases, owed, hub).await;
             })
         };
         let reader = tokio::spawn(read_events(
@@ -577,12 +582,14 @@ async fn connect_once(
 }
 
 /// The server has no memory of our handles: reopen each by path, concurrently, keep only those that still name the same inode, and return the releases of the rest, so the server doesn't hold what we won't use. Every reopen has the offline deadline: reopening is part of getting the connection back, and the connection is not published until it is done, so a reopen without a bound would keep every call on the mount waiting. The reopens run concurrently, so the whole phase is bounded by one of them.
+#[allow(clippy::too_many_arguments)]
 async fn reopen_handles(
     conn: &Connection,
     root: &KeyRoot,
     ids: IdMap,
     handles: &HandleTable,
     offline_timeout: Duration,
+    cancels: &watch::Sender<usize>,
     tapping: Tapping<'_>,
 ) -> Vec<jackalopefs_proto::Request> {
     let live = handles.live();
@@ -592,7 +599,12 @@ async fn reopen_handles(
     tracing::info!(count = live.len(), "reopening handles after a new session");
     let mut reopens = tokio::task::JoinSet::new();
     for (fh, rec) in live {
-        let (conn, root, hub) = (conn.clone(), root.clone(), tapping.hub.clone());
+        let (conn, root, hub, cancels) = (
+            conn.clone(),
+            root.clone(),
+            tapping.hub.clone(),
+            cancels.clone(),
+        );
         let (session, conn_key) = (tapping.session, tapping.conn);
         reopens.spawn(async move {
             let tapping = Tapping {
@@ -600,24 +612,22 @@ async fn reopen_handles(
                 session,
                 conn: conn_key,
             };
-            let outcome = match timeout(
-                offline_timeout,
-                exchange(
-                    &conn,
-                    &root,
-                    &ids,
-                    &rec.reopen_request(fh),
-                    &mut Timing::default(),
-                    tapping,
-                    None,
-                    std::future::pending(),
-                ),
+            // A reopen given up on is a change given up on: its answer is read in the background and counted until it comes, so the release of its handle waits for it.
+            let outcome = exchange(
+                &conn,
+                &root,
+                &ids,
+                &rec.reopen_request(fh),
+                &mut Timing::default(),
+                tapping,
+                Some(&cancels),
+                async {
+                    tokio::time::sleep(offline_timeout).await;
+                    Error::Timeout
+                },
             )
             .await
-            {
-                Ok(result) => result.map_err(Error::from),
-                Err(_) => Err(Error::Timeout),
-            };
+            .map_err(Error::from);
             (fh, rec, outcome)
         });
     }
@@ -626,12 +636,9 @@ async fn reopen_handles(
         match joined {
             Ok((fh, rec, outcome)) => {
                 handles.apply_reopen(fh, &rec, outcome);
-                // A handle closed while it was being reopened had its release fail for want of a connection, and only a resumed session is sent what is owed.
+                // A handle closed while it was being reopened had its release fail for want of a connection; it goes with the rest.
                 if rec.is_dead() || handles.get(fh).is_none() {
-                    stale.push(match rec.kind {
-                        HandleKind::File => jackalopefs_proto::Request::Release { fh },
-                        HandleKind::Dir => jackalopefs_proto::Request::Releasedir { fh },
-                    });
+                    stale.push(release_request(rec.kind, fh));
                 }
             }
             Err(e) => tracing::error!("reopen task failed: {e}"),
@@ -640,30 +647,32 @@ async fn reopen_handles(
     stale
 }
 
-/// Send releases concurrently for as long as the connection lasts: `releases` at once, then each one owed from then on (`owed`: a release that timed out, or found no connection while this one was coming up). One the server does not answer on this connection is owed again once the connection has ended, for the next resume of this session: owing it at once would wake this loop to send it again on the connection that just failed it.
+/// Send releases concurrently for as long as the connection lasts: `releases` at once, then each one owed from then on (`owed`: a release that timed out, or found no connection while this one was coming up). Each is ordered, so it goes out only once the connection's pending cancels (`Attached::cancels`) are answered, like any change: one of them may be the open of its id. One the server does not answer on this connection is owed again once the connection has ended, for the next resume of this session: owing it at once would wake this loop to send it again on the connection that just failed it.
 async fn send_releases(
-    conn: &Connection,
-    root: &KeyRoot,
-    ids: IdMap,
+    attached: Arc<Attached>,
     handles: &HandleTable,
-    releases: Vec<jackalopefs_proto::Request>,
+    releases: Vec<Request>,
     mut owed: watch::Receiver<u64>,
-    tapping: Tapping<'_>,
+    hub: Arc<Hub>,
 ) {
     let mut sends = tokio::task::JoinSet::new();
-    let send = |sends: &mut tokio::task::JoinSet<_>, release: jackalopefs_proto::Request| {
-        let (conn, root, hub) = (conn.clone(), root.clone(), tapping.hub.clone());
-        let (session, conn_key) = (tapping.session, tapping.conn);
+    let send = |sends: &mut tokio::task::JoinSet<_>, release: Request| {
+        let (attached, hub) = (attached.clone(), hub.clone());
         sends.spawn(async move {
             let tapping = Tapping {
                 hub: &hub,
-                session,
-                conn: conn_key,
+                session: attached.session_id,
+                conn: attached.conn_key,
             };
+            let mut cancels = attached.cancels.subscribe();
+            cancels
+                .wait_for(|pending| *pending == 0)
+                .await
+                .expect("the connection's count lives as long as the connection");
             let sent = exchange(
-                &conn,
-                &root,
-                &ids,
+                &attached.conn,
+                &attached.root,
+                &attached.ids,
                 &release,
                 &mut Timing::default(),
                 tapping,
@@ -705,7 +714,7 @@ async fn send_releases(
                 }
             }
             Some(joined) = sends.join_next() => settle(joined),
-            _ = conn.closed() => break,
+            _ = attached.conn.closed() => break,
         }
     }
     while let Some(joined) = sends.join_next().await {

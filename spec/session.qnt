@@ -42,8 +42,8 @@ module session {
   type Phase = Absent | Transit | Held | Ready | Cancelled | Superseded | Dropped | Running | Abandoned | Finished
   /// What the server sent back on the stream and the client has not yet read; `Lost` when the connection was gone on the server's side, so nothing went out.
   type Answer = NoAnswer | Reply | ErrnoReply | Unrun | Fenced | Lost
-  /// What `Handles::reserve` gave an open: nothing yet; a refusal, the id having been released; a slot of the pool; or the slot of the entry already under the id, a retried open's.
-  type Slot = NoSlot | Refused | Taken | Kept
+  /// What `Handles::reserve` gave an open: nothing yet; a slot of the pool; or the entry already under the id, a resend's (`Reserved::Held`).
+  type Slot = NoSlot | Taken | Kept
   type Req = {
     origin: Origin,
     attempt: int,
@@ -62,10 +62,10 @@ module session {
   /// One connection, by the client's generation. `clientAlive` and `serverAlive` are each end's view; `published` is the connection manager's: the reopens are done and calls may use it. `cancels` is `Attached::cancels`.
   type Conn = { session: int, epoch: int, clientAlive: bool, serverAlive: bool, published: bool, cancels: int }
 
-  /// A handle the server holds: the request that inserted it (0 for none), and whether the id had been released and then forgotten by the window when it was inserted, which is G4.
-  type Entry = { by: int, evicted: bool }
-  /// `SessionState`: the attachment's epoch and counts, whether the session is in the server's table (`live`) and whether its grace period is running (`detached`); its `Handles`, with the released ids it remembers (`released`) and every id ever released (a ghost). `handshakeLost` bounds that action to once between connections.
-  type Session = { epoch: int, running: int, abandoned: int, runningOlder: int, live: bool, detached: bool, handshakeLost: bool, handles: int -> Entry, released: Set[int], releasedEver: Set[int] }
+  /// A handle the server holds: the request that inserted it (0 for none).
+  type Entry = { by: int }
+  /// `SessionState`: the attachment's epoch and counts, whether the session is in the server's table (`live`) and whether its grace period is running (`detached`); its `Handles`. `handshakeLost` bounds that action to once between connections.
+  type Session = { epoch: int, running: int, abandoned: int, runningOlder: int, live: bool, detached: bool, handshakeLost: bool, handles: int -> Entry }
 
   /// The client's handle table: for each id, the request whose reply it accepted, or the reopen it expects (0 for none held); the handles a reopen killed (`HandleRec::dead`); the releases owed; the opens of unknown outcome whose orphan release has not been sent; the handles reopened on the current session; the reopens whose task still waits for an answer (`reopen_handles`' tasks).
   type Client = { held: int -> int, dead: Set[int], owed: Set[int], orphansDue: Set[int], reopened: Set[int], reopening: Set[int] }
@@ -106,8 +106,8 @@ module session {
   pure def newReq(origin: Origin, attempt: int, g: int, k: Conn): Req = { origin: origin, attempt: attempt, phase: Transit, conn: g, epoch: k.epoch, session: k.session, cancelSent: false, counted: false, answer: NoAnswer, slot: NoSlot }
   pure val noConn: Conn = { session: 0, epoch: 0, clientAlive: false, serverAlive: false, published: false, cancels: 0 }
   pure def liveConn(s: int, epoch: int, published: bool): Conn = { session: s, epoch: epoch, clientAlive: true, serverAlive: true, published: published, cancels: 0 }
-  pure val noEntry: Entry = { by: 0, evicted: false }
-  pure val noSession: Session = { epoch: 0, running: 0, abandoned: 0, runningOlder: 0, live: false, detached: false, handshakeLost: false, handles: CALLS.mapBy(fh => noEntry), released: Set(), releasedEver: Set() }
+  pure val noEntry: Entry = { by: 0 }
+  pure val noSession: Session = { epoch: 0, running: 0, abandoned: 0, runningOlder: 0, live: false, detached: false, handshakeLost: false, handles: CALLS.mapBy(fh => noEntry) }
   pure val freshSession: Session = noSession.with("epoch", 1).with("live", true)
   pure val emptyClient: Client = { held: CALLS.mapBy(fh => 0), dead: Set(), owed: Set(), orphansDue: Set(), reopened: Set(), reopening: Set() }
 
@@ -120,7 +120,8 @@ module session {
   }
 
   def kindOf(c: int): Kind = calls.get(c).kind
-  def orderedReq(q: Req): bool = match q.origin { OfCall(c) => ordered(kindOf(c)) | Reopen(_) => true | _ => false }
+  /// Whether a request takes part in the ordering (`Request::changes`): a call's change or open, a reopen, and a release the client sends on its own (orphan or owed, `ordered`); not the kernel's release.
+  def orderedReq(q: Req): bool = match q.origin { OfCall(c) => ordered(kindOf(c)) | NoOrigin => false | _ => true }
   def opensReq(q: Req): bool = match q.origin { OfCall(c) => isOpen(kindOf(c)) | Reopen(_) => true | _ => false }
   def releasesReq(q: Req): bool = match q.origin { OfCall(c) => isRelease(kindOf(c)) | OrphanRelease(_) => true | OwedRelease(_) => true | _ => false }
   /// The handle an open keeps or a release lets go, 0 for a change.
@@ -275,7 +276,7 @@ module session {
         }
         | Reopen(fh) => all {
           keepCalls,
-          conns' = conns,
+          conns' = if (q.counted) conns.setBy(q.conn, k => k.with("cancels", k.cancels - 1)) else conns,
           client' = if (not(client.reopening.contains(r))) client
             else {
               val done = client.with("reopening", client.reopening.exclude(Set(r)))
@@ -289,7 +290,11 @@ module session {
           conns' = conns,
           client' = if (q.answer == Reply) client.with("owed", client.owed.exclude(Set(fh))) else client,
         }
-        | _ => all { keepCalls, conns' = conns, keepClient }
+        | _ => all {
+          keepCalls,
+          conns' = if (q.counted) conns.setBy(q.conn, k => k.with("cancels", k.cancels - 1)) else conns,
+          keepClient,
+        }
       },
       gen' = gen,
       sid' = sid,
@@ -320,20 +325,22 @@ module session {
     }
   }
 
-  /// A reopen's `timeout` passes (`reopen_handles`), its reply not yet read: the exchange is dropped, both sides of its stream reset, nothing counted on `cancels`; the handle, if still held, is dead, and its release owed (`apply_reopen`, and the stale list, which takes a handle the kernel released meanwhile too).
+  /// A reopen's deadline passes (`reopen_handles`), its reply not yet read: `exchange` resets its send side and counts it on the connection's `cancels`, made before the reopens, and reads the server's answer in the background; the handle, if still held, is dead, and its release owed (`apply_reopen`, and the stale list, which takes a handle the kernel released meanwhile too), to be sent once that answer is in.
   action reopenGiveUp(r: int): bool = {
     val q = reqs.get(r)
     val fh = fhOf(q)
     all {
       client.reopening.contains(r),
       conns.get(q.conn).clientAlive,
-      reqs' = reqs.set(r, q.with("cancelSent", true)),
+      reqs' = reqs.set(r, q.with("cancelSent", true).with("counted", true)),
+      conns' = conns.setBy(q.conn, k => k.with("cancels", k.cancels + 1)),
       client' = {
         val done = client.with("reopening", client.reopening.exclude(Set(r))).with("owed", client.owed.union(Set(fh)))
         if (client.held.get(fh) == r) done.with("held", done.held.set(fh, 0)).with("dead", done.dead.union(Set(fh))) else done
       },
       keepCalls,
-      keepConns,
+      gen' = gen,
+      sid' = sid,
       keepSessions,
       keepGhosts,
     }
@@ -358,10 +365,10 @@ module session {
     }
   }
 
-  /// `send_releases`: the connection's release task sends each release owed, whenever it is owed, with no cancel and no give-up, once at a time on one connection; one the server does not answer stays owed, for the next connection.
+  /// `send_releases`: the connection's release task sends each release owed, whenever it is owed, once the connection's pending cancels are answered (it is ordered), with no give-up, once at a time on one connection; one the server does not answer stays owed, for the next connection.
   def owedSendable(fh: int): bool = {
     val conn = conns.get(gen)
-    conn.clientAlive and conn.published and client.owed.contains(fh) and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh) and reqs.get(x).conn == gen and unsettled(reqs.get(x)))) and lowestFree <= R
+    conn.clientAlive and conn.published and conn.cancels == 0 and client.owed.contains(fh) and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh) and reqs.get(x).conn == gen and unsettled(reqs.get(x)))) and lowestFree <= R
   }
   action owedSend(fh: int): bool = {
     val conn = conns.get(gen)
@@ -379,19 +386,46 @@ module session {
     }
   }
 
-  /// `release_orphan`: an open whose outcome the caller never learned may have kept a handle, so its id is released in the background, with no kernel request to interrupt it. Its own timeout, which only owes it, is left out.
+  /// `release_orphan`: an open whose outcome the caller never learned may have kept a handle, so its id is released in the background, with no kernel request to interrupt it. The release is ordered, so it waits, like any change, for the connection's pending cancels, the open's among them, to be answered.
+  def orphanSendable(fh: int): bool = conns.get(gen).clientAlive and conns.get(gen).published and conns.get(gen).cancels == 0 and client.orphansDue.contains(fh) and lowestFree <= R
   action orphanSend(fh: int): bool = {
     val conn = conns.get(gen)
     val r = lowestFree
     all {
-      conn.clientAlive,
-      conn.published,
-      client.orphansDue.contains(fh),
-      r <= R,
+      orphanSendable(fh),
       reqs' = reqs.set(r, newReq(OrphanRelease(fh), 1, gen, conn)),
       client' = client.with("orphansDue", client.orphansDue.exclude(Set(fh))),
       keepCalls,
       keepConns,
+      keepSessions,
+      keepGhosts,
+    }
+  }
+
+  /// The orphan release's own deadline passes (`op_timeout`, the offline deadline at least): before it was sent, it is owed; after, its cancel is counted like any change's, and it is owed.
+  action orphanGiveUp(fh: int): bool = all {
+    client.orphansDue.contains(fh),
+    client' = client.with("orphansDue", client.orphansDue.exclude(Set(fh))).with("owed", client.owed.union(Set(fh))),
+    keepCalls,
+    keepReqs,
+    keepConns,
+    keepSessions,
+    keepGhosts,
+  }
+  action orphanSentGiveUp(r: int): bool = {
+    val q = reqs.get(r)
+    all {
+      isOrphan(q.origin),
+      unsettled(q),
+      q.answer == NoAnswer,
+      not(q.counted),
+      conns.get(q.conn).clientAlive,
+      reqs' = reqs.set(r, q.with("cancelSent", true).with("counted", true)),
+      conns' = conns.setBy(q.conn, k => k.with("cancels", k.cancels + 1)),
+      client' = client.with("owed", client.owed.union(Set(fhOf(q)))),
+      keepCalls,
+      gen' = gen,
+      sid' = sid,
       keepSessions,
       keepGhosts,
     }
@@ -513,21 +547,6 @@ module session {
     }
   }
 
-  /// `Released` keeps the latest 1024 ids released, so enough later releases push an id out. This forgets any remembered id at any time, which stands for any amount of that pressure; what it lets through is G4.
-  action releasedForget(s: int, fh: int): bool = {
-    val ses = sessions.get(s)
-    all {
-      ses.released.contains(fh),
-      sessions' = sessions.set(s, ses.with("released", ses.released.exclude(Set(fh)))),
-      pool' = pool,
-      keepCalls,
-      keepReqs,
-      keepConns,
-      keepClient,
-      keepGhosts,
-    }
-  }
-
   // ---- The server's requests (`crates/server/src/session.rs` `handle_request`, `ops.rs`, `handles.rs`) ----
 
   /// The request is decoded and, for a change, the fence read once: held in `drain` if it is above zero, else straight to the blocking pool. Nothing arrives on a connection the server has lost.
@@ -589,12 +608,11 @@ module session {
     }
   }
 
-  /// `Handles::reserve`, as the open begins: refused if the id was released and is still remembered, else the entry already under the id (`Reserved::Held`: a resend whose original kept it, which answers from it and opens nothing), else a slot of the pool.
+  /// `Handles::reserve`, as the open begins: the entry already under the id (`Reserved::Held`: a resend whose original kept it, which answers from it and opens nothing), else a slot of the pool.
   def reserve(q: Req): Slot = {
     val ses = sessions.get(q.session)
     val fh = fhOf(q)
-    if (ses.released.contains(fh)) Refused
-    else if (ses.handles.get(fh).by != 0) Kept
+    if (ses.handles.get(fh).by != 0) Kept
     else Taken
   }
 
@@ -624,31 +642,31 @@ module session {
     }
   }
 
-  /// `Slot::insert` refuses, giving the slot back, when the id was released meanwhile and is still remembered, or when another open of the id got there first; before that, the open itself may have failed with an errno (`errno`), or `reserve` refused it. Not asked of a `Kept` open, which inserts nothing.
+  /// `Slot::insert` refuses, giving the slot back, when another open of the id got there first; before that, the open itself may have failed with an errno (`errno`). Not asked of a `Kept` open, which inserts nothing.
   def insertRefused(ses: Session, q: Req, errno: bool): bool = {
     val fh = fhOf(q)
-    q.slot == Refused or errno or ses.released.contains(fh) or ses.handles.get(fh).by != 0
+    errno or ses.handles.get(fh).by != 0
   }
 
-  /// `Slot::insert`: the entry is kept under the id, the slot becoming its; refused, the slot is given back. A `Kept` open changes nothing. The entry notes whether the id had been released and then forgotten (G4).
+  /// `Slot::insert`: the entry is kept under the id, the slot becoming its; refused, the slot is given back. A `Kept` open changes nothing.
   def inserted(ses: Session, q: Req, r: int, errno: bool): (Session, int) = {
     val fh = fhOf(q)
     val taken = if (q.slot == Taken) 1 else 0
     if (q.slot == Kept) Tup(ses, pool)
     else if (insertRefused(ses, q, errno)) Tup(ses, pool - taken)
-    else Tup(ses.with("handles", ses.handles.set(fh, { by: r, evicted: ses.releasedEver.contains(fh) and not(ses.released.contains(fh)) })), pool)
+    else Tup(ses.with("handles", ses.handles.set(fh, { by: r })), pool)
   }
 
-  /// `Handles::remove`: the id is remembered, and the handle under it, if any, closed and its slot given back; a release of an unknown handle is no error.
+  /// `Handles::remove`: the handle under the id, if any, is closed and its slot given back; a release of an unknown handle is no error.
   def released(ses: Session, q: Req): (Session, int) = {
     val fh = fhOf(q)
     Tup(
-      ses.with("released", ses.released.union(Set(fh))).with("releasedEver", ses.releasedEver.union(Set(fh))).with("handles", ses.handles.set(fh, noEntry)),
+      ses.with("handles", ses.handles.set(fh, noEntry)),
       if (ses.handles.get(fh).by != 0) pool - 1 else pool
     )
   }
 
-  /// The work ends, with a reply or an errno (an open refused at `reserve` or at `insert` with EBADF; a release, or an open answered from the handle under its id, never fails), and `GuardChange::drop` uncounts the change under the epoch it began at; one given up on sends no reply, but its work stands. The reply goes nowhere on a connection the server has lost.
+  /// The work ends, with a reply or an errno (an open refused at `insert` with EBADF; a release, or an open answered from the handle under its id, never fails), and `GuardChange::drop` uncounts the change under the epoch it began at; one given up on sends no reply, but its work stands. The reply goes nowhere on a connection the server has lost.
   action finish(r: int, errno: bool): bool = {
     val q = reqs.get(r)
     val ses = sessions.get(q.session)
@@ -731,13 +749,10 @@ module session {
   action stepReopenGiveUp = { nondet r = REQS.oneOf()  reopenGiveUp(r) }
   action stepOwedSend = { nondet fh = CALLS.oneOf()  owedSend(fh) }
   action stepOrphanSend = { nondet fh = CALLS.oneOf()  orphanSend(fh) }
+  action stepOrphanGiveUp = { nondet fh = CALLS.oneOf()  orphanGiveUp(fh) }
+  action stepOrphanSentGiveUp = { nondet r = REQS.oneOf()  orphanSentGiveUp(r) }
   action stepDropSession = { nondet s = SIDS.oneOf()  dropSession(s) }
   action stepCloseSession = { nondet s = SIDS.oneOf()  closeSession(s) }
-  action stepReleasedForget = {
-    nondet s = SIDS.oneOf()
-    nondet fh = CALLS.oneOf()
-    releasedForget(s, fh)
-  }
   action stepArrive = { nondet r = REQS.oneOf()  arrive(r) }
   action stepDrain = { nondet r = REQS.oneOf()  drain(r) }
   action stepBegin = { nondet r = REQS.oneOf()  begin(r) }
@@ -760,12 +775,13 @@ module session {
     publish,
     stepOwedSend,
     stepOrphanSend,
+    stepOrphanGiveUp,
+    stepOrphanSentGiveUp,
     reconnect,
     newSession,
     handshakeLost,
     stepDropSession,
     stepCloseSession,
-    stepReleasedForget,
     stepArrive,
     stepDrain,
     stepBegin,
@@ -802,22 +818,11 @@ module session {
   /// No release owed is stuck: once all else is quiet, one of them can go out on the connection that is up (G5 was a release owed there waiting for a later connection). S3 holds only at quiescence, which a stuck release would keep out of reach, so this is what sees one.
   val owedNeverStuck = (quiet and lowestFree <= R and client.owed != Set()) implies client.owed.exists(fh => owedSendable(fh))
 
-  /// The server holds `fh` for the client's session as the client holds it. With `g4` allowed, that gap may explain a handle the server alone holds: the id was released and forgotten before the open landed (G4).
-  def handleAgrees(fh: int, g4: bool): bool = {
-    val entry = sessions.get(sid).handles.get(fh)
-    val serverHas = entry.by != 0
-    val clientHas = client.held.get(fh) != 0
-    and {
-      clientHas implies serverHas,
-      serverHas implies (clientHas or (g4 and entry.evicted)),
-    }
-  }
+  /// The server holds `fh` for the client's session exactly when the client holds it.
+  def handleAgrees(fh: int): bool = (sessions.get(sid).handles.get(fh).by != 0) == (client.held.get(fh) != 0)
 
-  /// S3, handles, with the known gap allowed for: once nothing is in flight, no release owed included, the server's handles for the session are the client's live ones.
-  val S3 = quiescent implies CALLS.forall(fh => handleAgrees(fh, true))
-
-  /// S3 without the allowance, expected to fail with the gap's trace.
-  val S3noG4 = quiescent implies CALLS.forall(fh => handleAgrees(fh, false))
+  /// S3, handles: once nothing is in flight, no release owed included, the server's handles for the session are the client's live ones.
+  val S3 = quiescent implies CALLS.forall(fh => handleAgrees(fh))
 
   /// An open's handle is never replaced by another file's: whatever the client holds under an id, the server's entry for its session under that id was opened by the request the client accepted, or by an earlier attempt of the same call, whose handle a resend answers from.
   val S3identity = CALLS.forall(fh => {
@@ -853,7 +858,7 @@ module session {
   val seenSuperseded = REQS.exists(r => reqs.get(r).phase == Superseded)
   val seenResendRan = CALLS.exists(c => REQS.filter(r => reqs.get(r).origin == OfCall(c) and begun(reqs.get(r).phase)).size() == 2)
   val seenTakeover = tookOver
-  val seenRefused = REQS.exists(r => reqs.get(r).slot == Refused and reqs.get(r).phase == Finished)
+  val seenReleaseHeld = REQS.exists(r => isOrphan(reqs.get(r).origin) and reqs.get(r).phase == Held)
   val seenOrphanRan = REQS.exists(r => isOrphan(reqs.get(r).origin) and reqs.get(r).phase == Finished)
   val seenReopenSettled = quiescent and client.owed == Set() and REQS.exists(r => isReopen(reqs.get(r).origin) and reqs.get(r).phase == Finished)
   val seenOwedSettled = quiescent and client.owed == Set() and REQS.exists(r => isOwed(reqs.get(r).origin) and reqs.get(r).phase == Finished)
@@ -862,7 +867,7 @@ module session {
   val neverSuperseded = not(seenSuperseded)
   val neverResendRan = not(seenResendRan)
   val neverTakeover = not(seenTakeover)
-  val neverRefused = not(seenRefused)
+  val neverReleaseHeld = not(seenReleaseHeld)
   val neverOrphanRan = not(seenOrphanRan)
   val neverReopenSettled = not(seenReopenSettled)
   val neverOwedSettled = not(seenOwedSettled)

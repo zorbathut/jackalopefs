@@ -679,7 +679,11 @@ impl Message for Request {
                 g.set_offset(*offset);
                 g.set_data(data);
             }
-            Request::Release { fh } => b.init_release().set_fh(*fh),
+            Request::Release { fh, ordered } => {
+                let mut g = b.init_release();
+                g.set_fh(*fh);
+                g.set_ordered(*ordered);
+            }
             Request::Fsync { fh, datasync } => {
                 let mut g = b.init_fsync();
                 g.set_fh(*fh);
@@ -700,7 +704,11 @@ impl Message for Request {
                 g.set_offset(*offset);
                 g.set_max_bytes(*max_bytes);
             }
-            Request::Releasedir { fh } => b.init_releasedir().set_fh(*fh),
+            Request::Releasedir { fh, ordered } => {
+                let mut g = b.init_releasedir();
+                g.set_fh(*fh);
+                g.set_ordered(*ordered);
+            }
             Request::Statfs { path } => {
                 build_path(b.init_statfs().init_path(path.names().len() as u32), path)
             }
@@ -860,7 +868,10 @@ impl Message for Request {
                 offset: g.get_offset(),
                 data: g.get_data()?.to_vec(),
             },
-            rq::Which::Release(g) => Request::Release { fh: g.get_fh() },
+            rq::Which::Release(g) => Request::Release {
+                fh: g.get_fh(),
+                ordered: g.get_ordered(),
+            },
             rq::Which::Fsync(g) => Request::Fsync {
                 fh: g.get_fh(),
                 datasync: g.get_datasync(),
@@ -874,7 +885,10 @@ impl Message for Request {
                 offset: g.get_offset(),
                 max_bytes: g.get_max_bytes(),
             },
-            rq::Which::Releasedir(g) => Request::Releasedir { fh: g.get_fh() },
+            rq::Which::Releasedir(g) => Request::Releasedir {
+                fh: g.get_fh(),
+                ordered: g.get_ordered(),
+            },
             rq::Which::Statfs(g) => Request::Statfs {
                 path: parse_path(g.get_path()?)?,
             },

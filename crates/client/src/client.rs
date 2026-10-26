@@ -1283,7 +1283,9 @@ impl Client {
     /// Forget the handle locally first so a reconnect never reopens it, then tell the server.
     pub async fn release(&self, fh: u64) -> Result<(), Error> {
         self.caller.handles.remove(fh);
-        self.caller.release(Request::Release { fh }).await
+        self.caller
+            .release(Request::Release { fh, ordered: false })
+            .await
     }
 
     pub async fn fsync(&self, fh: u64, datasync: bool) -> Result<(), Error> {
@@ -1331,7 +1333,9 @@ impl Client {
 
     pub async fn releasedir(&self, fh: u64) -> Result<(), Error> {
         self.caller.handles.remove(fh);
-        self.caller.release(Request::Releasedir { fh }).await
+        self.caller
+            .release(Request::Releasedir { fh, ordered: false })
+            .await
     }
 
     pub async fn statfs(&self, path: Path) -> Result<Statfs, Error> {
@@ -1374,10 +1378,11 @@ impl Client {
     }
 }
 
-fn release_request(kind: HandleKind, fh: u64) -> Request {
+/// The release of `fh` the client sends on its own, which is ordered: the open of `fh` may not have landed yet ([`Request::Release`]).
+pub(crate) fn release_request(kind: HandleKind, fh: u64) -> Request {
     match kind {
-        HandleKind::File => Request::Release { fh },
-        HandleKind::Dir => Request::Releasedir { fh },
+        HandleKind::File => Request::Release { fh, ordered: true },
+        HandleKind::Dir => Request::Releasedir { fh, ordered: true },
     }
 }
 
@@ -1508,7 +1513,13 @@ mod tests {
             },
             &[None, None]
         ));
-        assert!(retry_safe(&Request::Release { fh: 1 }, &[None, None]));
+        assert!(retry_safe(
+            &Request::Release {
+                fh: 1,
+                ordered: false
+            },
+            &[None, None]
+        ));
         assert!(!retry_safe(
             &Request::Unlink {
                 parent: Path::root(),

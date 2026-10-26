@@ -68,45 +68,46 @@ module session_small {
     .then(start(3, Change, false)).then(send(3)).then(arrive(3)).expect(phaseOf(3) == Held)
     .then(finish(1, false)).then(drain(3)).then(begin(3)).expect(okSoFar)
 
-  /// An open given up on while it ran: its orphan release lands first and remembers the id, so `insert` refuses the open when it finishes and it keeps nothing.
-  run openGivenUpTest = init
-    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).expect(reqs.get(1).slot == Taken and pool == 1)
-    .then(giveUp(1)).expect(client.orphansDue == Set(1))
-    .then(seeCancel(1)).then(receive(1))
-    .then(orphanSend(1)).expect(client.orphansDue == Set() and reqs.get(2).origin == OrphanRelease(1))
-    .then(arrive(2)).then(begin(2)).then(finish(2, false)).expect(sessions.get(1).released == Set(1))
-    .then(receive(2))
-    .then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and reqs.get(1).answer == NoAnswer and quiescent and okSoFar)
-
-  /// An open given up on before it began, whose orphan release lands before the server sees the cancel: `reserve` refuses the open under the released id, and the client reads the errno as the cancel's answer.
-  run refusedTest = init
-    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).expect(phaseOf(1) == Ready)
-    .then(giveUp(1)).expect(conns.get(1).cancels == 1)
-    .then(orphanSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(sessions.get(1).released == Set(1))
-    .then(begin(1)).expect(reqs.get(1).slot == Refused and pool == 0)
-    .then(finish(1, false)).expect(reqs.get(1).answer == ErrnoReply)
-    .then(receive(1)).expect(conns.get(1).cancels == 0 and seenRefused and quiescent and okSoFar)
-
-  /// The hovering race: a retried open finds the original's entry, the entry is released while the retry runs, and the retry, answering from what it found, keeps nothing.
+  /// The hovering race: a retried open finds the original's entry and is given up on while it runs; its orphan release waits behind it, then closes the original's handle.
   run hoveringTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1)
     .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect)
     .then(send(1)).then(arrive(2)).then(begin(2)).expect(reqs.get(2).slot == Kept and pool == 1)
     .then(giveUp(1)).then(seeCancel(2)).then(receive(2))
     .then(orphanSend(1)).expect(reqs.get(3).origin == OrphanRelease(1))
-    .then(arrive(3)).then(begin(3)).then(finish(3, false)).expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and sessions.get(1).released == Set(1))
-    .then(receive(3))
-    .then(finish(2, false)).expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
+    .then(arrive(3)).expect(phaseOf(3) == Held)
+    .then(finish(2, false)).then(drain(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
+    .expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
 
-  /// The hovering race once the window has forgotten the id: the retry still keeps nothing, and the pool count stays right.
-  run forgottenGuardTest = init
-    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false))
-    .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect)
-    .then(send(1)).then(arrive(2)).then(begin(2)).expect(reqs.get(2).slot == Kept)
-    .then(giveUp(1)).then(seeCancel(2)).then(receive(2))
-    .then(orphanSend(1)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3)).expect(sessions.get(1).handles.get(1).by == 0 and pool == 0)
-    .then(releasedForget(1, 1)).expect(sessions.get(1).released == Set())
-    .then(finish(2, false)).expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
+  /// An open given up on while it ran: its orphan release waits for the cancel's answer, then behind the open, which keeps its handle until the release closes it.
+  run openGivenUpTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).expect(reqs.get(1).slot == Taken and pool == 1)
+    .then(giveUp(1)).expect(client.orphansDue == Set(1) and conns.get(1).cancels == 1)
+    .expect(not(orphanSendable(1)))
+    .then(seeCancel(1)).then(receive(1)).expect(phaseOf(1) == Abandoned and conns.get(1).cancels == 0)
+    .then(orphanSend(1)).expect(client.orphansDue == Set() and reqs.get(2).origin == OrphanRelease(1))
+    .then(arrive(2)).expect(phaseOf(2) == Held and seenReleaseHeld)
+    .then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1 and pool == 1)
+    .then(drain(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
+    .expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
+
+  /// An open given up on before it began: the server drops it unrun, and only then does its orphan release go out, closing nothing.
+  run openUnrunTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).expect(phaseOf(1) == Ready)
+    .then(giveUp(1)).then(seeCancel(1)).expect(phaseOf(1) == Cancelled)
+    .then(receive(1)).then(orphanSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
+    .expect(pool == 0 and quiescent and okSoFar)
+
+  /// The orphan release times out while it waits behind the open: its cancel is counted and it is owed; the owed release goes once the cancel's answer is in, and waits behind the open in turn.
+  run orphanOwedTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1))
+    .then(giveUp(1)).then(seeCancel(1)).then(receive(1))
+    .then(orphanSend(1)).then(arrive(2)).then(orphanSentGiveUp(2)).expect(client.owed == Set(1) and conns.get(1).cancels == 1)
+    .then(seeCancel(2)).expect(phaseOf(2) == Cancelled)
+    .then(receive(2)).expect(conns.get(1).cancels == 0)
+    .then(owedSend(1)).then(arrive(3)).expect(phaseOf(3) == Held)
+    .then(finish(1, false)).then(drain(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
+    .expect(client.owed == Set() and sessions.get(1).handles.get(1).by == 0 and quiescent and okSoFar)
 
   /// The original open was kept and its reply lost; the resend finds the original's handle under the id and answers from it, opening nothing (it cannot fail with an errno as opening again could), and the client holds what the server holds.
   run resentOpenTest = init
@@ -115,15 +116,7 @@ module session_small {
     .then(send(1)).then(arrive(2)).then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1)
     .then(drain(2)).then(begin(2)).expect(reqs.get(2).slot == Kept and pool == 1)
     .then(finish(2, false)).then(receive(2)).expect(calls.get(1).outcome == Replied and client.held.get(1) == 2 and sessions.get(1).handles.get(1).by == 1)
-    .expect(quiescent and S3 and S3noG4 and okSoFar)
-
-  /// G4: an open given up on while it ran, its orphan release landing first and the window then forgetting the id, so the open lands and keeps its handle. S3 allows for it; S3 without the allowance does not.
-  run g4Test = init
-    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1))
-    .then(giveUp(1)).then(seeCancel(1)).then(receive(1)).expect(phaseOf(1) == Abandoned)
-    .then(orphanSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(sessions.get(1).released == Set(1))
-    .then(releasedForget(1, 1)).expect(sessions.get(1).released == Set())
-    .then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1 and sessions.get(1).handles.get(1).evicted and quiescent and S3 and not(S3noG4) and okSoFar)
+    .expect(quiescent and S3 and okSoFar)
 
   /// A release given up on before its frame was written is owed and sent on the connection it was given up on, with no resume; until then nothing is quiescent.
   run owedLiveTest = init
@@ -175,15 +168,16 @@ module session_small {
     .then(owedSend(1)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3)).expect(client.owed == Set())
     .then(closeSession(1)).expect(pool == 0 and quiescent and okSoFar)
 
-  /// A new session whose reopen is given up on while the server runs it: the connection is published at once, the reopen running on, and the release of the dead handle goes out beside it.
+  /// A new session whose reopen is given up on while the server runs it: the connection is published at once, the reopen running on; its cancel is counted, so the release of the dead handle goes out once the server has answered it, and is held behind the reopen until that has kept its handle.
   run reopenGivenUpTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
     .then(loseClient(1, Set())).then(loseServer(1)).then(dropSession(1)).then(newSession)
-    .then(reopenSend(1)).then(arrive(2)).then(begin(2)).then(reopenGiveUp(2)).expect(client.dead == Set(1) and client.owed == Set(1))
-    .then(publish).expect(conns.get(2).published and phaseOf(2) == Running)
-    .then(owedSend(1)).expect(reqs.get(3).origin == OwedRelease(1))
-    .then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
-    .then(finish(2, false)).then(receive(2)).then(closeSession(1))
+    .then(reopenSend(1)).then(arrive(2)).then(begin(2)).then(reopenGiveUp(2)).expect(client.dead == Set(1) and client.owed == Set(1) and conns.get(2).cancels == 1)
+    .then(publish).expect(conns.get(2).published and phaseOf(2) == Running and not(owedSendable(1)))
+    .then(seeCancel(2)).then(receive(2)).expect(phaseOf(2) == Abandoned and conns.get(2).cancels == 0)
+    .then(owedSend(1)).then(arrive(3)).expect(phaseOf(3) == Held)
+    .then(finish(2, false)).expect(sessions.get(2).handles.get(1).by == 2)
+    .then(drain(3)).then(begin(3)).then(finish(3, false)).then(receive(3)).then(closeSession(1))
     .expect(sessions.get(2).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
 
   /// A new session whose reopen is still out when the kernel releases the handle: the connection is not published until the reopen has answered, and the handle it keeps is then released as stale.

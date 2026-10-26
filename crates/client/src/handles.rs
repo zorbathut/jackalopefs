@@ -216,7 +216,13 @@ impl HandleTable {
         Some(rec)
     }
 
+    /// Owe `release`, which from now on is sent in the background and so is ordered ([`Request::Release`]).
     pub fn owe_release(&self, release: Request) {
+        let release = match release {
+            Request::Release { fh, .. } => Request::Release { fh, ordered: true },
+            Request::Releasedir { fh, .. } => Request::Releasedir { fh, ordered: true },
+            other => unreachable!("only releases are owed: {other:?}"),
+        };
         self.owed.lock().push(release);
         self.owed_count.send_modify(|count| *count += 1);
     }

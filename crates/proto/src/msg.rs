@@ -129,8 +129,10 @@ pub enum Request {
         offset: u64,
         data: Vec<u8>,
     },
+    /// `ordered` for a release the client sends on its own: of an open whose outcome it never learned, of a handle a reopen lost, or one owed. It then takes part in the session's ordering like a change, so it lands after any open of its id. The kernel's release follows its open's reply and is not ordered.
     Release {
         fh: u64,
+        ordered: bool,
     },
     Fsync {
         fh: u64,
@@ -146,8 +148,10 @@ pub enum Request {
         offset: u64,
         max_bytes: u32,
     },
+    /// `ordered` as for [`Request::Release`].
     Releasedir {
         fh: u64,
+        ordered: bool,
     },
     Statfs {
         path: Path,
@@ -205,13 +209,13 @@ impl Request {
             | Request::Create { fh, .. }
             | Request::Read { fh, .. }
             | Request::Write { fh, .. }
-            | Request::Release { fh }
+            | Request::Release { fh, .. }
             | Request::Fsync { fh, .. }
             | Request::Fallocate { fh, .. }
             | Request::Lseek { fh, .. }
             | Request::Opendir { fh, .. }
             | Request::Readdir { fh, .. }
-            | Request::Releasedir { fh } => [Some(*fh), None],
+            | Request::Releasedir { fh, .. } => [Some(*fh), None],
             Request::CopyFileRange { fh_in, fh_out, .. } => [Some(*fh_in), Some(*fh_out)],
             Request::Lookup { .. }
             | Request::Readlink { .. }
@@ -231,7 +235,7 @@ impl Request {
         }
     }
 
-    /// Whether a request takes part in the session's ordering: everything but the reads, which may run in any order. A late `fsync` changes nothing either, and nor does a late release: handle ids are never reused, and an open a release overtakes keeps nothing. An open is ordered even when it changes no file, since one from a superseded connection could otherwise replace a live handle with whatever file is at its path by then.
+    /// Whether a request takes part in the session's ordering: everything but the reads, which may run in any order. A late `fsync` changes nothing either, and nor does a late release of the kernel's: its open replied before it was asked for, and handle ids are never reused. A release the client sends on its own is ordered, since the open of its id may not have landed yet. An open is ordered even when it changes no file, since one from a superseded connection could otherwise replace a live handle with whatever file is at its path by then.
     pub fn changes(&self) -> bool {
         match self {
             Request::Lookup { .. }
@@ -244,9 +248,8 @@ impl Request {
             | Request::Access { .. }
             | Request::Statfs { .. }
             | Request::Lseek { .. }
-            | Request::Fsync { .. }
-            | Request::Release { .. }
-            | Request::Releasedir { .. } => false,
+            | Request::Fsync { .. } => false,
+            Request::Release { ordered, .. } | Request::Releasedir { ordered, .. } => *ordered,
             Request::Setattr { .. }
             | Request::Mknod { .. }
             | Request::Mkdir { .. }
@@ -394,7 +397,9 @@ impl Request {
                 newparent,
                 newname,
             } => format!("{} -> {}", shown(path), at(newparent, newname)),
-            Request::Release { fh } | Request::Releasedir { fh } | Request::Fsync { fh, .. } => {
+            Request::Release { fh, .. }
+            | Request::Releasedir { fh, .. }
+            | Request::Fsync { fh, .. } => {
                 format!("fh={fh}")
             }
             Request::Read { fh, offset, size } => format!("fh={fh} offset={offset} size={size}"),
@@ -540,7 +545,16 @@ mod tests {
             flags: 0
         }
         .changes());
-        assert!(!Request::Release { fh: 1 }.changes());
+        assert!(!Request::Release {
+            fh: 1,
+            ordered: false
+        }
+        .changes());
+        assert!(Request::Release {
+            fh: 1,
+            ordered: true
+        }
+        .changes());
         assert!(!Request::Read {
             fh: 1,
             offset: 0,
@@ -634,7 +648,14 @@ mod tests {
                 100
             ))
         );
-        assert_eq!(Request::Release { fh: 3 }.with_data_elided(), None);
+        assert_eq!(
+            Request::Release {
+                fh: 3,
+                ordered: false
+            }
+            .with_data_elided(),
+            None
+        );
         assert_eq!(
             Response::Read(vec![1; 5]).with_data_elided(),
             Some((Response::Read(Vec::new()), 5))

@@ -181,7 +181,8 @@ struct HelloReply {
 # One request per bidi stream. Paths are relative to the export root.
 #
 # A request that changes something (everything but the reads, fsync and the
-# releases) keeps the client's side of its stream open until the reply is
+# releases the kernel asks for; a release the client sends on its own is
+# `ordered`) keeps the client's side of its stream open until the reply is
 # read: a client that gives up on it resets that side (code 2, cancelled) and
 # reads on, and the server answers by resetting its own side, code 4 (unrun:
 # it had not begun and never will) or 5 (fenced: it is running, and the
@@ -213,11 +214,14 @@ struct Request {
     create :group { fh @37 :UInt64; parent @38 :Path; name @39 :Data; mode @40 :UInt32; flags @41 :Int32; }
     read :group { fh @42 :UInt64; offset @43 :UInt64; size @44 :UInt32; }
     write :group { fh @45 :UInt64; offset @46 :UInt64; data @47 :Data; }
-    release :group { fh @48 :UInt64; }
+    # ordered: sent by the client on its own (the release of an open of unknown
+    # outcome, of a handle a reopen lost, or one owed), it takes part in the
+    # session's ordering like a change, so it lands after any open of its id.
+    release :group { fh @48 :UInt64; ordered @81 :Bool; }
     fsync :group { fh @49 :UInt64; datasync @50 :Bool; }
     opendir :group { fh @51 :UInt64; path @52 :Path; }
     readdir :group { fh @53 :UInt64; offset @54 :UInt64; maxBytes @55 :UInt32; }
-    releasedir :group { fh @56 :UInt64; }
+    releasedir :group { fh @56 :UInt64; ordered @82 :Bool; }
     statfs :group { path @57 :Path; }
     setxattr :group { path @58 :Path; name @59 :Data; value @60 :Data; flags @61 :Int32; }
     getxattr :group { path @62 :Path; name @63 :Data; }

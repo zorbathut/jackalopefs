@@ -504,6 +504,22 @@ pub enum Hold {
     After,
 }
 
+/// Whether the server holds a release behind the session's changes still running.
+pub fn server_holds_release(server: &TestServer) -> bool {
+    let now = std::time::Instant::now() + jackalopefs_perf::stall::INFLIGHT_LISTED;
+    server
+        .server
+        .perf
+        .scan_pending(now, jackalopefs_perf::stall::ModeScan::Listed)
+        .expect("the in-flight table's lock is free")
+        .found
+        .iter()
+        .any(|(pending, _)| {
+            pending.phase == jackalopefs_server::perf::PhaseServer::Held
+                && matches!(pending.op, Some("release" | "releasedir"))
+        })
+}
+
 /// A request the server ran while a [`Gate`] was installed: its operation, its handle, and its errno (`None` for success).
 #[derive(Clone, Debug)]
 pub struct Dispatched {

@@ -133,7 +133,7 @@ impl From<ErrorReserve> for Failure {
     fn from(e: ErrorReserve) -> Failure {
         match e {
             ErrorReserve::PoolFull => Failure::PoolFull,
-            ErrorReserve::Released | ErrorReserve::Duplicate => Failure::Errno(Errno::EBADF),
+            ErrorReserve::Duplicate => Failure::Errno(Errno::EBADF),
         }
     }
 }
@@ -598,7 +598,7 @@ impl Ops {
                     u64::try_from(found).expect("lseek returns no negative offset"),
                 ))
             }
-            Request::Release { fh } | Request::Releasedir { fh } => {
+            Request::Release { fh, .. } | Request::Releasedir { fh, .. } => {
                 if self.handles.remove(fh).is_none() {
                     tracing::debug!(fh, "release of an unknown handle");
                 }
@@ -971,7 +971,16 @@ mod tests {
             Response::Read(b"world".to_vec())
         );
         assert_eq!(fs::read(dir.path().join("f")).unwrap(), b"hello world");
-        assert_eq!(dispatch(&ops, Request::Release { fh: 1 }), Response::Ok);
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Release {
+                    fh: 1,
+                    ordered: false
+                }
+            ),
+            Response::Ok
+        );
         assert!(ops.handles.is_empty());
         assert_eq!(
             dispatch(
@@ -985,46 +994,16 @@ mod tests {
             Response::Err(Errno::EBADF as i32)
         );
         assert_eq!(
-            dispatch(&ops, Request::Release { fh: 1 }),
+            dispatch(
+                &ops,
+                Request::Release {
+                    fh: 1,
+                    ordered: false
+                }
+            ),
             Response::Ok,
             "releasing an unknown handle is harmless"
         );
-    }
-
-    /// An open the client gave up on, arriving after the release it sent in case the open had landed, touches nothing.
-    #[test]
-    fn an_open_under_a_released_id_changes_nothing() {
-        let (dir, ops) = fixture();
-        fs::write(dir.path().join("kept"), b"contents").unwrap();
-        assert_eq!(dispatch(&ops, Request::Release { fh: 9 }), Response::Ok);
-        assert_eq!(dispatch(&ops, Request::Release { fh: 10 }), Response::Ok);
-        assert_eq!(
-            dispatch(
-                &ops,
-                Request::Create {
-                    fh: 9,
-                    parent: Path::root(),
-                    name: name("never"),
-                    mode: 0o100644,
-                    flags: libc::O_RDWR,
-                }
-            ),
-            Response::Err(Errno::EBADF as i32)
-        );
-        assert!(!dir.path().join("never").exists());
-        assert_eq!(
-            dispatch(
-                &ops,
-                Request::Open {
-                    fh: 10,
-                    path: path("kept"),
-                    flags: libc::O_RDWR | libc::O_TRUNC,
-                }
-            ),
-            Response::Err(Errno::EBADF as i32)
-        );
-        assert_eq!(fs::read(dir.path().join("kept")).unwrap(), b"contents");
-        assert!(ops.handles.is_empty());
     }
 
     /// A resend of an open whose original ran and whose reply was lost gets the original's handle, even when the path no longer opens: the client takes an errno as "never opened" and would release nothing.
@@ -1053,7 +1032,16 @@ mod tests {
             ),
             Response::Read(b"contents".to_vec())
         );
-        assert_eq!(dispatch(&ops, Request::Release { fh: 1 }), Response::Ok);
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Release {
+                    fh: 1,
+                    ordered: false
+                }
+            ),
+            Response::Ok
+        );
         assert!(ops.handles.is_empty());
     }
 
@@ -1767,7 +1755,16 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(dispatch(&ops, Request::Releasedir { fh: 2 }), Response::Ok);
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Releasedir {
+                    fh: 2,
+                    ordered: false
+                }
+            ),
+            Response::Ok
+        );
         assert_eq!(
             dispatch(
                 &ops,
@@ -2001,7 +1998,16 @@ mod tests {
             matches!(dispatch(&ops, open(1)), Response::Opened { .. }),
             "a resend under an id already held answers from its handle, full pool or not"
         );
-        assert_eq!(dispatch(&ops, Request::Release { fh: 1 }), Response::Ok);
+        assert_eq!(
+            dispatch(
+                &ops,
+                Request::Release {
+                    fh: 1,
+                    ordered: false
+                }
+            ),
+            Response::Ok
+        );
         assert_eq!(pool.used(), 1);
         assert!(matches!(dispatch(&ops, open(3)), Response::Opened { .. }));
         assert_eq!(
