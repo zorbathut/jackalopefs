@@ -22,10 +22,12 @@ if [[ ! -x $SPEC/node_modules/.bin/quint ]]; then
 fi
 QUINT=$SPEC/node_modules/.bin/quint
 
-# quint reuses any Apalache server already answering at its endpoint, whatever that server's version or state, so each run gets a port nothing listens on.
-port=$((20000 + RANDOM % 20000))
-while (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do port=$((20000 + RANDOM % 20000)); done
-ENDPOINT=localhost:$port
+# quint reuses any Apalache server already answering at its endpoint, whatever that server's version or state, and one it started for the previous check may still answer as it shuts down, with that check's compiled spec: a full exploration once got the last witness's invariant that way. So each check gets a port nothing listens on.
+endpoint() {
+  local port=$((20000 + RANDOM % 20000))
+  while (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do port=$((20000 + RANDOM % 20000)); done
+  echo "localhost:$port"
+}
 
 # Apalache writes _apalache-out under the working directory, so work from a scratch one.
 WORK=$(mktemp -d -t jackalopefs-spec.XXXXXX)
@@ -57,7 +59,7 @@ expect() {
   [[ $got == "$want" ]] || fail "$what: expected $want, got $got"
 }
 
-tlc() { "$QUINT" verify --backend=tlc --apalache-version="$APALACHE_VERSION" --server-endpoint="$ENDPOINT" "$@"; }
+tlc() { "$QUINT" verify --backend=tlc --apalache-version="$APALACHE_VERSION" --server-endpoint="$(endpoint)" "$@"; }
 
 section "typecheck"
 for f in session session_small session_tiny; do

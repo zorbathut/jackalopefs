@@ -12,8 +12,12 @@ mkdir -p "$TMPDIR"
 QUINT=$SPEC/node_modules/.bin/quint
 [[ -x $QUINT ]] || { echo "run scripts/spec/check.sh once first, which installs quint" >&2; exit 1; }
 
-port=$((20000 + RANDOM % 20000))
-while (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do port=$((20000 + RANDOM % 20000)); done
+# A port nothing listens on for each check, as in check.sh: an Apalache server still shutting down from the previous mutation could answer with that mutation's compiled spec.
+endpoint() {
+  local port=$((20000 + RANDOM % 20000))
+  while (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do port=$((20000 + RANDOM % 20000)); done
+  echo "localhost:$port"
+}
 WORK=$(mktemp -d -t jackalopefs-spec-mut.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
@@ -35,7 +39,7 @@ if text.count(old) != 1:
 path.write_text(text.replace(old, new))
 PY
   local started=$SECONDS out got
-  if out=$("$QUINT" verify --backend=tlc --apalache-version="$APALACHE_VERSION" --server-endpoint="localhost:$port" --invariant="$inv" "$dir/session_tiny.qnt" 2>&1); then
+  if out=$("$QUINT" verify --backend=tlc --apalache-version="$APALACHE_VERSION" --server-endpoint="$(endpoint)" --invariant="$inv" "$dir/session_tiny.qnt" 2>&1); then
     got=$(grep -q '^\[ok\]' <<<"$out" && echo "not caught" || echo error)
   else
     got=$(grep -q '^\[violation\]' <<<"$out" && echo caught || echo error)
