@@ -136,3 +136,9 @@ Per CLAUDE-general.md, silent error handling is banned. In Rust terms: don't dis
 ## Style
 
 Braces are enforced at the language level; beyond that, follow rustfmt defaults. The general "don't hand-wrap lines" rule applies to comments — one thought, one line.
+
+# jackalopefs
+
+## The session model
+
+`spec/session.qnt` is a Quint model of the session protocol, and the files whose module doc says they are modelled in it are its code. A commit that changes one of those files changes the model too, or its message carries a line starting `Spec:` that says why not (`Spec: unaffected (reason)`, or `Spec: follows in "<subject>"` for a model change later in the series); `spec/README.md`, "Keeping it in sync", says what checks this and how.

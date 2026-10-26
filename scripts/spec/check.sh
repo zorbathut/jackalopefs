@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks the Quint model of the session protocol (spec/) as spec/README.md describes: typecheck, the scenario runs, and TLC on the tiny instance finding each reachability witness. With FULL=1 it also has TLC explore the tiny instance's whole state space for the invariants that must hold (about an hour and a half) and simulates the small instance. Every outcome is asserted.
+# Checks the Quint model of the session protocol (spec/) as spec/README.md describes: typecheck, the scenario runs, and TLC on the tiny instance finding each reachability witness. With FULL=1 it also has TLC explore the tiny instance's whole state space for the invariants that must hold (about an hour and a half) and simulates the small instance. Every outcome is asserted; last, it prints the drift report (`scripts/spec/drift.sh`).
 #
 # Needs Node and a JDK. The first run installs the pinned Quint into spec/node_modules (from spec/package-lock.json) and downloads the pinned Apalache, which carries TLC, into ~/.quint; `quint run` under FULL=1 also fetches its own evaluator binary. TLC is given an 8 GB heap.
 set -euo pipefail
@@ -94,6 +94,9 @@ else
   echo
   echo "FULL=1 adds TLC over session_tiny's whole state space and the simulation of session_small."
 fi
+
+section "drift (a report, not a check)"
+"$ROOT/scripts/spec/drift.sh"
 
 echo
 if [[ $failures -eq 0 ]]; then echo "all checks passed"; else echo "$failures check(s) failed"; exit 1; fi
