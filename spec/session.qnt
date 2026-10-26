@@ -38,7 +38,7 @@ module session {
 
   /// Where a request came from: a call's attempt, or the client's own traffic: the reopen of a held handle after a new session, the release of an open whose outcome the caller never learned (`release_orphan`), or a release owed from before.
   type Origin = NoOrigin | OfCall(int) | Reopen(int) | OrphanRelease(int) | OwedRelease(int)
-  /// A request as the server has it. `Transit`: written by the client, not decoded. `Held`: decoded with a fence above zero, waiting in `SessionState::drain`. `Ready`: decoded with a fence of zero, or drained, waiting for a blocking thread; the fence is not read again from here. `Cancelled`: dropped unrun on the client's cancel. `Superseded`: refused by the epoch check in `SessionState::drain` or `SessionState::begin`. `Dropped`: gone with the connection on the server's side. `Abandoned`: running, and given up on.
+  /// A request as the server has it. `Transit`: written by the client, not decoded. `Held`: decoded with a fence above zero, waiting in `SessionState::drain` until `SessionState::drained` lets it go. `Ready`: decoded with a fence of zero, or drained, waiting for a blocking thread; the fence is not read again from here. `Cancelled`: dropped unrun on the client's cancel. `Superseded`: refused by the epoch check in `SessionState::drained` or `SessionState::begin`. `Dropped`: gone with the connection on the server's side. `Abandoned`: running, and given up on.
   type Phase = Absent | Transit | Held | Ready | Cancelled | Superseded | Dropped | Running | Abandoned | Finished
   /// What the server sent back on the stream and the client has not yet read; `Lost` when the connection was gone on the server's side, so nothing went out.
   type Answer = NoAnswer | Reply | ErrnoReply | Unrun | Fenced | Lost
@@ -561,7 +561,7 @@ module session {
     }
   }
 
-  /// A request on a connection the server has lost, not yet decoded or held, notices and is dropped: its stream fails, or `handle_request`'s wait in `SessionState::drain` sees it stopped. Until then it may still be decoded, or drain (the wait races the two).
+  /// A request on a connection the server has lost, not yet decoded or held, notices and is dropped: its stream fails, or `handle_request`'s wait in `SessionState::drain` sees it stopped (`SessionState::stopped`). Until then it may still be decoded, or drain (the wait races the two).
   action dropCut(r: int): bool = {
     val q = reqs.get(r)
     all {
@@ -576,7 +576,7 @@ module session {
     }
   }
 
-  /// `SessionState::drain`: the held change goes on once nothing is left of the earlier connections' changes and of those given up on; one whose session has resumed elsewhere meanwhile is let go, and `SessionState::begin` then refuses it.
+  /// `SessionState::drained`: the held change goes on once nothing is left of the earlier connections' changes and of those given up on; one whose session has resumed elsewhere meanwhile is let go, and `SessionState::begin` then refuses it.
   def canDrain(r: int): bool = {
     val q = reqs.get(r)
     val ses = sessions.get(q.session)
