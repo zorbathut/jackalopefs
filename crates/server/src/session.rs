@@ -114,7 +114,7 @@ pub(crate) struct Exchange {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PhaseExchange {
+pub(crate) enum PhaseExchange {
     /// A change waiting for the changes it is fenced behind ([`SessionState::drained`]).
     Held,
     /// Waiting for a blocking thread to begin it.
@@ -158,6 +158,13 @@ impl Exchange {
     }
 }
 
+#[cfg(test)]
+impl Exchange {
+    pub(crate) fn phase_now(&self) -> PhaseExchange {
+        *self.phase.lock()
+    }
+}
+
 impl Drop for Exchange {
     fn drop(&mut self) {
         if self.holder.get_mut().is_some() {
@@ -191,6 +198,25 @@ pub(crate) enum Verdict {
 }
 
 impl SessionState {
+    /// The attachment's epoch and counts (`running`, `abandoned`, `running_older`), and whether its grace period runs.
+    #[cfg(test)]
+    pub(crate) fn attachment_now(&self) -> (u64, usize, usize, usize, bool) {
+        let a = self.attachment.lock();
+        (
+            a.epoch,
+            a.running,
+            a.abandoned,
+            a.running_older,
+            a.detached_at.is_some(),
+        )
+    }
+
+    /// Whether anything of the session is under way ([`Holder`]).
+    #[cfg(test)]
+    pub(crate) fn held_now(&self) -> bool {
+        self.holders.load(Ordering::SeqCst) > 0
+    }
+
     /// A hold on the session for a request whose stream was just accepted.
     pub(crate) fn hold(self: &Arc<Self>) -> Holder {
         self.holders.fetch_add(1, Ordering::SeqCst);
@@ -200,7 +226,11 @@ impl SessionState {
     }
 
     /// Begin `exchange`, from the connection attached at `epoch`. A change is counted as running, unless the client gave up on it, or the session has resumed on a newer connection since: then the client has already resent the change or failed it. Either way it must not run. Any other request begins whatever the epoch, and is counted nowhere.
-    fn begin(self: &Arc<Self>, epoch: u64, exchange: &Arc<Exchange>) -> Option<GuardExchange> {
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        epoch: u64,
+        exchange: &Arc<Exchange>,
+    ) -> Option<GuardExchange> {
         if !exchange.ordered {
             let mut phase = exchange.phase.lock();
             assert_eq!(*phase, PhaseExchange::Ready, "a request begins once");
@@ -267,7 +297,7 @@ impl SessionState {
     }
 
     /// The client gave up on `change`, from the connection attached at `epoch`. One that has not begun never will; one running holds the session's later changes until it ends, unless an earlier connection's change already does.
-    fn abandon(&self, epoch: u64, change: &Exchange) -> Verdict {
+    pub(crate) fn abandon(&self, epoch: u64, change: &Exchange) -> Verdict {
         assert!(change.ordered, "only a change is given up on");
         let mut attachment = self.attachment.lock();
         let mut phase = change.phase.lock();
@@ -310,7 +340,7 @@ impl SessionState {
     }
 
     /// How many changes `exchange`, just decoded on the connection attached at `epoch`, waits for: for a change, those still running from earlier connections, and those the client gave up on; none for a connection that is no longer current itself, whose changes will not run, and none for any other request. It is held while there are any ([`SessionState::drain`]), and ready otherwise.
-    fn fencing(&self, epoch: u64, exchange: &Exchange) -> usize {
+    pub(crate) fn fencing(&self, epoch: u64, exchange: &Exchange) -> usize {
         if !exchange.ordered {
             spec_trace!(self.recorder.as_ref(), {
                 let (key, op) = *exchange
@@ -354,7 +384,7 @@ impl SessionState {
     }
 
     /// Whether the held `change`, from the connection attached at `epoch`, goes on: `Some(true)` once it waits for nothing ([`SessionState::fencing`]), when it is ready; `Some(false)` when that connection stopped being current meanwhile, and it will not run; `None` while it is still held.
-    fn drained(&self, epoch: u64, change: &Exchange) -> Option<bool> {
+    pub(crate) fn drained(&self, epoch: u64, change: &Exchange) -> Option<bool> {
         let attachment = self.attachment.lock();
         let mut phase = change.phase.lock();
         assert_eq!(*phase, PhaseExchange::Held, "only a held change drains");
@@ -396,7 +426,7 @@ impl SessionState {
     }
 
     /// The held `change`'s stream ended before it drained: the client stopped reading its reply (`lost` false), or its connection went. It will not run.
-    fn stopped(&self, change: &Exchange, lost: bool) {
+    pub(crate) fn stopped(&self, change: &Exchange, lost: bool) {
         let _attachment = self.attachment.lock();
         let mut phase = change.phase.lock();
         assert_eq!(*phase, PhaseExchange::Held, "only a held change is stopped");
@@ -428,13 +458,13 @@ impl Drop for SessionState {
 }
 
 /// An exchange running from [`SessionState::begin`] until dropped; a change counted as running all that time.
-struct GuardExchange {
+pub(crate) struct GuardExchange {
     session: Arc<SessionState>,
     epoch: u64,
     exchange: Arc<Exchange>,
     /// Whether the exchange's work ended in an errno, for the event of its end.
     #[cfg(feature = "spec-trace")]
-    errno: bool,
+    pub(crate) errno: bool,
 }
 
 impl Drop for GuardExchange {
@@ -1163,12 +1193,12 @@ struct Refusal {
 }
 
 /// Undoes the handshake's attaching of a session unless its Ack was written, should the handshake fail after that (the Ack could not be written, or the handshake timed out writing it): a resumed session starts its grace period, since the client still holds its token, and a new one is dropped, since no client ever learned it. It covers the handshake only; `handle_connection` has its own `DetachOnDrop` in place before it next awaits.
-struct DetachUnlessAcked<'a> {
-    sessions: &'a Sessions,
-    id: u64,
-    epoch: u64,
-    resumed: bool,
-    acked: bool,
+pub(crate) struct DetachUnlessAcked<'a> {
+    pub(crate) sessions: &'a Sessions,
+    pub(crate) id: u64,
+    pub(crate) epoch: u64,
+    pub(crate) resumed: bool,
+    pub(crate) acked: bool,
 }
 
 impl Drop for DetachUnlessAcked<'_> {

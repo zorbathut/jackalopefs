@@ -88,6 +88,8 @@ In order, each step useful on its own:
 
    This replaces hand-staged interleavings with millions of seeded ones, and it is the step most likely to find the next real bug.
 3. **`quint-connect` on top of the harness.** Traces from the spec drive the real code in the simulator, checking it against the model step by step. This is the link from target 1 to target 2.
+
+   Done for the server first, without the simulator: its session protocol was pulled out into a synchronous machine (`SessionState`'s steps, `Exchange`, the holders), and runs of the model drive it step by step with the state compared after each (`spec/README.md`, "Model-based testing"). It reads the traces itself rather than through quint-connect, whose driver sees only each step's action and choices: this one plays the client and the network too, and replays the scenario runs from `quint test`, whose traces record no actions. The client's machine is next.
 4. **Proofs where they are cheap and pay** (ongoing):
    - **Kani:** harnesses for the decoder's limits (no panic, bounded allocation on any frame) and for `retry_safe` and `changes` against a stated spec.
    - **Verus, if the appetite is there:** the pure state machines: `SessionState`'s fence counts, `Exchange`'s phases, `Handles` slot accounting with `Released`. These are small, have exactly the bugs found by review, and are where bcachefs is using Verus too.

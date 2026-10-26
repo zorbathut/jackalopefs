@@ -6,6 +6,8 @@ pub mod dirents;
 pub mod export;
 pub mod handles;
 pub mod ids;
+#[cfg(test)]
+mod mbt;
 pub mod ops;
 pub mod perf;
 pub mod session;

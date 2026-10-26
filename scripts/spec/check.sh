@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks the Quint model of the session protocol (spec/) as spec/README.md describes: typecheck, the scenario runs, trace validation's own check (spec/replay_test.qnt), and TLC on the tiny instance finding each reachability witness. With FULL=1 it also has TLC explore the tiny instance's whole state space for the invariants that must hold (about two and a half hours) and simulates the small instance. Every outcome is asserted; last, it prints the drift report (`scripts/spec/drift.sh`).
+# Checks the Quint model of the session protocol (spec/) as spec/README.md describes: typecheck, the scenario runs, that model-based testing's corpus was made from this model, trace validation's own check (spec/replay_test.qnt), and TLC on the tiny instance finding each reachability witness. With FULL=1 it also has TLC explore the tiny instance's whole state space for the invariants that must hold (about two and a half hours) and simulates the small instance. Every outcome is asserted; last, it prints the drift report (`scripts/spec/drift.sh`).
 #
 # Needs Node and a JDK. The first run installs the pinned Quint into spec/node_modules (from spec/package-lock.json) and downloads the pinned Apalache, which carries TLC, into ~/.quint; `quint run` under FULL=1 also fetches its own evaluator binary. TLC is given an 8 GB heap.
 set -euo pipefail
@@ -68,6 +68,13 @@ done
 
 section "scenario runs"
 if out=$("$QUINT" test "$SPEC/session_small.qnt" 2>&1); then echo "ok         session_small.qnt: $(grep -o '[0-9]* passing' <<<"$out")"; else echo "$out" >&2; fail "quint test session_small.qnt"; fi
+
+section "model-based testing's corpus (spec/mbt/corpus.json.gz)"
+if [[ $(gzip -dc "$SPEC/mbt/corpus.json.gz" | head -1 | grep -o '"hash":"[0-9a-f]*"' | cut -d'"' -f4) == "$("$ROOT/scripts/spec/mbt.sh" hash)" ]]; then
+  echo "ok         made from this model"
+else
+  fail "the corpus is older than the model: scripts/spec/mbt.sh corpus remakes it"
+fi
 
 section "trace validation's own check (spec/replay_test.qnt)"
 if out=$("$QUINT" test "$SPEC/replay_test.qnt" --match='^replyLostTest$' 2>&1) && grep -q '1 passing' <<<"$out"; then echo "ok         a recorded trace replays"; else echo "$out" >&2; fail "replay_test.qnt: replyLostTest"; fi
