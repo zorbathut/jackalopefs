@@ -68,8 +68,6 @@ pub enum EndHeld {
     Drained,
     /// Its connection stopped being the session's current one.
     Superseded,
-    /// The client gave up on it.
-    Cancelled,
     /// The client stopped reading its reply.
     Stopped,
     /// Its connection went.
@@ -482,7 +480,6 @@ pub mod quint {
                 let end = match end {
                     EndHeld::Drained => "drained",
                     EndHeld::Superseded => "superseded",
-                    EndHeld::Cancelled => "cancelled",
                     EndHeld::Stopped => "stopped",
                     EndHeld::Lost => "lost",
                 };

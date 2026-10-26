@@ -338,7 +338,6 @@ module replay {
     if (r <= 0) unmapped(e, r)
     else if (e.end == "lost") lostWith(e, r)
     else if (e.end == "stopped") refuse
-    else if (e.end == "cancelled") all { seeCancel(r), rp' = rp.with("at", rp.at + 1) }
     else all {
       (e.end == "superseded") == (sessions.get(q.session).epoch != q.epoch),
       drain(r),

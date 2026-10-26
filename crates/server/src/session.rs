@@ -1441,7 +1441,8 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
         let current = tokio::select! {
             current = serving.session.drain(serving.epoch, held) => current,
             code = cancel_asked(&mut recv) => {
-                spec_trace!(recorder.as_ref(), EventSpec::HeldEnded { key, end: EndHeld::Cancelled });
+                let verdict = serving.session.abandon(serving.epoch, held);
+                debug_assert_eq!(verdict, Verdict::Unrun, "a held change has not begun");
                 event!(
                     target: EVENT_TARGET,
                     perf.events,
