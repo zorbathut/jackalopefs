@@ -208,4 +208,39 @@ module session_small {
     .then(publish).then(owedSend(1)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
     .then(send(2)).then(arrive(4)).then(begin(4)).then(finish(4, false)).then(receive(4)).then(closeSession(1))
     .expect(sessions.get(2).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
+
+  /// A change held on a connection the server then loses is dropped when its task notices, unrun; the change it waited for runs on.
+  run heldDroppedTest = init
+    .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))
+    .then(giveUp(1)).then(seeCancel(1)).then(receive(1))
+    .then(start(2, Change, false)).then(send(2)).then(arrive(2)).expect(phaseOf(2) == Held)
+    .then(loseServer(1)).then(dropCut(2)).expect(phaseOf(2) == Dropped and sessions.get(1).abandoned == 1)
+    .then(finish(1, false)).expect(sessions.get(1).abandoned == 0 and okSoFar)
+
+  /// A change held behind an earlier connection's is let go once its own connection is superseded too, and never runs.
+  run heldSupersededTest = init
+    .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))
+    .then(loseClient(1, Set())).then(reconnect)
+    .then(start(2, Change, false)).then(send(2)).then(arrive(2)).expect(phaseOf(2) == Held)
+    .then(loseClient(2, Set())).then(reconnect).expect(sessions.get(1).epoch == 3)
+    .then(drain(2)).expect(phaseOf(2) == Superseded)
+    .then(finish(1, false)).expect(sessions.get(1).runningOlder == 0 and okSoFar)
+    .then(loseClient(3, Set())).then(loseServer(3)).expect(not(alive(1)) and okSoFar)
+
+  /// A change given up on before the server decoded it is answered unrun, and the next change goes once that answer is in.
+  run cancelledUndecodedTest = init
+    .then(start(1, Change, false)).then(send(1)).then(giveUp(1)).expect(conns.get(1).cancels == 1)
+    .then(seeCancel(1)).expect(phaseOf(1) == Cancelled and reqs.get(1).answer == Unrun)
+    .then(receive(1)).expect(conns.get(1).cancels == 0)
+    .then(start(2, Change, false)).then(send(2)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
+    .expect(calls.get(2).outcome == Replied and okSoFar)
+
+  /// A change given up on while it ran is counted once more when the session resumes, as one of the earlier connection's: the next connection's change waits for it there, not twice.
+  run fencedResumedTest = init
+    .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))
+    .then(giveUp(1)).then(seeCancel(1)).then(receive(1)).expect(sessions.get(1).abandoned == 1)
+    .then(loseClient(1, Set())).then(reconnect).expect(sessions.get(1).abandoned == 0 and sessions.get(1).runningOlder == 1)
+    .then(start(2, Change, false)).then(send(2)).then(arrive(2)).expect(phaseOf(2) == Held)
+    .then(finish(1, false)).then(drain(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
+    .expect(calls.get(2).outcome == Replied and okSoFar)
 }
