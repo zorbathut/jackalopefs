@@ -506,7 +506,7 @@ impl Drop for AttachmentConn {
 
 pub struct Sessions {
     map: Mutex<HashMap<u64, Arc<SessionState>>>,
-    /// Sessions dropped from `map` (grace run out, or evicted), for as long as something of theirs lives: every request task and every change running holds its session. A client that names one gets it back ([`Sessions::resume`]), so a change of it still queued or running stays ordered before the client's next ones; one whose last reference has gone has nothing left to order, and the client starts a new session. Locked only under `map`'s lock.
+    /// Sessions dropped from `map` (grace run out, or evicted), for as long as anything holds them. A client that names one gets it back while something of it is under way ([`Sessions::resume`], [`Holder`]), so a change of it still queued or running stays ordered before the client's next ones; one with nothing under way has nothing left to order, and the client starts a new session, even while a task of the old one finishes. Locked only under `map`'s lock.
     dropped: Mutex<HashMap<u64, Weak<SessionState>>>,
     next_id: AtomicU64,
     /// The handles a session holds before it is reported.
@@ -589,12 +589,20 @@ impl Sessions {
         (state, 1)
     }
 
-    /// Reattach `id` if the token matches; a session still attached elsewhere is taken over, since the client evidently lost that connection. A session dropped from the table comes back while anything of it lives. Done under the table's lock, so no drop comes between finding the session and attaching it.
+    /// Reattach `id` if the token matches; a session still attached elsewhere is taken over, since the client evidently lost that connection. A session dropped from the table comes back while something of it is under way ([`Holder`]). Done under the table's lock, so no drop comes between finding the session and attaching it.
     pub fn resume(&self, id: u64, token: &[u8; 16]) -> Option<(Arc<SessionState>, u64)> {
         let mut map = self.map.lock();
         let (state, dropped) = match map.get(&id) {
             Some(state) => (state.clone(), false),
-            None => (self.dropped.lock().get(&id)?.upgrade()?, true),
+            None => {
+                let state = self.dropped.lock().get(&id)?.upgrade()?;
+                if state.holders.load(Ordering::SeqCst) == 0 {
+                    // Nothing of it is under way, only tasks finishing. Its last reference may be this one: not under the table's lock.
+                    drop(map);
+                    return None;
+                }
+                (state, true)
+            }
         };
         if !bool::from(state.resume_token.ct_eq(token)) {
             // A dropped session's last reference may be this one, and dropping it closes its handles: not under the table's lock.
@@ -2108,6 +2116,24 @@ mod tests {
         assert_eq!(sessions.reap(Duration::ZERO), 1);
         drop(state);
         assert!(sessions.resume(id, &token).is_none());
+    }
+
+    /// What still holds a dropped session's `Arc` once nothing of it is under way (a request task writing its reply, a blocking thread yet to see that its request was given up on, a report listing the session) does not keep it resumable: the model's sessions resume only while something of them is under way.
+    #[test]
+    fn a_dropped_session_with_nothing_under_way_is_not_resumed_while_its_tasks_finish() {
+        let sessions = sessions_unlimited();
+        let (state, epoch) = sessions.create();
+        let finished = Exchange::new(true, state.hold());
+        drop(state.begin(epoch, &finished).unwrap());
+        let given_up = Exchange::new(true, state.hold());
+        assert_eq!(state.abandon(epoch, &given_up), Verdict::Unrun);
+        sessions.detach(state.id, epoch);
+        assert_eq!(sessions.reap(Duration::ZERO), 1);
+        assert!(
+            sessions.resume(state.id, &state.resume_token).is_none(),
+            "only tasks finishing hold it"
+        );
+        drop((finished, given_up));
     }
 
     #[test]

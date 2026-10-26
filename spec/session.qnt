@@ -138,13 +138,13 @@ module session {
   /// A release of the client's own (an orphan's or one owed) whose reply it has not read.
   def unsettled(q: Req): bool = (isOrphan(q.origin) or isOwed(q.origin)) and (q.phase != Finished or q.answer != NoAnswer)
 
-  /// `SessionState::fencing`: what a change from the connection attached at `epoch` waits for; nothing for a connection no longer current, whose changes will not run.
-  /// Whether anything of session `s` lives at the server: a request not ended, or a connection whose task still runs. Each holds the session's `Arc`, which is what `Sessions::resume` finds a dropped session by.
+  /// Whether anything of session `s` is under way at the server: a request not ended, or a connection whose task still runs. Each is a `Holder` of the session, which is what `Sessions::resume` finds a dropped session by.
   def alive(s: int): bool = REQS.exists(r => reqs.get(r).session == s and not(terminal(reqs.get(r).phase))) or GENS.exists(g => conns.get(g).session == s and conns.get(g).serverAlive)
 
   /// Whether a hello naming session `s` resumes it: it is in the table, or dropped from it with something of it still alive.
   def resumable(s: int): bool = sessions.get(s).live or alive(s)
 
+  /// `SessionState::fencing`: what a change from the connection attached at `epoch` waits for; nothing for a connection no longer current, whose changes will not run.
   def fencing(s: int, epoch: int): int = {
     val ses = sessions.get(s)
     if (ses.epoch == epoch) ses.runningOlder + ses.abandoned else 0
@@ -525,7 +525,7 @@ module session {
     }
   }
 
-  /// The last `Arc<SessionState>` of a dropped session goes, once its connection task and every request of it have ended: its `Handles` close and give their slots back.
+  /// The last `Arc<SessionState>` of a dropped session goes, some time after its connection task and every request of it have ended (a request's task writes its reply first): its `Handles` close and give their slots back.
   action closeSession(s: int): bool = {
     val ses = sessions.get(s)
     val held = CALLS.filter(fh => ses.handles.get(fh).by != 0)
