@@ -28,7 +28,7 @@ use jackalopefs_proto::{
 use parking_lot::Mutex;
 use quinn::{Connection, RecvStream, SendStream};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -72,6 +72,8 @@ pub struct SessionState {
     attachment: Mutex<Attachment>,
     /// Woken when the last change a later one waits for finishes: the last of an earlier connection's, or the last the client gave up on.
     drained: tokio::sync::Notify,
+    /// What of the session is under way ([`Holder`]): its requests from when their streams are accepted until they end, and its attached connection. The session model's `alive`.
+    holders: AtomicUsize,
     #[cfg(feature = "spec-trace")]
     recorder: Option<Arc<jackalopefs_perf::spec_trace::Recorder>>,
 }
@@ -104,6 +106,8 @@ impl Attachment {
 pub(crate) struct Exchange {
     ordered: bool,
     phase: Mutex<PhaseExchange>,
+    /// Its request's hold on the session, let go as it ends.
+    holder: Mutex<Option<Holder>>,
     /// The exchange and operation it is, for the events recorded under the attachment lock.
     #[cfg(feature = "spec-trace")]
     traced: std::sync::OnceLock<(jackalopefs_perf::spec_trace::KeyExchange, &'static str)>,
@@ -128,10 +132,12 @@ enum PhaseExchange {
 }
 
 impl Exchange {
-    pub(crate) fn new(ordered: bool) -> Arc<Exchange> {
+    /// The request just decoded, with the hold it has had on the session since its stream was accepted.
+    pub(crate) fn new(ordered: bool, holder: Holder) -> Arc<Exchange> {
         Arc::new(Exchange {
             ordered,
             phase: Mutex::new(PhaseExchange::Ready),
+            holder: Mutex::new(Some(holder)),
             #[cfg(feature = "spec-trace")]
             traced: std::sync::OnceLock::new(),
         })
@@ -143,6 +149,31 @@ impl Exchange {
             .get()
             .expect("an exchange is keyed when it is decoded")
             .0
+    }
+
+    /// Move to the terminal `to`, letting go of the session.
+    fn end(&self, phase: &mut PhaseExchange, to: PhaseExchange) {
+        *phase = to;
+        self.holder.lock().take();
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        if self.holder.get_mut().is_some() {
+            tracing::debug!(phase = ?self.phase.get_mut(), "a request was dropped before it ended");
+        }
+    }
+}
+
+/// A hold on a session by something of it under way, which keeps a dropped session resumable ([`Sessions::resume`]); let go when dropped.
+pub(crate) struct Holder {
+    session: Arc<SessionState>,
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        self.session.holders.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -160,6 +191,14 @@ pub(crate) enum Verdict {
 }
 
 impl SessionState {
+    /// A hold on the session for a request whose stream was just accepted.
+    pub(crate) fn hold(self: &Arc<Self>) -> Holder {
+        self.holders.fetch_add(1, Ordering::SeqCst);
+        Holder {
+            session: self.clone(),
+        }
+    }
+
     /// Begin `exchange`, from the connection attached at `epoch`. A change is counted as running, unless the client gave up on it, or the session has resumed on a newer connection since: then the client has already resent the change or failed it. Either way it must not run. Any other request begins whatever the epoch, and is counted nowhere.
     fn begin(self: &Arc<Self>, epoch: u64, exchange: &Arc<Exchange>) -> Option<GuardExchange> {
         if !exchange.ordered {
@@ -192,7 +231,7 @@ impl SessionState {
         };
         if cancelled || attachment.epoch != epoch {
             if !cancelled {
-                *phase = PhaseExchange::Superseded;
+                change.end(&mut phase, PhaseExchange::Superseded);
             }
             spec_trace!(
                 self.recorder.as_ref(),
@@ -234,7 +273,7 @@ impl SessionState {
         let mut phase = change.phase.lock();
         let verdict = match *phase {
             PhaseExchange::Held | PhaseExchange::Ready => {
-                *phase = PhaseExchange::Cancelled;
+                change.end(&mut phase, PhaseExchange::Cancelled);
                 Verdict::Unrun
             }
             // `begin` refused it a moment before the cancel came: nothing is left to do, and it is answered as a superseded change is.
@@ -320,7 +359,7 @@ impl SessionState {
         let mut phase = change.phase.lock();
         assert_eq!(*phase, PhaseExchange::Held, "only a held change drains");
         let current = if attachment.epoch != epoch {
-            *phase = PhaseExchange::Superseded;
+            change.end(&mut phase, PhaseExchange::Superseded);
             false
         } else if attachment.running_older + attachment.abandoned == 0 {
             *phase = PhaseExchange::Ready;
@@ -361,7 +400,7 @@ impl SessionState {
         let _attachment = self.attachment.lock();
         let mut phase = change.phase.lock();
         assert_eq!(*phase, PhaseExchange::Held, "only a held change is stopped");
-        *phase = PhaseExchange::Dropped;
+        change.end(&mut phase, PhaseExchange::Dropped);
         spec_trace!(
             self.recorder.as_ref(),
             EventSpec::HeldEnded {
@@ -401,7 +440,8 @@ struct GuardExchange {
 impl Drop for GuardExchange {
     fn drop(&mut self) {
         if !self.exchange.ordered {
-            *self.exchange.phase.lock() = PhaseExchange::Finished;
+            self.exchange
+                .end(&mut self.exchange.phase.lock(), PhaseExchange::Finished);
             spec_trace!(
                 self.session.recorder.as_ref(),
                 EventSpec::Finished {
@@ -415,7 +455,9 @@ impl Drop for GuardExchange {
         let mut attachment = self.session.attachment.lock();
         let abandoned = {
             let mut phase = self.exchange.phase.lock();
-            std::mem::replace(&mut *phase, PhaseExchange::Finished) == PhaseExchange::Abandoned
+            let abandoned = *phase == PhaseExchange::Abandoned;
+            self.exchange.end(&mut phase, PhaseExchange::Finished);
+            abandoned
         };
         let current = attachment.epoch == self.epoch;
         if current {
@@ -446,6 +488,19 @@ impl Drop for GuardExchange {
             drop(attachment);
             self.session.drained.notify_waiters();
         }
+    }
+}
+
+/// A connection's hold on its session, from `handle_connection` taking it up to the connection's end, when the session's grace period starts unless a newer connection has taken it over ([`Sessions::detach`]).
+pub(crate) struct AttachmentConn {
+    sessions: Arc<Sessions>,
+    epoch: u64,
+    holder: Holder,
+}
+
+impl Drop for AttachmentConn {
+    fn drop(&mut self) {
+        self.sessions.detach(self.holder.session.id, self.epoch);
     }
 }
 
@@ -500,6 +555,7 @@ impl Sessions {
                 ..Attachment::default()
             }),
             drained: tokio::sync::Notify::new(),
+            holders: AtomicUsize::new(0),
             #[cfg(feature = "spec-trace")]
             recorder: self.recorder.get().cloned(),
         });
@@ -595,6 +651,19 @@ impl Sessions {
     /// Drop a session no client can resume: one whose Ack, with its id and token, never reached the client.
     fn forget(&self, id: u64) {
         self.map.lock().remove(&id);
+    }
+
+    /// The connection attached at `epoch` takes `state` up ([`AttachmentConn`]).
+    pub(crate) fn attach(
+        self: &Arc<Self>,
+        state: &Arc<SessionState>,
+        epoch: u64,
+    ) -> AttachmentConn {
+        AttachmentConn {
+            sessions: self.clone(),
+            epoch,
+            holder: state.hold(),
+        }
     }
 
     /// Mark the session detached, unless a newer connection has already taken it over.
@@ -976,6 +1045,7 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     let _detach = DetachOnDrop {
         server: server.clone(),
         session: session.clone(),
+        attachment: Some(server.sessions.attach(&session, epoch)),
         conn: conn.clone(),
         tracker,
         epoch,
@@ -1011,7 +1081,13 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
-                tokio::spawn(handle_request(serving.clone(), send, recv));
+                // The request holds its session from here, before its task first runs.
+                tokio::spawn(handle_request(
+                    serving.clone(),
+                    serving.session.hold(),
+                    send,
+                    recv,
+                ));
             }
             Err(e) => {
                 tracing::debug!(session = session.id, "connection ended: {e}");
@@ -1026,6 +1102,7 @@ async fn handle_connection(conn: Connection, server: Arc<Server>) {
 struct DetachOnDrop {
     server: Arc<Server>,
     session: Arc<SessionState>,
+    attachment: Option<AttachmentConn>,
     conn: Connection,
     tracker: Arc<Mutex<TrackerQuic>>,
     epoch: u64,
@@ -1043,7 +1120,7 @@ impl Drop for DetachOnDrop {
                 connections.remove(&self.session.id);
             }
         }
-        self.server.sessions.detach(self.session.id, self.epoch);
+        drop(self.attachment.take());
         spec_trace!(
             self.session.recorder.as_ref(),
             EventSpec::ConnEnded {
@@ -1379,7 +1456,12 @@ async fn cancel_asked(recv: &mut RecvStream) -> quinn::VarInt {
     }
 }
 
-async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: RecvStream) {
+async fn handle_request(
+    serving: Arc<Serving>,
+    holder: Holder,
+    mut send: SendStream,
+    mut recv: RecvStream,
+) {
     let ops = serving.ops.clone();
     let perf = serving.server.perf.clone();
     let hook = serving.server.dispatch_hook.get().cloned();
@@ -1522,7 +1604,7 @@ async fn handle_request(serving: Arc<Serving>, mut send: SendStream, mut recv: R
         sampled.request(&body, || elided(req.with_data_elided()));
     }
     drop(body);
-    let exchange = Exchange::new(req.changes());
+    let exchange = Exchange::new(req.changes(), holder);
     #[cfg(feature = "spec-trace")]
     exchange.traced.set((key, op)).expect("keyed once");
     let fence = serving.session.fencing(serving.epoch, &exchange);
@@ -1985,7 +2067,9 @@ mod tests {
     async fn a_dropped_session_with_a_change_running_is_resumed() {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
-        let running = state.begin(first, &Exchange::new(true)).unwrap();
+        let running = state
+            .begin(first, &Exchange::new(true, state.hold()))
+            .unwrap();
         sessions.detach(state.id, first);
         assert_eq!(sessions.reap(Duration::ZERO), 1);
         assert!(sessions.get(state.id).is_none(), "dropped");
@@ -2030,7 +2114,9 @@ mod tests {
     fn a_session_evicted_while_its_change_runs_is_resumed() {
         let sessions = sessions_unlimited();
         let (state, epoch) = sessions.create();
-        let running = state.begin(epoch, &Exchange::new(true)).unwrap();
+        let running = state
+            .begin(epoch, &Exchange::new(true, state.hold()))
+            .unwrap();
         sessions.detach(state.id, epoch);
         for _ in 0..MAX_DETACHED_SESSIONS {
             let (other, other_epoch) = sessions.create();
@@ -2047,8 +2133,8 @@ mod tests {
     }
 
     /// A change just decoded on the connection attached at `epoch`, which must be held.
-    fn held(state: &SessionState, epoch: u64) -> Arc<Exchange> {
-        let change = Exchange::new(true);
+    fn held(state: &Arc<SessionState>, epoch: u64) -> Arc<Exchange> {
+        let change = Exchange::new(true, state.hold());
         assert!(state.fencing(epoch, &change) > 0, "nothing fences it");
         change
     }
@@ -2058,14 +2144,18 @@ mod tests {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
         let running = state
-            .begin(first, &Exchange::new(true))
+            .begin(first, &Exchange::new(true, state.hold()))
             .expect("the current connection's change runs");
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
         assert!(
-            state.begin(first, &Exchange::new(true)).is_none(),
+            state
+                .begin(first, &Exchange::new(true, state.hold()))
+                .is_none(),
             "the session has resumed on a newer connection"
         );
-        assert!(state.begin(second, &Exchange::new(true)).is_some());
+        assert!(state
+            .begin(second, &Exchange::new(true, state.hold()))
+            .is_some());
         drop(running);
     }
 
@@ -2073,15 +2163,19 @@ mod tests {
     async fn a_resumed_connection_waits_for_the_older_ones_changes_only() {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
-        let old = state.begin(first, &Exchange::new(true)).unwrap();
+        let old = state
+            .begin(first, &Exchange::new(true, state.hold()))
+            .unwrap();
         assert_eq!(
-            state.fencing(first, &Exchange::new(true)),
+            state.fencing(first, &Exchange::new(true, state.hold())),
             0,
             "nothing is older than the first connection"
         );
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
-        let own = state.begin(second, &Exchange::new(true)).unwrap();
-        let next = Exchange::new(true);
+        let own = state
+            .begin(second, &Exchange::new(true, state.hold()))
+            .unwrap();
+        let next = Exchange::new(true, state.hold());
         assert_eq!(state.fencing(second, &next), 1);
         assert!(
             pending(state.drain(second, &next)).await,
@@ -2095,7 +2189,9 @@ mod tests {
         drop(own);
 
         let (_, third) = sessions.resume(state.id, &state.resume_token).unwrap();
-        let older = state.begin(third, &Exchange::new(true)).unwrap();
+        let older = state
+            .begin(third, &Exchange::new(true, state.hold()))
+            .unwrap();
         let (_, fourth) = sessions.resume(state.id, &state.resume_token).unwrap();
         let drained = tokio::spawn({
             let state = state.clone();
@@ -2112,7 +2208,9 @@ mod tests {
     async fn a_held_change_whose_connection_is_superseded_waits_no_longer() {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
-        let old = state.begin(first, &Exchange::new(true)).unwrap();
+        let old = state
+            .begin(first, &Exchange::new(true, state.hold()))
+            .unwrap();
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
         let next = held(&state, second);
         let waiting = tokio::spawn({
@@ -2135,7 +2233,7 @@ mod tests {
         );
         assert_eq!(*next.phase.lock(), PhaseExchange::Superseded);
         assert_eq!(
-            state.fencing(second, &Exchange::new(true)),
+            state.fencing(second, &Exchange::new(true, state.hold())),
             0,
             "a superseded connection's change is not held"
         );
@@ -2144,8 +2242,12 @@ mod tests {
             "the first connection's change still runs"
         );
         assert!(
-            state.begin(first, &Exchange::new(true)).is_none()
-                && state.begin(second, &Exchange::new(true)).is_none()
+            state
+                .begin(first, &Exchange::new(true, state.hold()))
+                .is_none()
+                && state
+                    .begin(second, &Exchange::new(true, state.hold()))
+                    .is_none()
         );
         drop(old);
     }
@@ -2154,11 +2256,11 @@ mod tests {
     fn a_change_given_up_on_before_it_began_never_runs() {
         let sessions = sessions_unlimited();
         let (state, epoch) = sessions.create();
-        let change = Exchange::new(true);
+        let change = Exchange::new(true, state.hold());
         assert_eq!(state.abandon(epoch, &change), Verdict::Unrun);
         assert!(state.begin(epoch, &change).is_none());
         assert_eq!(
-            state.fencing(epoch, &Exchange::new(true)),
+            state.fencing(epoch, &Exchange::new(true, state.hold())),
             0,
             "nothing ran, so nothing waits"
         );
@@ -2168,11 +2270,13 @@ mod tests {
     async fn a_change_given_up_on_while_it_ran_holds_the_later_ones() {
         let sessions = sessions_unlimited();
         let (state, epoch) = sessions.create();
-        let change = Exchange::new(true);
+        let change = Exchange::new(true, state.hold());
         let running = state.begin(epoch, &change).unwrap();
-        let other = state.begin(epoch, &Exchange::new(true)).unwrap();
+        let other = state
+            .begin(epoch, &Exchange::new(true, state.hold()))
+            .unwrap();
         assert_eq!(
-            state.fencing(epoch, &Exchange::new(true)),
+            state.fencing(epoch, &Exchange::new(true, state.hold())),
             0,
             "changes in flight hold nothing"
         );
@@ -2184,28 +2288,28 @@ mod tests {
         assert!(timeout(Duration::from_secs(1), state.drain(epoch, &next))
             .await
             .unwrap());
-        assert_eq!(state.fencing(epoch, &Exchange::new(true)), 0);
+        assert_eq!(state.fencing(epoch, &Exchange::new(true, state.hold())), 0);
     }
 
     #[test]
     fn a_change_given_up_on_once_it_has_run_holds_nothing() {
         let sessions = sessions_unlimited();
         let (state, epoch) = sessions.create();
-        let change = Exchange::new(true);
+        let change = Exchange::new(true, state.hold());
         drop(state.begin(epoch, &change).unwrap());
         assert_eq!(state.abandon(epoch, &change), Verdict::Finished);
-        assert_eq!(state.fencing(epoch, &Exchange::new(true)), 0);
+        assert_eq!(state.fencing(epoch, &Exchange::new(true, state.hold())), 0);
     }
 
     #[tokio::test]
     async fn a_change_given_up_on_and_then_resumed_past_is_waited_for_once() {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
-        let change = Exchange::new(true);
+        let change = Exchange::new(true, state.hold());
         let running = state.begin(first, &change).unwrap();
         assert_eq!(state.abandon(first, &change), Verdict::Fenced);
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
-        let next = Exchange::new(true);
+        let next = Exchange::new(true, state.hold());
         assert_eq!(
             state.fencing(second, &next),
             1,
@@ -2231,13 +2335,13 @@ mod tests {
     fn a_superseded_connections_change_given_up_on_is_counted_once() {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
-        let change = Exchange::new(true);
+        let change = Exchange::new(true, state.hold());
         let running = state.begin(first, &change).unwrap();
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
         assert_eq!(state.abandon(first, &change), Verdict::Fenced);
-        assert_eq!(state.fencing(second, &Exchange::new(true)), 1);
+        assert_eq!(state.fencing(second, &Exchange::new(true, state.hold())), 1);
         drop(running);
-        assert_eq!(state.fencing(second, &Exchange::new(true)), 0);
+        assert_eq!(state.fencing(second, &Exchange::new(true, state.hold())), 0);
         let attachment = state.attachment.lock();
         assert_eq!(
             (
@@ -2253,19 +2357,26 @@ mod tests {
     fn a_held_change_drains_once_nothing_fences_it() {
         let sessions = sessions_unlimited();
         let (state, epoch) = sessions.create();
-        let running = state.begin(epoch, &Exchange::new(true)).unwrap();
-        let fenced = Exchange::new(true);
+        let running = state
+            .begin(epoch, &Exchange::new(true, state.hold()))
+            .unwrap();
+        let fenced = Exchange::new(true, state.hold());
         drop(state.begin(epoch, &fenced).map(|guard| {
             assert_eq!(state.abandon(epoch, &fenced), Verdict::Fenced);
             (guard, running)
         }));
-        let next = Exchange::new(true);
+        let next = Exchange::new(true, state.hold());
         assert_eq!(state.fencing(epoch, &next), 0, "everything has finished");
         assert_eq!(*next.phase.lock(), PhaseExchange::Ready);
 
-        let first = state.begin(epoch, &Exchange::new(true)).unwrap();
-        assert_eq!(state.abandon(epoch, &Exchange::new(true)), Verdict::Unrun);
-        let given_up = Exchange::new(true);
+        let first = state
+            .begin(epoch, &Exchange::new(true, state.hold()))
+            .unwrap();
+        assert_eq!(
+            state.abandon(epoch, &Exchange::new(true, state.hold())),
+            Verdict::Unrun
+        );
+        let given_up = Exchange::new(true, state.hold());
         let guard = state.begin(epoch, &given_up).unwrap();
         assert_eq!(state.abandon(epoch, &given_up), Verdict::Fenced);
         let next = held(&state, epoch);
@@ -2281,7 +2392,7 @@ mod tests {
     fn a_held_change_given_up_on_or_stopped_never_runs() {
         let sessions = sessions_unlimited();
         let (state, epoch) = sessions.create();
-        let given_up = Exchange::new(true);
+        let given_up = Exchange::new(true, state.hold());
         let guard = state.begin(epoch, &given_up).unwrap();
         assert_eq!(state.abandon(epoch, &given_up), Verdict::Fenced);
         let cancelled = held(&state, epoch);
@@ -2303,7 +2414,7 @@ mod tests {
     fn a_change_superseded_as_it_began_is_answered_as_superseded() {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
-        let change = Exchange::new(true);
+        let change = Exchange::new(true, state.hold());
         sessions.resume(state.id, &state.resume_token).unwrap();
         assert!(state.begin(first, &change).is_none());
         assert_eq!(*change.phase.lock(), PhaseExchange::Superseded);
@@ -2314,7 +2425,9 @@ mod tests {
     async fn a_held_change_whose_session_resumes_is_let_go_as_superseded() {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
-        let running = state.begin(first, &Exchange::new(true)).unwrap();
+        let running = state
+            .begin(first, &Exchange::new(true, state.hold()))
+            .unwrap();
         let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
         let next = held(&state, second);
         assert_eq!(state.drained(second, &next), None);
@@ -2330,9 +2443,11 @@ mod tests {
     fn a_request_that_is_no_change_runs_whatever_the_epoch_and_counts_nowhere() {
         let sessions = sessions_unlimited();
         let (state, first) = sessions.create();
-        let running = state.begin(first, &Exchange::new(true)).unwrap();
+        let running = state
+            .begin(first, &Exchange::new(true, state.hold()))
+            .unwrap();
         sessions.resume(state.id, &state.resume_token).unwrap();
-        let read = Exchange::new(false);
+        let read = Exchange::new(false, state.hold());
         assert_eq!(state.fencing(first, &read), 0, "never held");
         let guard = state
             .begin(first, &read)
@@ -2351,5 +2466,77 @@ mod tests {
         assert_eq!(*read.phase.lock(), PhaseExchange::Finished);
         assert_eq!(counts(&state), (0, 0, 1));
         drop(running);
+    }
+
+    fn holders(state: &SessionState) -> usize {
+        state.holders.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_request_holds_its_session_until_it_ends() {
+        let sessions = sessions_unlimited();
+        let (state, epoch) = sessions.create();
+        let unread = state.hold();
+        assert_eq!(holders(&state), 1, "from the stream's acceptance");
+        drop(unread);
+        assert_eq!(holders(&state), 0, "a request never decoded lets go");
+
+        let given_up = Exchange::new(true, state.hold());
+        assert_eq!(state.abandon(epoch, &given_up), Verdict::Unrun);
+        assert_eq!(holders(&state), 0, "cancelled");
+
+        let change = Exchange::new(true, state.hold());
+        let guard = state.begin(epoch, &change).unwrap();
+        assert_eq!(state.abandon(epoch, &change), Verdict::Fenced);
+        assert_eq!(holders(&state), 1, "running, given up on or not");
+        let next = held(&state, epoch);
+        let stopped = held(&state, epoch);
+        assert_eq!(holders(&state), 3);
+        state.stopped(&stopped, true);
+        assert_eq!(holders(&state), 2, "dropped while held");
+        drop(guard);
+        assert_eq!(holders(&state), 1, "finished");
+        assert_eq!(state.drained(epoch, &next), Some(true));
+        assert_eq!(holders(&state), 1, "ready");
+        let read = Exchange::new(false, state.hold());
+        drop(state.begin(epoch, &read).unwrap());
+        drop(state.begin(epoch, &next).unwrap());
+        assert_eq!(holders(&state), 0);
+
+        let running = state
+            .begin(epoch, &Exchange::new(true, state.hold()))
+            .unwrap();
+        let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
+        let superseded = Exchange::new(true, state.hold());
+        assert!(state.begin(epoch, &superseded).is_none());
+        assert_eq!(holders(&state), 1, "superseded as it began");
+        let let_go = held(&state, second);
+        sessions.resume(state.id, &state.resume_token).unwrap();
+        assert_eq!(state.drained(second, &let_go), Some(false));
+        assert_eq!(holders(&state), 1, "superseded as it was held");
+        drop(running);
+        assert_eq!(holders(&state), 0);
+        drop(Exchange::new(true, state.hold()));
+        assert_eq!(holders(&state), 0, "dropped unended, at shutdown");
+    }
+
+    #[test]
+    fn an_attached_connection_holds_its_session_and_detaches_it_as_it_ends() {
+        let sessions = Arc::new(sessions_unlimited());
+        let (state, first) = sessions.create();
+        let attached = sessions.attach(&state, first);
+        assert_eq!(holders(&state), 1);
+        let (_, second) = sessions.resume(state.id, &state.resume_token).unwrap();
+        let taken_over = sessions.attach(&state, second);
+        drop(attached);
+        assert_eq!(holders(&state), 1);
+        assert_eq!(
+            sessions.reap(Duration::ZERO),
+            0,
+            "the connection taken over leaves the session attached"
+        );
+        drop(taken_over);
+        assert_eq!(holders(&state), 0);
+        assert_eq!(sessions.reap(Duration::ZERO), 1, "detached");
     }
 }
