@@ -4,7 +4,7 @@
 
 ## What there is to check
 
-The failure model states four invariants: at most once, no overtaking, no leaked descriptors, durability. They are kept by a protocol between client and server (epochs, the resume barrier, cancels answered `unrun` or `fenced`, the client's wait on pending cancels, owed and orphan releases), by a few small state machines in the code (`SessionState`'s counts, `Change`'s phase, `Handles` and its released ids, `retry_safe`), and by everything they run on: tokio, quinn, the kernel's FUSE and writeback behaviour, the server's filesystem.
+The failure model states four invariants: at most once, no overtaking, no leaked descriptors, durability. They are kept by a protocol between client and server (epochs, the resume barrier, cancels answered `unrun` or `fenced`, the client's wait on pending cancels, owed and orphan releases), by a few small state machines in the code (`SessionState`'s counts, `Exchange`'s phase, `Handles` and its released ids, `retry_safe`), and by everything they run on: tokio, quinn, the kernel's FUSE and writeback behaviour, the server's filesystem.
 
 Those are three different targets, and no single tool covers all of them:
 
@@ -90,7 +90,7 @@ In order, each step useful on its own:
 3. **`quint-connect` on top of the harness.** Traces from the spec drive the real code in the simulator, checking it against the model step by step. This is the link from target 1 to target 2.
 4. **Proofs where they are cheap and pay** (ongoing):
    - **Kani:** harnesses for the decoder's limits (no panic, bounded allocation on any frame) and for `retry_safe` and `changes` against a stated spec.
-   - **Verus, if the appetite is there:** the pure state machines: `SessionState`'s fence counts, `Change`'s phases, `Handles` slot accounting with `Released`. These are small, have exactly the bugs found by review, and are where bcachefs is using Verus too.
+   - **Verus, if the appetite is there:** the pure state machines: `SessionState`'s fence counts, `Exchange`'s phases, `Handles` slot accounting with `Released`. These are small, have exactly the bugs found by review, and are where bcachefs is using Verus too.
 
    Proving the async code itself is not worth attempting yet.
 

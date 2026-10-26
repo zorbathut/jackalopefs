@@ -678,7 +678,7 @@ module session {
     )
   }
 
-  /// The work ends, with a reply or an errno (an open refused at `Slot::insert` with EBADF; a release, or an open answered from the handle under its id, never fails), and `GuardChange::drop` uncounts the change under the epoch it began at; one given up on sends no reply, but its work stands. The reply goes nowhere on a connection the server has lost.
+  /// The work ends, with a reply or an errno (an open refused at `Slot::insert` with EBADF; a release, or an open answered from the handle under its id, never fails), and `GuardExchange::drop` uncounts the change under the epoch it began at; one given up on sends no reply, but its work stands. The reply goes nowhere on a connection the server has lost.
   action finish(r: int, errno: bool): bool = {
     val q = reqs.get(r)
     val ses = sessions.get(q.session)
