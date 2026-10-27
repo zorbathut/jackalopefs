@@ -63,7 +63,7 @@ Each event is recorded where it takes effect: the server's under the attachment 
 
 | Event | Recorded at | Replayed as | Checked |
 |---|---|---|---|
-| `CallStarted` | `Caller::attempt`, first | `start`, a model call per real one; reads and other unmodelled requests, a release of a handle the model never had, and a kernel release of a dead handle (`Stale`) are passed over | |
+| `CallStarted` | `Caller::attempt`, first | `start`, a model call per real one; reads and other unmodelled requests, and a release of a handle the model never had are passed over | |
 | `CallReady` | `Caller::attempt`, while it reads the connection's pending cancels as answered | `send` | the call's connection is the model's current one |
 | `ReleaseReady` | `send_releases`, likewise | `owedSend` | likewise |
 | `Stream` | `client::exchange`, the stream opened and the frame encoded, before it is written | maps the stream to its request; a reopen's `reopenSend` | |

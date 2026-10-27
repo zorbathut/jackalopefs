@@ -101,7 +101,7 @@ pub struct HandleRec {
     pub kind: HandleKind,
     /// The process whose open made the handle, `None` when it could not be named; known to this client alone.
     pub opener: Option<Opener>,
-    /// Set when a reopen after a lost session found a different inode (or nothing) at the path; every later use fails with `ESTALE`.
+    /// Set when the file the handle was opened on is no longer there to use: a reopen after a lost session found a different inode (or nothing) at the path, or did not answer, or the server came back serving another directory; every later use fails with `ESTALE`.
     dead: AtomicBool,
 }
 
@@ -362,10 +362,20 @@ impl HandleTable {
             .collect()
     }
 
-    /// Every handle is stale: what the paths led to is gone.
+    /// Every handle is stale: what the paths led to is gone. Their releases are owed, since a session that resumed still holds them; the kernel's release of a dead handle sends nothing more.
     pub fn kill_all(&self) {
-        for rec in self.map.lock().values() {
-            rec.mark_dead();
+        let killed: Vec<(u64, HandleKind)> = self
+            .map
+            .lock()
+            .iter()
+            .filter(|(_, rec)| !rec.is_dead())
+            .map(|(fh, rec)| {
+                rec.mark_dead();
+                (*fh, rec.kind)
+            })
+            .collect();
+        for (fh, kind) in killed {
+            self.owe_release(crate::client::release_request(kind, fh));
         }
     }
 
@@ -530,6 +540,48 @@ mod tests {
         assert!(table.open_nodeids().is_empty());
         assert!(table.live().is_empty());
         assert!(table.alloc() > fh);
+    }
+
+    #[test]
+    fn handles_killed_together_owe_their_releases() {
+        let table = HandleTable::default();
+        let file = table.alloc();
+        table.insert(
+            file,
+            2,
+            KeyNode::of(&attr(2)),
+            Path::root(),
+            libc::O_RDONLY,
+            HandleKind::File,
+            None,
+        );
+        let dir = table.alloc();
+        table.insert(
+            dir,
+            3,
+            KeyNode::of(&attr(3)),
+            Path::root(),
+            libc::O_RDONLY,
+            HandleKind::Dir,
+            None,
+        );
+        table.kill_all();
+        assert!(table.live().is_empty());
+        assert_eq!(table.owed_sendable(), vec![file, dir]);
+        assert_eq!(
+            table.owed_send(file, 1),
+            Request::Release {
+                fh: file,
+                ordered: true
+            }
+        );
+        assert_eq!(
+            table.owed_send(dir, 1),
+            Request::Releasedir {
+                fh: dir,
+                ordered: true
+            }
+        );
     }
 
     #[test]

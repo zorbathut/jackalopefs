@@ -1474,9 +1474,16 @@ impl Client {
         }
     }
 
-    /// Forget the handle locally first so a reconnect never reopens it, then tell the server.
+    /// Forget the handle locally first so a reconnect never reopens it, then tell the server, unless the handle is dead: whatever killed it owed its release.
     pub async fn release(&self, fh: u64) -> Result<(), Error> {
-        self.caller.handles.remove(fh);
+        if self
+            .caller
+            .handles
+            .remove(fh)
+            .is_some_and(|rec| rec.is_dead())
+        {
+            return Ok(());
+        }
         self.caller
             .release(Request::Release { fh, ordered: false })
             .await
@@ -1525,8 +1532,16 @@ impl Client {
         }
     }
 
+    /// As [`Self::release`].
     pub async fn releasedir(&self, fh: u64) -> Result<(), Error> {
-        self.caller.handles.remove(fh);
+        if self
+            .caller
+            .handles
+            .remove(fh)
+            .is_some_and(|rec| rec.is_dead())
+        {
+            return Ok(());
+        }
         self.caller
             .release(Request::Releasedir { fh, ordered: false })
             .await
