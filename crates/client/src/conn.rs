@@ -2,7 +2,9 @@
 //!
 //! Connections by generation, reopens, publishing and the releases sent in the background are modelled in `spec/session.qnt`; a change to them updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
-use crate::client::{exchange, release_request, Error, ErrorExchange, KeyRoot, Tapping, Timing};
+use crate::client::{
+    exchange, given_up, release_request, Error, ErrorExchange, KeyRoot, Tapping, Timing,
+};
 use crate::handles::HandleTable;
 use crate::ids::{IdMap, ModeIds};
 use crate::perf::{Perf, Slowpath};
@@ -628,21 +630,29 @@ async fn reopen_handles(
             };
             let mut timing = Timing::for_origin(Some(Origin::Reopen(fh)));
             // A reopen given up on is a change given up on: its answer is read in the background and counted until it comes, so the release of its handle waits for it.
-            let outcome = exchange(
+            let outcome = match exchange(
                 &conn,
                 &root,
                 &ids,
                 &rec.reopen_request(fh),
                 &mut timing,
                 tapping,
-                Some(&cancels),
                 async {
                     tokio::time::sleep(offline_timeout).await;
                     Error::Timeout
                 },
             )
             .await
-            .map_err(Error::from);
+            {
+                Err(ErrorExchange::GaveUp {
+                    error,
+                    written,
+                    pending,
+                }) => Err(given_up(
+                    error, written, pending, &cancels, tapping, &timing,
+                )),
+                exchanged => exchanged.map_err(Error::from),
+            };
             (fh, rec, outcome)
         });
     }
@@ -709,7 +719,6 @@ async fn send_releases(attached: Arc<Attached>, handles: &HandleTable, hub: Arc<
                             &release,
                             &mut timing,
                             tapping,
-                            None,
                             std::future::pending(),
                         )
                         .await;

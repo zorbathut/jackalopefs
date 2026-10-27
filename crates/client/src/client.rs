@@ -10,7 +10,7 @@ use crate::inodes::KeyNode;
 use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_perf::event;
-use jackalopefs_perf::hub::{elided, Hub, IdsEvent, Side};
+use jackalopefs_perf::hub::{elided, Hub, IdsEvent, Sampled, Side};
 use jackalopefs_perf::spec_trace;
 use jackalopefs_perf::spec_trace::Origin;
 #[cfg(feature = "spec-trace")]
@@ -74,8 +74,12 @@ pub(crate) enum ErrorExchange {
     NotSent(String),
     Lost(String),
     Protocol(String),
-    /// The call stopped waiting for the reply.
-    GaveUp(Error),
+    /// The call stopped waiting for the reply: before the request was written whole, or after, when `pending` holds what is left of the exchange for the caller to decide what becomes of it ([`given_up`]).
+    GaveUp {
+        error: Error,
+        written: bool,
+        pending: Option<Box<PendingReply>>,
+    },
 }
 
 impl From<ErrorExchange> for Error {
@@ -83,7 +87,7 @@ impl From<ErrorExchange> for Error {
         match e {
             ErrorExchange::NotSent(_) | ErrorExchange::Lost(_) => Error::Disconnected,
             ErrorExchange::Protocol(msg) => Error::Protocol(msg),
-            ErrorExchange::GaveUp(e) => e,
+            ErrorExchange::GaveUp { error, .. } => error,
         }
     }
 }
@@ -377,6 +381,92 @@ fn verdict_of(read: &Result<(Vec<u8>, Result<Response, ErrorCodec>), ErrorCodec>
     }
 }
 
+/// What [`exchange`] reads a reply with: the reply's body, decoded or not.
+type ReadReply = Result<(Vec<u8>, Result<Response, ErrorCodec>), ErrorCodec>;
+
+/// A request written whole and given up on before its reply came: its send side, open still for a change, and the reading of its reply. Dropped, the reply goes unread, and a change's send side is reset.
+pub(crate) struct PendingReply {
+    send: SideSend,
+    reply: std::pin::Pin<Box<dyn Future<Output = ReadReply> + Send>>,
+    sampled: Option<Sampled>,
+    op: &'static str,
+    stream: u64,
+    #[cfg(feature = "spec-trace")]
+    recorder: Option<Arc<Recorder>>,
+    #[cfg(feature = "spec-trace")]
+    key: KeyExchange,
+}
+
+impl std::fmt::Debug for PendingReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingReply")
+            .field("op", &self.op)
+            .field("stream", &self.stream)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingReply {
+    /// Tell the server the change was given up on, by resetting its send side, and read its answer in the background, the change counted on its connection's pending cancels (`counted`) until the answer comes.
+    fn cancel(mut self, counted: CancelPending) {
+        self.send.cancel();
+        tokio::spawn(async move {
+            let read = self.reply.await;
+            let verdict = verdict_of(&read);
+            spec_trace!(
+                self.recorder.as_ref(),
+                EventSpec::CancelAnswered {
+                    key: self.key,
+                    verdict
+                }
+            );
+            tracing::debug!(
+                op = self.op,
+                stream = self.stream,
+                verdict,
+                "a change given up on was answered"
+            );
+            match (self.sampled, &read) {
+                (Some(sampled), Ok((body, Ok(resp)))) => {
+                    sampled.reply(body, || elided(resp.with_data_elided()))
+                }
+                (Some(mut sampled), _) => sampled.outcome(verdict),
+                (None, _) => {}
+            }
+            drop(counted);
+        });
+    }
+}
+
+/// An exchange on the connection whose pending cancels are `cancels` given up on: what is left of it once written whole (`pending`), when the caller says it is to be counted, is counted on the connection's pending cancels and cancelled ([`PendingReply::cancel`]); anything else is dropped. The give-up is recorded as made for `timing`'s origin, after the count, so that no call that reads the count as clear is recorded after it.
+#[cfg_attr(not(feature = "spec-trace"), allow(unused_variables))]
+pub(crate) fn given_up(
+    error: Error,
+    written: bool,
+    pending: Option<Box<PendingReply>>,
+    cancels: &watch::Sender<usize>,
+    tapping: Tapping<'_>,
+    timing: &Timing<'_>,
+) -> Error {
+    let counted = pending.map(|pending| (pending, CancelPending::count(cancels)));
+    #[cfg(feature = "spec-trace")]
+    if let (Some(recorder), Some(origin)) = (tapping.hub.recorder(), timing.origin) {
+        recorder.record(EventSpec::Failed {
+            origin,
+            conn: Some(tapping.conn.unwrap_or(0)),
+            stream: timing.stream,
+            failure: Failure::GaveUp {
+                written,
+                counted: counted.is_some(),
+            },
+        });
+    }
+    if let Some((pending, count)) = counted {
+        pending.cancel(count);
+    }
+    error
+}
+
 /// When each step of an exchange completed; a step that never completed leaves its instant unset. Each step also moves the phase of the kernel request's call, when the exchange is made for one.
 #[derive(Default)]
 pub(crate) struct Timing<'a> {
@@ -478,7 +568,7 @@ pub(crate) struct Tapping<'a> {
 
 /// One request on one fresh bidi stream, until `give_up` says the call stops waiting. When a tap captures this exchange ([`Hub::sample`]), it gets the request as sent and the reply as received, before any rewriting here, so its bytes are the server's.
 ///
-/// A change keeps its send side open until the reply is in, so that giving up on it can still reach the server: the side is reset, and the server answers by resetting its own, having dropped the change unrun or made the session's later changes wait for it, or with the reply if the change was done. That answer is waited for in the background, the change counted on `cancels` meanwhile; with no `cancels`, a change given up on is dropped like a read, both sides reset at once.
+/// A change keeps its send side open until the reply is in, so that giving up on it can still reach the server: a request given up on once written whole comes back as a [`PendingReply`], which the caller cancels or drops ([`given_up`]); one given up on before is dropped, both sides reset at once.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn exchange(
     conn: &Connection,
@@ -487,7 +577,6 @@ pub(crate) async fn exchange(
     req: &Request,
     timing: &mut Timing<'_>,
     tapping: Tapping<'_>,
-    cancels: Option<&watch::Sender<usize>>,
     give_up: impl Future<Output = Error>,
 ) -> Result<Response, ErrorExchange> {
     tokio::pin!(give_up);
@@ -515,11 +604,7 @@ pub(crate) async fn exchange(
     };
     let opened = tokio::select! {
         biased;
-        e = &mut give_up => {
-            #[cfg(feature = "spec-trace")]
-            failed(None, Failure::GaveUp { written: false, counted: false });
-            return Err(ErrorExchange::GaveUp(e));
-        }
+        e = &mut give_up => return Err(ErrorExchange::GaveUp { error: e, written: false, pending: None }),
         opened = conn.open_bi() => opened,
     };
     let (send, recv) = opened.map_err(|e| {
@@ -562,11 +647,7 @@ pub(crate) async fn exchange(
     }
     tokio::select! {
         biased;
-        e = &mut give_up => {
-            #[cfg(feature = "spec-trace")]
-            failed(Some(stream), Failure::GaveUp { written: false, counted: false });
-            return Err(ErrorExchange::GaveUp(e));
-        }
+        e = &mut give_up => return Err(ErrorExchange::GaveUp { error: e, written: false, pending: None }),
         written = send.send.write_all(&frame) => {
             written.map_err(|e| {
                 #[cfg(feature = "spec-trace")]
@@ -606,33 +687,18 @@ pub(crate) async fn exchange(
         biased;
         read = &mut reply => read,
         e = &mut give_up => {
-            let Some(cancels) = cancels.filter(|_| changes) else {
+            let pending = Some(Box::new(PendingReply {
+                send,
+                reply,
+                sampled,
+                op: req.op_name(),
+                stream,
                 #[cfg(feature = "spec-trace")]
-                failed(Some(stream), Failure::GaveUp { written: true, counted: false });
-                return Err(ErrorExchange::GaveUp(e));
-            };
-            let pending = CancelPending::count(cancels);
-            #[cfg(feature = "spec-trace")]
-            failed(Some(stream), Failure::GaveUp { written: true, counted: true });
-            send.cancel();
-            let op = req.op_name();
-            #[cfg(feature = "spec-trace")]
-            let recorder = recorder.cloned();
-            tokio::spawn(async move {
-                let read = reply.await;
-                let verdict = verdict_of(&read);
-                spec_trace!(recorder.as_ref(), EventSpec::CancelAnswered { key, verdict });
-                tracing::debug!(op, stream, verdict, "a change given up on was answered");
-                match (sampled, &read) {
-                    (Some(sampled), Ok((body, Ok(resp)))) => {
-                        sampled.reply(body, || elided(resp.with_data_elided()))
-                    }
-                    (Some(mut sampled), _) => sampled.outcome(verdict),
-                    (None, _) => {}
-                }
-                drop(pending);
-            });
-            return Err(ErrorExchange::GaveUp(e));
+                recorder: recorder.cloned(),
+                #[cfg(feature = "spec-trace")]
+                key,
+            }));
+            return Err(ErrorExchange::GaveUp { error: e, written: true, pending });
         }
     };
     let (body, decoded) = match read {
@@ -1019,18 +1085,18 @@ impl Caller {
                 timing.origin = origin;
             }
             let attempt = Instant::now();
+            let tapping = Tapping {
+                hub: &self.perf.hub,
+                session: attached.session_id,
+                conn: attached.conn_key,
+            };
             let exchanged = exchange(
                 &attached.conn,
                 &attached.root,
                 &attached.ids,
                 sent,
                 &mut timing,
-                Tapping {
-                    hub: &self.perf.hub,
-                    session: attached.session_id,
-                    conn: attached.conn_key,
-                },
-                Some(&attached.cancels),
+                tapping,
                 &mut give_up,
             )
             .await;
@@ -1078,7 +1144,20 @@ impl Caller {
                     min_generation = attached.generation + 1;
                 }
                 Err(ErrorExchange::Protocol(msg)) => return Err(Error::Protocol(msg)),
-                Err(ErrorExchange::GaveUp(e)) => return Err(e),
+                Err(ErrorExchange::GaveUp {
+                    error,
+                    written,
+                    pending,
+                }) => {
+                    return Err(given_up(
+                        error,
+                        written,
+                        pending.filter(|_| req.changes()),
+                        &attached.cancels,
+                        tapping,
+                        &timing,
+                    ))
+                }
             }
             account.retries += 1;
             if let Some(kernel) = kernel {
