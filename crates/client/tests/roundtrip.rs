@@ -956,6 +956,58 @@ async fn the_release_of_a_reopen_given_up_on_waits_for_it() {
     server.stop().await;
 }
 
+/// A handle released while the other reopens of a new session still run, its reopen done, has its release owed until the connection is published; it is sent then, rather than left for some later release to wake the release task.
+#[tokio::test]
+async fn a_release_owed_while_the_reopens_run_is_sent() {
+    let export = tempfile::tempdir().unwrap();
+    fs::write(export.path().join("f"), b"contents").unwrap();
+    fs::create_dir(export.path().join("d")).unwrap();
+    let server = TestServer::start(export.path(), None).await;
+    let client = jackalopefs_client::Client::connect(server.config(Duration::from_secs(1)))
+        .await
+        .unwrap();
+    client
+        .open(path("f"), libc::O_RDONLY, None, |attr| Ok(attr.ino))
+        .await
+        .unwrap();
+    let (dir, _) = client
+        .opendir(path("d"), None, |attr| Ok(attr.ino))
+        .await
+        .unwrap();
+    let stopped = server.stop_held().await;
+    let server = stopped.start().await;
+    // Installed before this task next yields, so before the client can reach the new server.
+    let gate = Gate::install(&server);
+    gate.arm("open", Hold::Running);
+    gate.wait_parked().await;
+    wait_for(
+        Duration::from_secs(5),
+        "the directory to be reopened",
+        || (server.server.sessions.handle_totals().dirs == 1).then_some(()),
+    )
+    .await;
+    let released = client.releasedir(dir).await;
+    assert!(
+        matches!(released, Err(Error::Timeout)),
+        "the release found no connection, so it is owed: {released:?}"
+    );
+    assert!(!gate.released(), "the file's reopen still runs");
+    gate.release();
+    wait_for(
+        Duration::from_secs(5),
+        "the owed release to close the reopened directory",
+        || (server.server.sessions.handle_totals().dirs == 0).then_some(()),
+    )
+    .await;
+    assert_eq!(
+        server.server.sessions.handle_totals().files,
+        1,
+        "the file's reopen was let go in time, so the client still holds it"
+    );
+    client.shutdown().await;
+    server.stop().await;
+}
+
 fn owned_by(uid: u32, gid: u32) -> jackalopefs_proto::Attr {
     let t = TimeSpec { sec: 0, nsec: 0 };
     jackalopefs_proto::Attr {

@@ -302,6 +302,8 @@ async fn run(
             session: attached.session_id,
             conn: conn_key,
         };
+        // Watched from before the releases owed are taken and the handles reopened, so that none owed from then on, a handle the kernel releases while the reopens run among them, goes unnoticed.
+        let owed = handles.owed_changes();
         // Made before the reopens, which count on it the ones they give up on, so that a stale release waits for the answer.
         let cancels = watch::Sender::new(0);
         let restore = async {
@@ -339,8 +341,6 @@ async fn run(
             ids,
             cancels,
         });
-        // Watched from before any call can use the connection, so no release owed on it goes unnoticed.
-        let owed = handles.owed_changes();
         let releasing_on = attached.clone();
         // Recorded first, since a call can take the connection as soon as it is published.
         jackalopefs_perf::spec_trace!(
