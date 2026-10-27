@@ -795,7 +795,7 @@ fn kind_call(req: &Request) -> KindCall {
 }
 
 /// Whether a request whose reply was lost may be sent again without changing the outcome, given the records of the handles it names. A write is positional unless its handle was opened with `O_APPEND`, which the server honours by writing at its own end of file each time; one on a handle this client has no record of is not resent.
-fn retry_safe(req: &Request, handles: &[Option<Arc<HandleRec>>; 2]) -> bool {
+pub(crate) fn retry_safe(req: &Request, handles: &[Option<Arc<HandleRec>>; 2]) -> bool {
     match req {
         Request::Lookup { .. }
         | Request::Getattr { .. }

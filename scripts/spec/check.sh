@@ -62,12 +62,13 @@ expect() {
 tlc() { "$QUINT" verify --backend=tlc --apalache-version="$APALACHE_VERSION" --server-endpoint="$(endpoint)" "$@"; }
 
 section "typecheck"
-for f in session session_small session_tiny replay replay_test; do
+for f in session session_small session_tiny session_mbt replay replay_test; do
   "$QUINT" typecheck "$SPEC/$f.qnt" >/dev/null && echo "ok         $f.qnt" || fail "typecheck $f.qnt"
 done
 
 section "scenario runs"
 if out=$("$QUINT" test "$SPEC/session_small.qnt" 2>&1); then echo "ok         session_small.qnt: $(grep -o '[0-9]* passing' <<<"$out")"; else echo "$out" >&2; fail "quint test session_small.qnt"; fi
+if out=$("$QUINT" test "$SPEC/session_mbt.qnt" 2>&1); then echo "ok         session_mbt.qnt: $(grep -o '[0-9]* passing' <<<"$out")"; else echo "$out" >&2; fail "quint test session_mbt.qnt"; fi
 
 section "model-based testing's corpus (spec/mbt/corpus.json.gz)"
 if [[ $(gzip -dc "$SPEC/mbt/corpus.json.gz" | head -1 | grep -o '"hash":"[0-9a-f]*"' | cut -d'"' -f4) == "$("$ROOT/scripts/spec/mbt.sh" hash)" ]]; then

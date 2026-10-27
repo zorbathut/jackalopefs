@@ -310,6 +310,12 @@ impl HandleTable {
         self.owed.lock().clear();
     }
 
+    /// The handles whose release is owed, sent or not.
+    #[cfg(test)]
+    pub(crate) fn owed_now(&self) -> std::collections::BTreeSet<u64> {
+        self.owed.lock().keys().copied().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.map.lock().len()
     }

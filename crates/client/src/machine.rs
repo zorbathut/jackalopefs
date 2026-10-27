@@ -308,6 +308,11 @@ impl ReopenRound {
     }
 
     #[cfg(test)]
+    pub(crate) fn sending(&self) -> Vec<u64> {
+        self.sending.keys().copied().collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn reopened(&self) -> &BTreeSet<u64> {
         &self.reopened
     }

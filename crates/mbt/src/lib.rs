@@ -205,7 +205,7 @@ pub fn corpus() -> Vec<(String, serde_json::Value)> {
         .collect()
 }
 
-/// Random runs of the model's small instance, by name: `JACKALOPEFS_MBT_TRACES` of them (default 200), from `JACKALOPEFS_MBT_SEED`, each up to `JACKALOPEFS_MBT_STEPS` steps (default 40). Needs Quint, which `scripts/spec/check.sh` installs; `scripts/spec/mbt.sh` runs the tests that use this.
+/// Random runs of the model's small instance, by name, each state after the first carrying what the client could do in the one before (`spec/session_mbt.qnt`): `JACKALOPEFS_MBT_TRACES` of them (default 200), from `JACKALOPEFS_MBT_SEED`, each up to `JACKALOPEFS_MBT_STEPS` steps (default 40). Needs Quint, which `scripts/spec/check.sh` installs; `scripts/spec/mbt.sh` runs the tests that use this.
 pub fn random_runs() -> Vec<(String, serde_json::Value)> {
     let var =
         |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_string());
@@ -225,9 +225,13 @@ pub fn random_runs() -> Vec<(String, serde_json::Value)> {
         .current_dir(spec_dir())
         .args([
             "run",
-            "session_small.qnt",
+            "session_mbt.qnt",
             "--main",
-            "session_small",
+            "session_mbt",
+            "--init",
+            "mbtInit",
+            "--step",
+            "mbtStep",
             "--mbt",
             "--verbosity",
             "0",

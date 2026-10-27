@@ -8,6 +8,8 @@ pub mod ids;
 pub mod inodes;
 pub mod invalidate;
 pub mod machine;
+#[cfg(test)]
+mod mbt;
 pub mod mount;
 pub mod perf;
 pub mod procs;

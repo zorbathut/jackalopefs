@@ -596,6 +596,7 @@ dependencies = [
  "fuser",
  "humantime",
  "io-uring",
+ "jackalopefs-mbt",
  "jackalopefs-perf",
  "jackalopefs-proto",
  "jackalopefs-server",

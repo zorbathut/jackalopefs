@@ -1,7 +1,7 @@
 //! The session model's state as an ITF trace carries it (`spec/session.qnt`, its `var`s).
 
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(tag = "tag", content = "value")]
@@ -57,19 +57,49 @@ pub enum Slot {
     Kept,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "tag", content = "value")]
+pub enum StatusCall {
+    Idle,
+    Waiting,
+    InFlight,
+    Ended,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "tag", content = "value")]
+pub enum Outcome {
+    NoOutcome,
+    Replied,
+    Errno,
+    GaveUp,
+    Failed,
+}
+
 #[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Call {
     pub kind: Kind,
+    pub status: StatusCall,
+    pub resendable: bool,
+    pub attempt: u32,
+    pub min_gen: u64,
+    pub lost_once: bool,
+    pub req: u64,
+    pub outcome: Outcome,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Req {
     pub origin: Origin,
+    pub attempt: u32,
     pub phase: Phase,
     pub conn: u64,
     pub epoch: u64,
     pub session: u64,
+    pub cancel_sent: bool,
+    pub counted: bool,
     pub answer: Answer,
     pub slot: Slot,
 }
@@ -79,7 +109,32 @@ pub struct Req {
 pub struct Conn {
     pub session: u64,
     pub epoch: u64,
+    pub client_alive: bool,
     pub server_alive: bool,
+    pub published: bool,
+    pub cancels: usize,
+}
+
+/// The client's handle table and its round of reopens.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Client {
+    /// For each id, the request whose reply the client accepted, or the reopen it expects; 0 for none held.
+    pub held: BTreeMap<u64, u64>,
+    pub dead: BTreeSet<u64>,
+    pub owed: BTreeSet<u64>,
+    pub to_reopen: BTreeSet<u64>,
+    pub reopened: BTreeSet<u64>,
+    pub reopening: BTreeSet<u64>,
+}
+
+/// What the client could do in the state before, in a run of `spec/session_mbt.qnt`, but for the model's bound on requests.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct Guards {
+    pub send: BTreeSet<u64>,
+    pub owed: BTreeSet<u64>,
+    pub reopen: BTreeSet<u64>,
+    pub publish: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -109,7 +164,11 @@ pub struct Model {
     pub gen: u64,
     pub sessions: BTreeMap<u64, Session>,
     pub sid: u64,
+    pub client: Client,
     pub pool: usize,
+    /// In a run of `spec/session_mbt.qnt`: what the client could do in the state before this one.
+    #[serde(default)]
+    pub guards: Option<Guards>,
     #[serde(default)]
     pub action_taken: Option<String>,
     /// The choices the action made, each `Some` or `None`, in a trace `quint run --mbt` wrote.

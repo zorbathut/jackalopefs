@@ -237,6 +237,21 @@ module session_small {
     .then(owedSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).then(closeSession(1))
     .expect(client.owed == Set() and pool == 0 and quiescent and okSoFar)
 
+  /// An open the server refuses with an errno keeps nothing and owes nothing; a change that fails so ends with its errno.
+  run openRefusedTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, true)).then(receive(1))
+    .expect(calls.get(1).outcome == Errno and client.held.get(1) == 0 and client.owed == Set() and pool == 0)
+    .then(start(2, Change, false)).then(send(2)).then(arrive(2)).then(begin(2)).then(finish(2, true)).then(receive(2))
+    .expect(calls.get(2).outcome == Errno and quiescent and okSoFar)
+
+  /// The kernel's release given up on in flight is not ordered, so nothing is counted and its stream is dropped unread; its release is owed, and the owed one, ordered, goes out and finds the handle already closed.
+  run releaseGivenUpTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
+    .then(start(2, Release(1), true)).then(send(2)).then(giveUp(2)).expect(client.owed == Set(1) and conns.get(1).cancels == 0)
+    .then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
+    .then(owedSend(1)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
+    .expect(client.owed == Set() and sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
+
   /// A change held on a connection the server then loses is dropped when its task notices, unrun; the change it waited for runs on.
   run heldDroppedTest = init
     .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))
