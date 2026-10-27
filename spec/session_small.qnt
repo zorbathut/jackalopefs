@@ -209,6 +209,34 @@ module session_small {
     .then(send(2)).then(arrive(4)).then(begin(4)).then(finish(4, false)).then(receive(4)).then(closeSession(1))
     .expect(sessions.get(2).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
 
+  /// A new session's round of reopens is fixed as it begins: the kernel releases a handle before its reopen is written, and the reopen goes out all the same, its reply owing the release of what it opened.
+  run reopenReleasedFirstTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
+    .then(loseClient(1, Set())).then(loseServer(1)).then(dropSession(1)).then(newSession).expect(client.toReopen == Set(1))
+    .then(start(2, Release(1), true)).expect(client.held.get(1) == 0 and client.toReopen == Set(1))
+    .then(reopenSend(1)).expect(client.held.get(1) == 0 and client.reopening == Set(2))
+    .then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).expect(client.owed == Set(1))
+    .then(publish).then(owedSend(1)).then(arrive(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
+    .then(send(2)).then(arrive(4)).then(begin(4)).then(finish(4, false)).then(receive(4)).then(closeSession(1))
+    .expect(sessions.get(2).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
+
+  /// A reopen given up on before its frame was written whole reaches the server with nothing: nothing is counted, the handle is dead, its release owed, and the connection published.
+  run reopenUnsentTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
+    .then(loseClient(1, Set())).then(loseServer(1)).then(dropSession(1)).then(newSession)
+    .then(reopenUnsentGiveUp(1)).expect(client.dead == Set(1) and client.owed == Set(1) and conns.get(2).cancels == 0)
+    .then(publish).then(owedSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).then(closeSession(1))
+    .expect(client.owed == Set() and pool == 0 and quiescent and okSoFar)
+
+  /// A connection lost while its round of reopens runs takes the reopens not yet written with it: their handles are dead, and their releases owed to a session that, new, holds none of them.
+  run reopenLostTest = init
+    .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).then(receive(1))
+    .then(loseClient(1, Set())).then(loseServer(1)).then(dropSession(1)).then(newSession)
+    .then(loseClient(2, Set())).expect(client.toReopen == Set() and client.dead == Set(1) and client.owed == Set(1))
+    .then(loseServer(2)).then(reconnect).expect(conns.get(3).published)
+    .then(owedSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2)).then(closeSession(1))
+    .expect(client.owed == Set() and pool == 0 and quiescent and okSoFar)
+
   /// A change held on a connection the server then loses is dropped when its task notices, unrun; the change it waited for runs on.
   run heldDroppedTest = init
     .then(start(1, Change, false)).then(send(1)).then(arrive(1)).then(begin(1))

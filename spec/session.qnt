@@ -67,8 +67,8 @@ module session {
   /// `SessionState`: the attachment's epoch and counts, whether the session is in the server's table (`live`) and whether its grace period is running (`detached`); its `Handles`. `handshakeLost` bounds that action to once between connections.
   type Session = { epoch: int, running: int, abandoned: int, runningOlder: int, live: bool, detached: bool, handshakeLost: bool, handles: int -> Entry }
 
-  /// The client's handle table: for each id, the request whose reply it accepted, or the reopen it expects (0 for none held); the handles a reopen killed (`HandleRec::dead`); the releases owed (`HandleTable::owe_release`); the handles reopened on the current session; the reopens whose task still waits for an answer (`reopen_handles`' tasks).
-  type Client = { held: int -> int, dead: Set[int], owed: Set[int], reopened: Set[int], reopening: Set[int] }
+  /// The client's handle table: for each id, the request whose reply it accepted, or the reopen it expects (0 for none held); the handles a reopen killed (`HandleRec::dead`); the releases owed (`HandleTable::owe_release`); the round of reopens after a new session (`ReopenRound`): the handles whose reopen is not yet written, those reopened, and the reopens that still wait for an answer.
+  type Client = { held: int -> int, dead: Set[int], owed: Set[int], toReopen: Set[int], reopened: Set[int], reopening: Set[int] }
 
   // ---- State ----
 
@@ -109,7 +109,7 @@ module session {
   pure val noEntry: Entry = { by: 0 }
   pure val noSession: Session = { epoch: 0, running: 0, abandoned: 0, runningOlder: 0, live: false, detached: false, handshakeLost: false, handles: CALLS.mapBy(fh => noEntry) }
   pure val freshSession: Session = noSession.with("epoch", 1).with("live", true)
-  pure val emptyClient: Client = { held: CALLS.mapBy(fh => 0), dead: Set(), owed: Set(), reopened: Set(), reopening: Set() }
+  pure val emptyClient: Client = { held: CALLS.mapBy(fh => 0), dead: Set(), owed: Set(), toReopen: Set(), reopened: Set(), reopening: Set() }
 
   /// A request ends in `phase`; a reset the server has not acted on is moot from here.
   pure def ended(q: Req, phase: Phase): Req = q.with("phase", phase).with("cancelSent", false)
@@ -218,7 +218,7 @@ module session {
     if (call.resendable and not(call.lostOnce)) call.with("status", Waiting).with("minGen", g + 1).with("lostOnce", true).with("req", 0)
     else call.with("status", Ended).with("outcome", Failed).with("req", 0)
 
-  /// `ConnManager` sees the connection end: every exchange on it fails. The calls in `notSent`, whose frames the stream may not have carried whole, go to the next connection untouched (`Caller::attempt`, `NotSent`); the rest lost their reply, `lostCall`, an open or a release that fails owing the release of its handle. The readers of the pending cancels fail too, so their count goes with the connection. Reopens not yet accepted fail with it (`apply_reopen` on `Err`): their handles are dead and their releases owed. An owed release without its reply stays owed, for the next resume.
+  /// `ConnManager` sees the connection end: every exchange on it fails. The calls in `notSent`, whose frames the stream may not have carried whole, go to the next connection untouched (`Caller::attempt`, `NotSent`); the rest lost their reply, `lostCall`, an open or a release that fails owing the release of its handle. The readers of the pending cancels fail too, so their count goes with the connection. Reopens not yet answered, or not yet written, fail with it (`ReopenRound::ended` on `Err`): their handles are dead and their releases owed, the released ones' too. An owed release without its reply stays owed, for the next resume.
   action loseClient(g: int, notSent: Set[int]): bool = {
     val inflight = CALLS.filter(c => calls.get(c).status == InFlight and reqs.get(calls.get(c).req).conn == g)
     val failing = inflight.exclude(notSent).filter(c => not(calls.get(c).resendable and not(calls.get(c).lostOnce)))
@@ -239,7 +239,8 @@ module session {
       client' = {
         held: CALLS.mapBy(fh => if (unreopened.contains(fh)) 0 else client.held.get(fh)),
         dead: client.dead.union(unreopened),
-        owed: client.owed.union(unreopened).union(reopensFailing.map(r => fhOf(reqs.get(r)))).union(unsettledReleases).union(failing.filter(c => isRelease(kindOf(c))).map(c => match kindOf(c) { Release(fh) => fh | _ => 0 })).union(failing.filter(c => isOpen(kindOf(c)))),
+        owed: client.owed.union(unreopened).union(client.toReopen).union(reopensFailing.map(r => fhOf(reqs.get(r)))).union(unsettledReleases).union(failing.filter(c => isRelease(kindOf(c))).map(c => match kindOf(c) { Release(fh) => fh | _ => 0 })).union(failing.filter(c => isOpen(kindOf(c)))),
+        toReopen: Set(),
         reopened: client.reopened,
         reopening: client.reopening.exclude(reopensFailing)
       },
@@ -298,19 +299,20 @@ module session {
 
   // ---- The client's own traffic (`crates/client/src/conn.rs`) ----
 
-  /// `reopen_handles`: after a new session, each held handle is opened again under its id before the connection is published, each by a task of its own; the client expects the server's entry from this request. The kernel may release the handle meanwhile, and the task goes on all the same.
+  /// `reopen_handles`: after a new session, each handle held when it began is opened again under its id before the connection is published, each by a task of its own (`ReopenRound::send`); the client expects the server's entry from this request. The kernel may release the handle meanwhile, and the reopen goes on all the same, its reply owing the release.
   action reopenSend(fh: int): bool = {
     val conn = conns.get(gen)
     val r = lowestFree
     all {
       conn.clientAlive,
       not(conn.published),
-      client.held.get(fh) != 0,
-      not(client.reopened.contains(fh)),
-      reqs.get(client.held.get(fh)).conn != gen,
+      client.toReopen.contains(fh),
       r <= R,
       reqs' = reqs.set(r, newReq(Reopen(fh), 1, gen, conn)),
-      client' = client.with("held", client.held.set(fh, r)).with("reopening", client.reopening.union(Set(r))),
+      client' = client
+        .with("toReopen", client.toReopen.exclude(Set(fh)))
+        .with("held", if (client.held.get(fh) != 0) client.held.set(fh, r) else client.held)
+        .with("reopening", client.reopening.union(Set(r))),
       keepCalls,
       keepConns,
       keepSessions,
@@ -318,7 +320,22 @@ module session {
     }
   }
 
-  /// A reopen's deadline passes (`reopen_handles`), its reply not yet read: `client::exchange` resets its send side and counts it on the connection's `cancels`, made before the reopens, and reads the server's answer in the background; the handle, if still held, is dead, and its release owed (`apply_reopen`, and the stale list, which takes a handle the kernel released meanwhile too), to be sent once that answer is in.
+  /// A reopen's deadline passes before its frame was written whole (waiting for a stream, the server's limit on them reached): nothing reached the server, so nothing is counted; the handle, if still held, is dead, and its release owed (`ReopenRound::ended`).
+  action reopenUnsentGiveUp(fh: int): bool = all {
+    client.toReopen.contains(fh),
+    conns.get(gen).clientAlive,
+    client' = {
+      val done = client.with("toReopen", client.toReopen.exclude(Set(fh))).with("owed", client.owed.union(Set(fh)))
+      if (client.held.get(fh) != 0) done.with("held", done.held.set(fh, 0)).with("dead", done.dead.union(Set(fh))) else done
+    },
+    keepCalls,
+    keepReqs,
+    keepConns,
+    keepSessions,
+    keepGhosts,
+  }
+
+  /// A reopen's deadline passes (`reopen_handles`), its reply not yet read: `client::exchange` resets its send side and counts it on the connection's `cancels`, made before the reopens, and reads the server's answer in the background; the handle, if still held, is dead, and its release owed (`ReopenRound::ended`, which owes it for a handle the kernel released meanwhile too), to be sent once that answer is in.
   action reopenGiveUp(r: int): bool = {
     val q = reqs.get(r)
     val fh = fhOf(q)
@@ -339,13 +356,13 @@ module session {
     }
   }
 
-  /// Every reopen task has ended, answered or given up on (the server may still run one given up on), and every held handle is reopened or dead: the connection is published, and the releases of the handles the reopens killed, or the kernel released meanwhile, go out behind it (`reopen_handles`' second return, owed here, sent by `send_releases`). What was owed to the old session is moot (`conn.rs`, the new-session branch).
+  /// Every reopen of the round has ended, answered or given up on (the server may still run one given up on), so every handle held is reopened or dead (`ReopenRound::publishable`): the connection is published, and the releases of the handles the reopens killed, or the kernel released meanwhile, go out behind it (owed by the round, sent by `send_releases`). What was owed to the old session is moot (`conn.rs`, the new-session branch).
   action publish: bool = {
     val conn = conns.get(gen)
     all {
       conn.clientAlive,
       not(conn.published),
-      heldNow.subseteq(client.reopened),
+      client.toReopen == Set(),
       client.reopening == Set(),
       conns' = conns.set(gen, conn.with("published", true)),
       keepCalls,
@@ -435,7 +452,7 @@ module session {
       sessions' = sessions.set(s, freshSession),
       pool' = pool,
       conns' = conns.set(g, liveConn(s, 1, heldNow == Set())),
-      client' = client.with("owed", Set()).with("reopened", Set()).with("reopening", Set()),
+      client' = client.with("owed", Set()).with("toReopen", heldNow).with("reopened", Set()).with("reopening", Set()),
       keepCalls,
       keepReqs,
       keepGhosts,
@@ -708,6 +725,7 @@ module session {
   action stepLoseServer = { nondet g = GENS.oneOf()  loseServer(g) }
   action stepReceive = { nondet r = REQS.oneOf()  receive(r) }
   action stepReopenSend = { nondet fh = CALLS.oneOf()  reopenSend(fh) }
+  action stepReopenUnsentGiveUp = { nondet fh = CALLS.oneOf()  reopenUnsentGiveUp(fh) }
   action stepReopenGiveUp = { nondet r = REQS.oneOf()  reopenGiveUp(r) }
   action stepOwedSend = { nondet fh = CALLS.oneOf()  owedSend(fh) }
   action stepDropSession = { nondet s = SIDS.oneOf()  dropSession(s) }
@@ -732,6 +750,7 @@ module session {
     stepReceive,
     stepReopenSend,
     stepReopenGiveUp,
+    stepReopenUnsentGiveUp,
     publish,
     stepOwedSend,
     reconnect,

@@ -212,7 +212,12 @@ module replay {
     if (e.failure == "notsent" or e.failure == "lost") skip
     else if (e.failure == "other") refuse
     else if (e.origin == "call" and e.failure == "stale") { if (c == 0) skip else refuse }
-    else if (e.origin == "reopen") { if (e.counted) all { reopenGiveUp(r), rp' = rp.with("at", rp.at + 1) } else skip }
+    else if (e.origin == "reopen") {
+      val fh = look(rp.fhCall, e.fh)
+      if (e.counted) all { reopenGiveUp(r), rp' = rp.with("at", rp.at + 1) }
+      else if (not(e.written) and client.toReopen.contains(fh)) all { reopenUnsentGiveUp(fh), rp' = rp.with("at", rp.at + 1) }
+      else skip
+    }
     else if (e.origin == "owed") refuse
     else if (c != 0) all {
       e.counted == (calls.get(c).status == InFlight and ordered(calls.get(c).kind)),

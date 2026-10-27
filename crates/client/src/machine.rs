@@ -1,11 +1,13 @@
-//! The client's half of the session protocol as steps that neither wait nor do IO: what a connection carries ([`AttachedState`]), a call's sends, give-up and resend ([`CallState`]), and what the end of an open or a release leaves owed. The async code around them (`Caller::attempt`, the connection manager) does the IO and the waiting, and asks these what to do and when; the model-based test takes the same steps without it.
+//! The client's half of the session protocol as steps that neither wait nor do IO: what a connection carries ([`AttachedState`]), a call's sends, give-up and resend ([`CallState`]), what the end of an open or a release leaves owed, and a new session's reopens ([`ReopenRound`]). The async code around them (`Caller::attempt`, the connection manager) does the IO and the waiting, and asks these what to do and when; the model-based test takes the same steps without it.
 //!
 //! These steps are modelled in `spec/session.qnt`; a change to them updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
-use crate::client::Error;
-use crate::handles::HandleTable;
-use jackalopefs_proto::Response;
+use crate::client::{release_request, Error};
+use crate::handles::{HandleRec, HandleTable};
+use jackalopefs_proto::{Request, Response};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::watch;
 
 /// A connection's part in the protocol: its generation, its changes given up on that the server has not yet said what became of, and whether the connection manager has handed it to calls (published it). Made at the handshake, before the reopens, which count their give-ups on it.
@@ -239,6 +241,65 @@ pub(crate) fn release_begins(handles: &HandleTable, fh: u64) -> bool {
     !handles.remove(fh).is_some_and(|rec| rec.is_dead())
 }
 
+/// A new session's round of reopens: each handle held as the session began is opened again under its id, before the connection is published, since the server holds none of them. The round is fixed as it begins; the kernel may release a handle meanwhile, and its reopen goes on all the same, owing the release of what it opened.
+#[derive(Debug)]
+pub struct ReopenRound {
+    /// The reopens not yet sent.
+    unsent: BTreeMap<u64, Arc<HandleRec>>,
+    /// The reopens sent, waiting for their answer.
+    sending: BTreeMap<u64, Arc<HandleRec>>,
+    /// The handles whose reopen found the same file.
+    reopened: BTreeSet<u64>,
+}
+
+impl ReopenRound {
+    pub fn new(handles: &HandleTable) -> ReopenRound {
+        ReopenRound {
+            unsent: handles.live().into_iter().collect(),
+            sending: BTreeMap::new(),
+            reopened: BTreeSet::new(),
+        }
+    }
+
+    /// The handles whose reopen is not yet sent.
+    pub fn unsent(&self) -> Vec<u64> {
+        self.unsent.keys().copied().collect()
+    }
+
+    /// The reopen of `fh` goes out: the request to send. The connection manager sends every reopen of the round at once, each by a task of its own, so for it a reopen is sent from when its task begins.
+    pub fn send(&mut self, fh: u64) -> Request {
+        let rec = self.unsent.remove(&fh).expect("a reopen is sent once");
+        let reopen = rec.reopen_request(fh);
+        self.sending.insert(fh, rec);
+        reopen
+    }
+
+    /// The reopen of `fh`, sent or not, ended with `outcome`: the same file keeps the handle alive (`HandleTable::apply_reopen`); anything else, a reopen given up on or lost with its connection among them, kills it. The release of a handle the reopen killed, or the kernel released meanwhile, is owed.
+    pub fn ended(&mut self, handles: &HandleTable, fh: u64, outcome: Result<Response, Error>) {
+        let rec = self
+            .sending
+            .remove(&fh)
+            .or_else(|| self.unsent.remove(&fh))
+            .expect("a reopen ends once");
+        handles.apply_reopen(fh, &rec, outcome);
+        if rec.is_dead() || handles.get(fh).is_none() {
+            handles.owe_release(release_request(rec.kind, fh));
+        } else {
+            self.reopened.insert(fh);
+        }
+    }
+
+    /// Every reopen has ended, so every handle held is reopened or dead: the connection may be published.
+    pub fn publishable(&self) -> bool {
+        self.unsent.is_empty() && self.sending.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reopened(&self) -> &BTreeSet<u64> {
+        &self.reopened
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,5 +447,53 @@ mod tests {
         assert!(release_owed(&Err(Error::Disconnected)));
         assert!(!release_owed(&Ok(Response::Ok)));
         assert!(!release_owed(&Err(Error::Interrupted)));
+    }
+
+    #[test]
+    fn a_round_of_reopens_keeps_what_it_finds_again_and_owes_the_rest() {
+        use crate::handles::tests::attr;
+        use crate::handles::HandleKind;
+        use crate::inodes::KeyNode;
+        let handles = HandleTable::default();
+        let open = |ino: u64| {
+            let fh = handles.alloc();
+            let path = jackalopefs_proto::Path::root();
+            handles.insert(
+                fh,
+                ino,
+                KeyNode::of(&attr(ino)),
+                path,
+                libc::O_RDONLY,
+                HandleKind::File,
+                None,
+            );
+            fh
+        };
+        let (kept, killed, released, unsent) = (open(2), open(3), open(4), open(5));
+        let mut round = ReopenRound::new(&handles);
+        assert_eq!(round.unsent(), vec![kept, killed, released, unsent]);
+        for fh in [kept, killed, released] {
+            assert!(matches!(round.send(fh), Request::Open { fh: sent, .. } if sent == fh));
+        }
+        assert!(
+            release_begins(&handles, released),
+            "the kernel releases a live handle"
+        );
+        round.ended(&handles, kept, Ok(Response::Opened { attr: attr(2) }));
+        round.ended(&handles, killed, Err(Error::Remote(libc::ENOENT)));
+        round.ended(&handles, released, Ok(Response::Opened { attr: attr(4) }));
+        assert!(!round.publishable(), "a reopen not yet sent");
+        round.ended(&handles, unsent, Err(Error::Timeout));
+        assert!(round.publishable());
+        assert_eq!(round.reopened(), &BTreeSet::from([kept]));
+        assert_eq!(
+            handles
+                .live()
+                .into_iter()
+                .map(|(fh, _)| fh)
+                .collect::<Vec<_>>(),
+            vec![kept]
+        );
+        assert_eq!(handles.owed_sendable(), vec![killed, released, unsent]);
     }
 }

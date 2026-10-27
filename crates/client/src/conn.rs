@@ -2,12 +2,10 @@
 //!
 //! Connections by generation, reopens, publishing and the releases sent in the background are modelled in `spec/session.qnt`; a change to them updates the model, or its commit says why not (`spec/README.md`, "Keeping it in sync").
 
-use crate::client::{
-    exchange, given_up, release_request, Error, ErrorExchange, KeyRoot, Tapping, Timing,
-};
+use crate::client::{exchange, given_up, Error, ErrorExchange, KeyRoot, Tapping, Timing};
 use crate::handles::HandleTable;
 use crate::ids::{IdMap, ModeIds};
-use crate::machine::AttachedState;
+use crate::machine::{counts_give_up, AttachedState, ReopenRound};
 use crate::perf::{Perf, Slowpath};
 use crate::transport::{client_config, ServerTrust};
 use jackalopefs_perf::hub::{Hub, IdsEvent, Side};
@@ -607,13 +605,18 @@ async fn reopen_handles(
     cancels: &watch::Sender<usize>,
     tapping: Tapping<'_>,
 ) {
-    let live = handles.live();
-    if live.is_empty() {
+    let mut round = ReopenRound::new(handles);
+    if round.publishable() {
         return;
     }
-    tracing::info!(count = live.len(), "reopening handles after a new session");
+    tracing::info!(
+        count = round.unsent().len(),
+        "reopening handles after a new session"
+    );
     let mut reopens = tokio::task::JoinSet::new();
-    for (fh, rec) in live {
+    let mut reopening = std::collections::HashMap::new();
+    for fh in round.unsent() {
+        let reopen = round.send(fh);
         let (conn, root, hub, cancels) = (
             conn.clone(),
             root.clone(),
@@ -621,7 +624,7 @@ async fn reopen_handles(
             cancels.clone(),
         );
         let (session, conn_key) = (tapping.session, tapping.conn);
-        reopens.spawn(async move {
+        let task = reopens.spawn(async move {
             let tapping = Tapping {
                 hub: &hub,
                 session,
@@ -629,42 +632,47 @@ async fn reopen_handles(
             };
             let mut timing = Timing::for_origin(Some(Origin::Reopen(fh)));
             // A reopen given up on is a change given up on: its answer is read in the background and counted until it comes, so the release of its handle waits for it.
-            let outcome = match exchange(
-                &conn,
-                &root,
-                &ids,
-                &rec.reopen_request(fh),
-                &mut timing,
-                tapping,
-                async {
-                    tokio::time::sleep(offline_timeout).await;
-                    Error::Timeout
-                },
-            )
+            let outcome = match exchange(&conn, &root, &ids, &reopen, &mut timing, tapping, async {
+                tokio::time::sleep(offline_timeout).await;
+                Error::Timeout
+            })
             .await
             {
                 Err(ErrorExchange::GaveUp {
                     error,
                     written,
                     pending,
-                }) => Err(given_up(
-                    error, written, pending, &cancels, tapping, &timing,
-                )),
+                }) => {
+                    let counted = counts_give_up(true, written, true);
+                    Err(given_up(
+                        error,
+                        written,
+                        pending.filter(|_| counted),
+                        &cancels,
+                        tapping,
+                        &timing,
+                    ))
+                }
                 exchanged => exchanged.map_err(Error::from),
             };
-            (fh, rec, outcome)
+            (fh, outcome)
         });
+        reopening.insert(task.id(), fh);
     }
-    while let Some(joined) = reopens.join_next().await {
-        match joined {
-            Ok((fh, rec, outcome)) => {
-                handles.apply_reopen(fh, &rec, outcome);
-                // A handle closed while it was being reopened had its release fail for want of a connection; it goes with the rest.
-                if rec.is_dead() || handles.get(fh).is_none() {
-                    handles.owe_release(release_request(rec.kind, fh));
-                }
+    while !round.publishable() {
+        match reopens.join_next_with_id().await {
+            Some(Ok((_, (fh, outcome)))) => round.ended(handles, fh, outcome),
+            Some(Err(e)) => {
+                tracing::error!("reopen task failed: {e}");
+                // Its handle is held all the same, so it is dead, and its release owed.
+                let fh = reopening[&e.id()];
+                round.ended(
+                    handles,
+                    fh,
+                    Err(Error::Protocol(format!("reopen task failed: {e}"))),
+                );
             }
-            Err(e) => tracing::error!("reopen task failed: {e}"),
+            None => unreachable!("a round with reopens to end has their tasks"),
         }
     }
 }
