@@ -776,12 +776,12 @@ async fn run(case: Case, order: Order) -> Option<Run> {
         }
         None => case.follow_up(&client, &mut prep).await,
     };
-    // The client releases an open of unknown outcome from a task of its own; whether that release reaches the server before the late original is what the cell is about, so it must have arrived before the original is let go: run, or held behind the original if that still runs, since the release is ordered.
+    // The client owes the release of an open of unknown outcome, which its release task sends; whether that release reaches the server before the late original is what the cell is about, so it must have arrived before the original is let go: run, or held behind the original if that still runs, since the release is ordered.
     if holds && !gate.released() && case.opens() && matches!(op, Some(Observed::Unknown(_))) {
         let fh = gate.taken().expect("the gate took the op").fh;
         wait_for(
             Duration::from_secs(10),
-            "the orphan release of the op's handle",
+            "the release of the op's handle, owed",
             || {
                 let ran = gate
                     .log()
@@ -808,7 +808,7 @@ async fn run(case: Case, order: Order) -> Option<Run> {
             Opened::Dir(fh) => client.releasedir(fh).await.unwrap(),
         }
     }
-    // Every handle the server opened must have been released before the server's table is counted: by the client, as an orphan, or before a late open.
+    // Every handle the server opened must have been released before the server's table is counted: by the client, as owed after an open of unknown outcome, or before a late open.
     wait_for(
         Duration::from_secs(10),
         "a release of every handle opened",

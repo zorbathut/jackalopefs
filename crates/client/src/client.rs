@@ -1087,17 +1087,6 @@ impl Caller {
         }
     }
 
-    /// An open whose reply was not received may have succeeded on the server; tell it to let go of that id, in the background. Spawned, so it carries no kernel request: the cleanup after an interrupted open must not itself be interrupted. Bounded by the offline deadline, after which it is owed and the connection's release task sends it again.
-    fn release_orphan(&self, req: Request) {
-        let mut caller = self.clone();
-        caller.op_timeout = self.op_timeout.or(Some(self.offline_timeout));
-        tokio::spawn(async move {
-            if let Err(e) = caller.release(req).await {
-                tracing::debug!("orphan handle release failed: {e}");
-            }
-        });
-    }
-
     /// Release a handle on the server. One that fails for want of a connection, or times out, is owed: without it the server would hold the descriptor for as long as the session lives, so the connection's release task sends it again, on this connection or the session's next.
     async fn release(&self, req: Request) -> Result<(), Error> {
         match self.call(req.clone()).await {
@@ -1239,7 +1228,7 @@ impl Client {
         }
     }
 
-    /// Open (or opendir, or create) under a fresh handle id, recorded with the process whose open it is. `node` says which node the reply's attributes belong to, or refuses them (an open whose path led to a file other than the one meant; a created file that cannot be registered), in which case the handle is released. Whenever the outcome leaves any doubt about whether the server opened something, the id is released in the background; only a definite refusal from the server needs no cleanup.
+    /// Open (or opendir, or create) under a fresh handle id, recorded with the process whose open it is. `node` says which node the reply's attributes belong to, or refuses them (an open whose path led to a file other than the one meant; a created file that cannot be registered), in which case the handle is released. Whenever the outcome leaves any doubt about whether the server opened something, the release of the id is owed, which the connection's release task sends; only a definite refusal from the server needs no cleanup.
     async fn open_handle(
         &self,
         path: Path,
@@ -1266,19 +1255,19 @@ impl Client {
                     Ok((fh, attr))
                 }
                 Err(e) => {
-                    self.caller.release_orphan(release_request(kind, fh));
+                    self.caller.handles.owe_release(release_request(kind, fh));
                     Err(e)
                 }
             },
             Ok(other) => {
-                self.caller.release_orphan(release_request(kind, fh));
+                self.caller.handles.owe_release(release_request(kind, fh));
                 Err(unexpected(other))
             }
             Err(
                 e
                 @ (Error::Timeout | Error::Interrupted | Error::Disconnected | Error::Protocol(_)),
             ) => {
-                self.caller.release_orphan(release_request(kind, fh));
+                self.caller.handles.owe_release(release_request(kind, fh));
                 Err(e)
             }
             Err(e) => Err(e),

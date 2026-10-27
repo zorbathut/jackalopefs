@@ -36,8 +36,8 @@ module session {
     endedBefore: Set[int]
   }
 
-  /// Where a request came from: a call's attempt, or the client's own traffic: the reopen of a held handle after a new session, the release of an open whose outcome the caller never learned (`release_orphan`), or a release owed from before.
-  type Origin = NoOrigin | OfCall(int) | Reopen(int) | OrphanRelease(int) | OwedRelease(int)
+  /// Where a request came from: a call's attempt, or the client's own traffic: the reopen of a held handle after a new session, or a release owed: of an open whose outcome the caller never learned (an orphan), of a handle a reopen lost, or one that failed.
+  type Origin = NoOrigin | OfCall(int) | Reopen(int) | OwedRelease(int)
   /// A request as the server has it. `Transit`: written by the client, not decoded. `Held`: decoded with a fence above zero, waiting in `SessionState::drain` until `SessionState::drained` lets it go. `Ready`: decoded with a fence of zero, or drained, waiting for a blocking thread; the fence is not read again from here. `Cancelled`: dropped unrun on the client's cancel. `Superseded`: refused by the epoch check in `SessionState::drained` or `SessionState::begin`. `Dropped`: gone with the connection on the server's side. `Abandoned`: running, and given up on.
   type Phase = Absent | Transit | Held | Ready | Cancelled | Superseded | Dropped | Running | Abandoned | Finished
   /// What the server sent back on the stream and the client has not yet read; `Lost` when the connection was gone on the server's side, so nothing went out.
@@ -67,8 +67,8 @@ module session {
   /// `SessionState`: the attachment's epoch and counts, whether the session is in the server's table (`live`) and whether its grace period is running (`detached`); its `Handles`. `handshakeLost` bounds that action to once between connections.
   type Session = { epoch: int, running: int, abandoned: int, runningOlder: int, live: bool, detached: bool, handshakeLost: bool, handles: int -> Entry }
 
-  /// The client's handle table: for each id, the request whose reply it accepted, or the reopen it expects (0 for none held); the handles a reopen killed (`HandleRec::dead`); the releases owed; the opens of unknown outcome whose orphan release has not been sent; the handles reopened on the current session; the reopens whose task still waits for an answer (`reopen_handles`' tasks).
-  type Client = { held: int -> int, dead: Set[int], owed: Set[int], orphansDue: Set[int], reopened: Set[int], reopening: Set[int] }
+  /// The client's handle table: for each id, the request whose reply it accepted, or the reopen it expects (0 for none held); the handles a reopen killed (`HandleRec::dead`); the releases owed (`HandleTable::owe_release`); the handles reopened on the current session; the reopens whose task still waits for an answer (`reopen_handles`' tasks).
+  type Client = { held: int -> int, dead: Set[int], owed: Set[int], reopened: Set[int], reopening: Set[int] }
 
   // ---- State ----
 
@@ -98,7 +98,6 @@ module session {
   pure def begun(p: Phase): bool = p == Running or p == Abandoned or p == Finished
   pure def terminal(p: Phase): bool = p == Absent or p == Cancelled or p == Superseded or p == Dropped or p == Finished
   pure def isReopen(o: Origin): bool = match o { Reopen(_) => true | _ => false }
-  pure def isOrphan(o: Origin): bool = match o { OrphanRelease(_) => true | _ => false }
   pure def isOwed(o: Origin): bool = match o { OwedRelease(_) => true | _ => false }
 
   pure val idleCall: Call = { kind: Change, status: Idle, resendable: false, attempt: 0, minGen: 1, lostOnce: false, req: 0, outcome: NoOutcome, endedBefore: Set() }
@@ -110,7 +109,7 @@ module session {
   pure val noEntry: Entry = { by: 0 }
   pure val noSession: Session = { epoch: 0, running: 0, abandoned: 0, runningOlder: 0, live: false, detached: false, handshakeLost: false, handles: CALLS.mapBy(fh => noEntry) }
   pure val freshSession: Session = noSession.with("epoch", 1).with("live", true)
-  pure val emptyClient: Client = { held: CALLS.mapBy(fh => 0), dead: Set(), owed: Set(), orphansDue: Set(), reopened: Set(), reopening: Set() }
+  pure val emptyClient: Client = { held: CALLS.mapBy(fh => 0), dead: Set(), owed: Set(), reopened: Set(), reopening: Set() }
 
   /// A request ends in `phase`; a reset the server has not acted on is moot from here.
   pure def ended(q: Req, phase: Phase): Req = q.with("phase", phase).with("cancelSent", false)
@@ -118,15 +117,14 @@ module session {
   pure def cutOff(q: Req): Req = if (q.answer == NoAnswer) q else q.with("answer", Lost)
 
   def kindOf(c: int): Kind = calls.get(c).kind
-  /// Whether a request takes part in the ordering (`Request::changes`): a call's change or open, a reopen, and a release the client sends on its own (orphan or owed, `ordered`); not the kernel's release.
+  /// Whether a request takes part in the ordering (`Request::changes`): a call's change or open, a reopen, and a release the client sends on its own (an owed one, `ordered`); not the kernel's release.
   def orderedReq(q: Req): bool = match q.origin { OfCall(c) => ordered(kindOf(c)) | NoOrigin => false | _ => true }
   def opensReq(q: Req): bool = match q.origin { OfCall(c) => isOpen(kindOf(c)) | Reopen(_) => true | _ => false }
-  def releasesReq(q: Req): bool = match q.origin { OfCall(c) => isRelease(kindOf(c)) | OrphanRelease(_) => true | OwedRelease(_) => true | _ => false }
+  def releasesReq(q: Req): bool = match q.origin { OfCall(c) => isRelease(kindOf(c)) | OwedRelease(_) => true | _ => false }
   /// The handle an open keeps or a release lets go, 0 for a change.
   def fhOf(q: Req): int = match q.origin {
     OfCall(c) => match kindOf(c) { Open => c | Release(fh) => fh | Change => 0 }
     | Reopen(fh) => fh
-    | OrphanRelease(fh) => fh
     | OwedRelease(fh) => fh
     | NoOrigin => 0
   }
@@ -135,8 +133,10 @@ module session {
   /// The request slot the next send takes: the lowest free one, or `R + 1` when none is.
   val lowestFree = REQS.filter(r => reqs.get(r).phase == Absent).fold(R + 1, (low, r) => if (r < low) r else low)
   val heldNow = CALLS.filter(fh => client.held.get(fh) != 0)
-  /// A release of the client's own (an orphan's or one owed) whose reply it has not read.
-  def unsettled(q: Req): bool = (isOrphan(q.origin) or isOwed(q.origin)) and (q.phase != Finished or q.answer != NoAnswer)
+  /// An owed release whose reply the client has not read.
+  def unsettled(q: Req): bool = isOwed(q.origin) and (q.phase != Finished or q.answer != NoAnswer)
+  /// The owed release of an open whose outcome the caller never learned, an orphan: an open's handle id is its call's.
+  def orphan(q: Req): bool = match q.origin { OwedRelease(fh) => isOpen(kindOf(fh)) and calls.get(fh).outcome != Replied | _ => false }
 
   /// Whether anything of session `s` is under way at the server: a request not ended, or a connection whose task still runs. Each is a `Holder` of the session, which is what `Sessions::resume` finds a dropped session by.
   def alive(s: int): bool = REQS.exists(r => reqs.get(r).session == s and not(terminal(reqs.get(r).phase))) or GENS.exists(g => conns.get(g).session == s and conns.get(g).serverAlive)
@@ -191,7 +191,7 @@ module session {
     }
   }
 
-  /// The kernel interrupts the request, or `op_timeout` passes (`give_up`): the call returns at once (L1). A give-up before the frame was written leaves nothing on the wire, which `Waiting` stands for here, `send` being one step. After it, `client::exchange` resets a change's send side and counts it on `Attached::cancels` in the same step as the return (M2's client half); a release's streams are dropped unanswered and its request runs on. An open of unknown outcome gets an orphan release (the open path); a release that timed out is owed (`release`).
+  /// The kernel interrupts the request, or `op_timeout` passes (`give_up`): the call returns at once (L1). A give-up before the frame was written leaves nothing on the wire, which `Waiting` stands for here, `send` being one step. After it, `client::exchange` resets a change's send side and counts it on `Attached::cancels` in the same step as the return (M2's client half); a release's streams are dropped unanswered and its request runs on. An open of unknown outcome owes the release of its id (the open path); a release that timed out is owed (`release`).
   action giveUp(c: int): bool = {
     val call = calls.get(c)
     val q = reqs.get(call.req)
@@ -202,7 +202,7 @@ module session {
       reqs' = if (cancels) reqs.set(call.req, q.with("cancelSent", true).with("counted", true)) else reqs,
       conns' = if (cancels) conns.setBy(q.conn, k => k.with("cancels", k.cancels + 1)) else conns,
       client' = match call.kind {
-        Open => client.with("orphansDue", client.orphansDue.union(Set(c)))
+        Open => client.with("owed", client.owed.union(Set(c)))
         | Release(fh) => client.with("owed", client.owed.union(Set(fh)))
         | Change => client
       },
@@ -218,7 +218,7 @@ module session {
     if (call.resendable and not(call.lostOnce)) call.with("status", Waiting).with("minGen", g + 1).with("lostOnce", true).with("req", 0)
     else call.with("status", Ended).with("outcome", Failed).with("req", 0)
 
-  /// `ConnManager` sees the connection end: every exchange on it fails. The calls in `notSent`, whose frames the stream may not have carried whole, go to the next connection untouched (`Caller::attempt`, `NotSent`); the rest lost their reply, `lostCall`, an open that fails getting an orphan release and a release being owed. The readers of the pending cancels fail too, so their count goes with the connection. Reopens not yet accepted fail with it (`apply_reopen` on `Err`): their handles are dead and their releases owed. An orphan or owed release without its reply is owed, for the next resume; the code sends an orphan's once more first, which only shortens the wait.
+  /// `ConnManager` sees the connection end: every exchange on it fails. The calls in `notSent`, whose frames the stream may not have carried whole, go to the next connection untouched (`Caller::attempt`, `NotSent`); the rest lost their reply, `lostCall`, an open or a release that fails owing the release of its handle. The readers of the pending cancels fail too, so their count goes with the connection. Reopens not yet accepted fail with it (`apply_reopen` on `Err`): their handles are dead and their releases owed. An owed release without its reply stays owed, for the next resume.
   action loseClient(g: int, notSent: Set[int]): bool = {
     val inflight = CALLS.filter(c => calls.get(c).status == InFlight and reqs.get(calls.get(c).req).conn == g)
     val failing = inflight.exclude(notSent).filter(c => not(calls.get(c).resendable and not(calls.get(c).lostOnce)))
@@ -239,8 +239,7 @@ module session {
       client' = {
         held: CALLS.mapBy(fh => if (unreopened.contains(fh)) 0 else client.held.get(fh)),
         dead: client.dead.union(unreopened),
-        owed: client.owed.union(unreopened).union(reopensFailing.map(r => fhOf(reqs.get(r)))).union(unsettledReleases).union(failing.filter(c => isRelease(kindOf(c))).map(c => match kindOf(c) { Release(fh) => fh | _ => 0 })),
-        orphansDue: client.orphansDue.union(failing.filter(c => isOpen(kindOf(c)))),
+        owed: client.owed.union(unreopened).union(reopensFailing.map(r => fhOf(reqs.get(r)))).union(unsettledReleases).union(failing.filter(c => isRelease(kindOf(c))).map(c => match kindOf(c) { Release(fh) => fh | _ => 0 })).union(failing.filter(c => isOpen(kindOf(c)))),
         reopened: client.reopened,
         reopening: client.reopening.exclude(reopensFailing)
       },
@@ -251,7 +250,7 @@ module session {
     }
   }
 
-  /// The answer reaches the client (`client::exchange`; for a change given up on, its background reader): a reply ends the call still waiting for it, an open's keeping the handle; an answer to a cancel, whatever it says, uncounts the change on `cancels`. A reopen's reply keeps the handle alive, an errno kills it (`apply_reopen`) and its release is owed (`reopen_handles`); an owed release's reply settles it (`send_releases`); an orphan release's reply settles nothing more.
+  /// The answer reaches the client (`client::exchange`; for a change given up on, its background reader): a reply ends the call still waiting for it, an open's keeping the handle; an answer to a cancel, whatever it says, uncounts the change on `cancels`. A reopen's reply keeps the handle alive, an errno kills it (`apply_reopen`) and its release is owed (`reopen_handles`); an owed release's reply settles it (`send_releases`).
   action receive(r: int): bool = {
     val q = reqs.get(r)
     all {
@@ -288,11 +287,7 @@ module session {
           conns' = conns,
           client' = if (q.answer == Reply) client.with("owed", client.owed.exclude(Set(fh))) else client,
         }
-        | _ => all {
-          keepCalls,
-          conns' = if (q.counted) conns.setBy(q.conn, k => k.with("cancels", k.cancels - 1)) else conns,
-          keepClient,
-        }
+        | NoOrigin => all { keepCalls, conns' = conns, keepClient }
       },
       gen' = gen,
       sid' = sid,
@@ -301,7 +296,7 @@ module session {
     }
   }
 
-  // ---- The client's own traffic (`crates/client/src/conn.rs`, `release_orphan` in `crates/client/src/client.rs`) ----
+  // ---- The client's own traffic (`crates/client/src/conn.rs`) ----
 
   /// `reopen_handles`: after a new session, each held handle is opened again under its id before the connection is published, each by a task of its own; the client expects the server's entry from this request. The kernel may release the handle meanwhile, and the task goes on all the same.
   action reopenSend(fh: int): bool = {
@@ -380,51 +375,6 @@ module session {
       sid' = sid,
       keepSessions,
       keepClient,
-      keepGhosts,
-    }
-  }
-
-  /// `release_orphan`: an open whose outcome the caller never learned may have kept a handle, so its id is released in the background, with no kernel request to interrupt it. The release is ordered, so it waits, like any change, for the connection's pending cancels, the open's among them, to be answered.
-  def orphanSendable(fh: int): bool = conns.get(gen).clientAlive and conns.get(gen).published and conns.get(gen).cancels == 0 and client.orphansDue.contains(fh) and lowestFree <= R
-  action orphanSend(fh: int): bool = {
-    val conn = conns.get(gen)
-    val r = lowestFree
-    all {
-      orphanSendable(fh),
-      reqs' = reqs.set(r, newReq(OrphanRelease(fh), 1, gen, conn)),
-      client' = client.with("orphansDue", client.orphansDue.exclude(Set(fh))),
-      keepCalls,
-      keepConns,
-      keepSessions,
-      keepGhosts,
-    }
-  }
-
-  /// The orphan release's own deadline passes (`op_timeout`, the offline deadline at least): before it was sent, it is owed; after, its cancel is counted like any change's, and it is owed.
-  action orphanGiveUp(fh: int): bool = all {
-    client.orphansDue.contains(fh),
-    client' = client.with("orphansDue", client.orphansDue.exclude(Set(fh))).with("owed", client.owed.union(Set(fh))),
-    keepCalls,
-    keepReqs,
-    keepConns,
-    keepSessions,
-    keepGhosts,
-  }
-  action orphanSentGiveUp(r: int): bool = {
-    val q = reqs.get(r)
-    all {
-      isOrphan(q.origin),
-      unsettled(q),
-      q.answer == NoAnswer,
-      not(q.counted),
-      conns.get(q.conn).clientAlive,
-      reqs' = reqs.set(r, q.with("cancelSent", true).with("counted", true)),
-      conns' = conns.setBy(q.conn, k => k.with("cancels", k.cancels + 1)),
-      client' = client.with("owed", client.owed.union(Set(fhOf(q)))),
-      keepCalls,
-      gen' = gen,
-      sid' = sid,
-      keepSessions,
       keepGhosts,
     }
   }
@@ -760,9 +710,6 @@ module session {
   action stepReopenSend = { nondet fh = CALLS.oneOf()  reopenSend(fh) }
   action stepReopenGiveUp = { nondet r = REQS.oneOf()  reopenGiveUp(r) }
   action stepOwedSend = { nondet fh = CALLS.oneOf()  owedSend(fh) }
-  action stepOrphanSend = { nondet fh = CALLS.oneOf()  orphanSend(fh) }
-  action stepOrphanGiveUp = { nondet fh = CALLS.oneOf()  orphanGiveUp(fh) }
-  action stepOrphanSentGiveUp = { nondet r = REQS.oneOf()  orphanSentGiveUp(r) }
   action stepDropSession = { nondet s = SIDS.oneOf()  dropSession(s) }
   action stepCloseSession = { nondet s = SIDS.oneOf()  closeSession(s) }
   action stepArrive = { nondet r = REQS.oneOf()  arrive(r) }
@@ -787,9 +734,6 @@ module session {
     stepReopenGiveUp,
     publish,
     stepOwedSend,
-    stepOrphanSend,
-    stepOrphanGiveUp,
-    stepOrphanSentGiveUp,
     reconnect,
     newSession,
     handshakeLost,
@@ -817,13 +761,12 @@ module session {
     ran.size() <= 2 and (ran.size() == 2 implies calls.get(c).resendable)
   })
 
-  /// Nothing is in flight: every request has ended and every answer on a live connection been read, every call is idle or ended, the current connection is up at both ends and published with no cancel pending, and no orphan release is due.
+  /// Nothing is in flight: every request has ended and every answer on a live connection been read, every call is idle or ended, and the current connection is up at both ends and published with no cancel pending.
   val quiet = {
     val conn = conns.get(gen)
     REQS.forall(r => terminal(reqs.get(r).phase) and (reqs.get(r).answer == NoAnswer or not(conns.get(reqs.get(r).conn).clientAlive)))
       and CALLS.forall(c => calls.get(c).status == Idle or calls.get(c).status == Ended)
       and conn.clientAlive and conn.serverAlive and conn.published and conn.cancels == 0
-      and client.orphansDue == Set()
   }
 
   /// Quiet, and no release owed either: nothing is about to be sent. S3 compares the two handle tables here.
@@ -872,8 +815,8 @@ module session {
   val seenSuperseded = REQS.exists(r => reqs.get(r).phase == Superseded)
   val seenResendRan = CALLS.exists(c => REQS.filter(r => reqs.get(r).origin == OfCall(c) and begun(reqs.get(r).phase)).size() == 2)
   val seenTakeover = tookOver
-  val seenReleaseHeld = REQS.exists(r => isOrphan(reqs.get(r).origin) and reqs.get(r).phase == Held)
-  val seenOrphanRan = REQS.exists(r => isOrphan(reqs.get(r).origin) and reqs.get(r).phase == Finished)
+  val seenReleaseHeld = REQS.exists(r => orphan(reqs.get(r)) and reqs.get(r).phase == Held)
+  val seenOrphanRan = REQS.exists(r => orphan(reqs.get(r)) and reqs.get(r).phase == Finished)
   val seenReopenSettled = quiescent and client.owed == Set() and REQS.exists(r => isReopen(reqs.get(r).origin) and reqs.get(r).phase == Finished)
   val seenOwedSettled = quiescent and client.owed == Set() and REQS.exists(r => isOwed(reqs.get(r).origin) and reqs.get(r).phase == Finished)
   val seenQuiescentHolding = quiescent and client.owed == Set() and heldNow != Set() and gen > 1

@@ -65,9 +65,6 @@ impl Step {
                 "stepReopenGiveUp",
                 "publish",
                 "stepOwedSend",
-                "stepOrphanSend",
-                "stepOrphanGiveUp",
-                "stepOrphanSentGiveUp",
             ],
         }
     }
@@ -317,9 +314,7 @@ impl Driver {
                 Kind::Release(fh) => Request::Release { fh, ordered: false },
             },
             Origin::Reopen(fh) => open(fh),
-            Origin::OrphanRelease(fh) | Origin::OwedRelease(fh) => {
-                Request::Release { fh, ordered: true }
-            }
+            Origin::OwedRelease(fh) => Request::Release { fh, ordered: true },
             Origin::NoOrigin => unreachable!("a request written has an origin"),
         }
     }

@@ -78,12 +78,9 @@ mutate drop_forgets_living_sessions S1strong \
 mutate owed_never_sent owedNeverStuck \
   'client.owed.contains(fh) and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh)' \
   'false and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh)'
-mutate orphan_release_unordered S3 \
+mutate owed_release_unordered S3 \
   'OfCall(c) => ordered(kindOf(c)) | NoOrigin => false | _ => true }' \
-  'OfCall(c) => ordered(kindOf(c)) | Reopen(_) => true | OwedRelease(_) => true | _ => false }'
-mutate orphan_send_ignores_cancels S3 \
-  'conns.get(gen).published and conns.get(gen).cancels == 0 and client.orphansDue' \
-  'conns.get(gen).published and client.orphansDue'
+  'OfCall(c) => ordered(kindOf(c)) | Reopen(_) => true | _ => false }'
 mutate owed_send_ignores_cancels S3 \
   'conn.published and conn.cancels == 0 and client.owed.contains(fh)' \
   'conn.published and client.owed.contains(fh)'

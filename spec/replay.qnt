@@ -41,8 +41,6 @@ module replay {
     at: int,
     // Real call → model call; 0 for a call the model leaves out.
     callOf: int -> int,
-    // Real call of an orphan release → the model call of the open whose handle it releases.
-    orphanOf: int -> int,
     // Real handle → the model call of its open.
     fhCall: int -> int,
     // Real call → the model request its send took, until its stream is known.
@@ -126,7 +124,6 @@ module replay {
     val c = rp.nextCall
     val fh = look(rp.fhCall, e.fh)
     if (e.ckind == "other" or (e.ckind == "release" and fh == 0) or nextOfCall(t, i, e.call).failure == "stale") skip
-    else if (e.ckind == "release" and e.ordered) all { keepAll, rp' = rp.with("at", rp.at + 1).with("orphanOf", rp.orphanOf.put(e.call, fh)) }
     else {
       val kind = if (e.ckind == "open") Open else if (e.ckind == "release") Release(fh) else Change
       all {
@@ -142,15 +139,12 @@ module replay {
 
   action onCallReady(t: List[Ev], i: int, e: Ev): bool = {
     val c = look(rp.callOf, e.call)
-    val o = look(rp.orphanOf, e.call)
     val sent = rp.with("at", rp.at + 1).with("pending", rp.pending.put(e.call, lowestFree))
     val passed = rp.with("at", rp.at + 1).with("pending", rp.pending.put(e.call, 0))
-    if (c == 0 and o == 0) skip
+    if (c == 0) skip
     else if (unsentCall(t, i, e.call)) all { keepAll, rp' = passed }
     else if (gen != e.gen) refuse
-    else if (c != 0) all { send(c), rp' = sent }
-    else if (client.orphansDue.contains(o)) all { orphanSend(o), rp' = sent }
-    else all { owedSend(o), rp' = sent }
+    else all { send(c), rp' = sent }
   }
 
   action onReleaseReady(t: List[Ev], i: int, e: Ev): bool = {
@@ -167,7 +161,7 @@ module replay {
     val pass = rp.with("at", rp.at + 1).with("unsent", rp.unsent.union(Set(k)))
     if (e.origin == "call") {
       val r = look(rp.pending, e.call)
-      if (look(rp.callOf, e.call) == 0 and look(rp.orphanOf, e.call) == 0) all { keepAll, rp' = ignore }
+      if (look(rp.callOf, e.call) == 0) all { keepAll, rp' = ignore }
       else if (r == 0) all { keepAll, rp' = pass }
       else all { keepAll, rp' = mapped(k, r) }
     } else {
@@ -214,11 +208,10 @@ module replay {
 
   action onFailed(e: Ev): bool = {
     val c = look(rp.callOf, e.call)
-    val o = look(rp.orphanOf, e.call)
     val r = keyed((e.gen, e.stream))
     if (e.failure == "notsent" or e.failure == "lost") skip
     else if (e.failure == "other") refuse
-    else if (e.origin == "call" and e.failure == "stale") { if (c == 0 and o == 0) skip else refuse }
+    else if (e.origin == "call" and e.failure == "stale") { if (c == 0) skip else refuse }
     else if (e.origin == "reopen") { if (e.counted) all { reopenGiveUp(r), rp' = rp.with("at", rp.at + 1) } else skip }
     else if (e.origin == "owed") refuse
     else if (c != 0) all {
@@ -226,10 +219,6 @@ module replay {
       giveUp(c),
       rp' = rp.with("at", rp.at + 1),
     }
-    else if (o != 0 and not(e.written)) {
-      if (client.orphansDue.contains(o)) all { orphanGiveUp(o), rp' = rp.with("at", rp.at + 1) } else skip
-    }
-    else if (o != 0 and e.counted) all { orphanSentGiveUp(r), rp' = rp.with("at", rp.at + 1) }
     else skip
   }
 
@@ -254,10 +243,14 @@ module replay {
     rp' = rp.with("at", rp.at + 1),
   }
 
+  /// A release owed is owed in the model already, or its handle dead; or the call that owes it, an open or a release whose exchange failed with its connection, is still in flight in the model and fails when it loses its connection (`lostCall`): the call fails as soon as its stream does, before the connection manager sees the loss, which owes it in the model.
   action onOwed(e: Ev): bool = {
     val fh = look(rp.fhCall, e.fh)
     if (fh == 0) skip
-    else all { client.owed.contains(fh) or client.dead.contains(fh), skip }
+    else all {
+      client.owed.contains(fh) or client.dead.contains(fh) or CALLS.exists(c => calls.get(c).status == InFlight and not(calls.get(c).resendable and not(calls.get(c).lostOnce)) and (c == fh or calls.get(c).kind == Release(fh))),
+      skip,
+    }
   }
 
   // ---- The server ----
@@ -442,7 +435,7 @@ module replay {
     },
   }
 
-  action replayInit = all { init, rp' = { at: 0, callOf: Map(), orphanOf: Map(), fhCall: Map(), pending: Map(), owedPending: Map(), reqAt: Map(), keyOf: Map(), ignored: Set(), unsent: Set(), received: Set(), sidOf: Map(), nextCall: 1 } }
+  action replayInit = all { init, rp' = { at: 0, callOf: Map(), fhCall: Map(), pending: Map(), owedPending: Map(), reqAt: Map(), keyOf: Map(), ignored: Set(), unsent: Set(), received: Set(), sidOf: Map(), nextCall: 1 } }
 
   /// A trace replays when every event was taken, and the invariants hold at the end too. A step may go to a loss, an early answer or a stranded request rather than to an event, so a run gives replay three steps an event.
   def replayed(t: List[Ev]): bool = rp.at == t.length() and okSoFar

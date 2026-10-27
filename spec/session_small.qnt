@@ -86,43 +86,43 @@ module session_small {
     .then(start(3, Change, false)).then(send(3)).then(arrive(3)).expect(phaseOf(3) == Held)
     .then(finish(1, false)).then(drain(3)).then(begin(3)).expect(okSoFar)
 
-  /// The hovering race: a retried open finds the original's entry and is given up on while it runs; its orphan release waits behind it, then closes the original's handle.
+  /// The hovering race: a retried open finds the original's entry and is given up on while it runs; the release of its id, owed, waits behind it, then closes the original's handle.
   run hoveringTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1)
     .then(loseClient(1, Set())).then(loseServer(1)).then(reconnect)
     .then(send(1)).then(arrive(2)).then(begin(2)).expect(reqs.get(2).slot == Kept and pool == 1)
     .then(giveUp(1)).then(seeCancel(2)).then(receive(2))
-    .then(orphanSend(1)).expect(reqs.get(3).origin == OrphanRelease(1))
+    .then(owedSend(1)).expect(reqs.get(3).origin == OwedRelease(1))
     .then(arrive(3)).expect(phaseOf(3) == Held)
     .then(finish(2, false)).then(drain(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
     .expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
 
-  /// An open given up on while it ran: its orphan release waits for the cancel's answer, then behind the open, which keeps its handle until the release closes it.
+  /// An open given up on while it ran: the release of its id, owed, waits for the cancel's answer, then behind the open, which keeps its handle until the release closes it.
   run openGivenUpTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1)).expect(reqs.get(1).slot == Taken and pool == 1)
-    .then(giveUp(1)).expect(client.orphansDue == Set(1) and conns.get(1).cancels == 1)
-    .expect(not(orphanSendable(1)))
+    .then(giveUp(1)).expect(client.owed == Set(1) and conns.get(1).cancels == 1)
+    .expect(not(owedSendable(1)))
     .then(seeCancel(1)).then(receive(1)).expect(phaseOf(1) == Abandoned and conns.get(1).cancels == 0)
-    .then(orphanSend(1)).expect(client.orphansDue == Set() and reqs.get(2).origin == OrphanRelease(1))
+    .then(owedSend(1)).expect(client.owed == Set(1) and reqs.get(2).origin == OwedRelease(1))
     .then(arrive(2)).expect(phaseOf(2) == Held and seenReleaseHeld)
     .then(finish(1, false)).expect(sessions.get(1).handles.get(1).by == 1 and pool == 1)
     .then(drain(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
     .expect(sessions.get(1).handles.get(1).by == 0 and pool == 0 and quiescent and okSoFar)
 
-  /// An open given up on before it began: the server drops it unrun, and only then does its orphan release go out, closing nothing.
+  /// An open given up on before it began: the server drops it unrun, and only then does the release of its id go out, closing nothing.
   run openUnrunTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).expect(phaseOf(1) == Ready)
     .then(giveUp(1)).then(seeCancel(1)).expect(phaseOf(1) == Cancelled)
-    .then(receive(1)).then(orphanSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
+    .then(receive(1)).then(owedSend(1)).then(arrive(2)).then(begin(2)).then(finish(2, false)).then(receive(2))
     .expect(pool == 0 and quiescent and okSoFar)
 
-  /// The orphan release times out while it waits behind the open: its cancel is counted and it is owed; the owed release goes once the cancel's answer is in, and waits behind the open in turn.
-  run orphanOwedTest = init
+  /// The release of an open given up on is lost with its connection while it waits behind the open: it stays owed, and goes again on the resumed connection, behind the open still running.
+  run orphanLostTest = init
     .then(start(1, Open, true)).then(send(1)).then(arrive(1)).then(begin(1))
     .then(giveUp(1)).then(seeCancel(1)).then(receive(1))
-    .then(orphanSend(1)).then(arrive(2)).then(orphanSentGiveUp(2)).expect(client.owed == Set(1) and conns.get(1).cancels == 1)
-    .then(seeCancel(2)).expect(phaseOf(2) == Cancelled)
-    .then(receive(2)).expect(conns.get(1).cancels == 0)
+    .then(owedSend(1)).then(arrive(2)).expect(phaseOf(2) == Held and not(owedSendable(1)))
+    .then(loseClient(1, Set())).expect(client.owed == Set(1))
+    .then(loseServer(1)).then(dropCut(2)).then(reconnect).expect(owedSendable(1))
     .then(owedSend(1)).then(arrive(3)).expect(phaseOf(3) == Held)
     .then(finish(1, false)).then(drain(3)).then(begin(3)).then(finish(3, false)).then(receive(3))
     .expect(client.owed == Set() and sessions.get(1).handles.get(1).by == 0 and quiescent and okSoFar)

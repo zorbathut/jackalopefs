@@ -18,7 +18,6 @@ pub enum Origin {
     NoOrigin,
     OfCall(u64),
     Reopen(u64),
-    OrphanRelease(u64),
     OwedRelease(u64),
 }
 

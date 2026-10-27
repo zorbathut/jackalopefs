@@ -644,9 +644,11 @@ async fn unlink_while_open_and_stale_open() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Stale), "{err}");
-    wait_for(Duration::from_secs(5), "orphan release", || {
-        (server.server.sessions.get(1).unwrap().handles.is_empty()).then_some(())
-    })
+    wait_for(
+        Duration::from_secs(5),
+        "the release of the refused open",
+        || (server.server.sessions.get(1).unwrap().handles.is_empty()).then_some(()),
+    )
     .await;
     client.shutdown().await;
     server.stop().await;
@@ -866,7 +868,7 @@ async fn timeout_against_a_blackhole_resets_and_holds_the_release() {
     client.shutdown().await;
 }
 
-/// An open given up on while it runs holds its orphan release behind it, so the release closes what the open keeps rather than landing first and leaving it open.
+/// An open given up on while it runs owes the release of its id, which is held behind it, so the release closes what the open keeps rather than landing first and leaving it open.
 #[tokio::test]
 async fn an_orphan_release_waits_for_the_open_given_up_on_while_it_ran() {
     let export = tempfile::tempdir().unwrap();
@@ -886,7 +888,7 @@ async fn an_orphan_release_waits_for_the_open_given_up_on_while_it_ran() {
     gate.wait_parked().await;
     wait_for(
         Duration::from_secs(5),
-        "the orphan release to be held behind the open",
+        "the release to be held behind the open",
         || server_holds_release(&server).then_some(()),
     )
     .await;
@@ -1366,7 +1368,7 @@ async fn a_nonsense_reply_to_an_open_releases_the_handle() {
     assert!(client.handles().is_empty());
     wait_for(
         Duration::from_secs(3),
-        "orphan release after a bad reply",
+        "the release of the open after a bad reply",
         || {
             let seen = blackhole.requests.lock();
             let opened = seen.iter().find_map(|r| match r {
