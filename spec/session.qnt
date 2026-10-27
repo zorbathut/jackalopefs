@@ -172,10 +172,12 @@ module session {
   }
 
   /// `Caller::attempt`: the call takes the current connection once it is published and at least the generation it waits for; a change waits first for the connection's pending cancels to be answered (`CallState::sendable`); `client::exchange` writes the request (`CallState::sent`).
-  def canSend(c: int): bool = {
+  def canSend(c: int): bool = sendReady(c) and lowestFree <= R
+  /// `canSend` but for the request pool, which bounds only the model.
+  def sendReady(c: int): bool = {
     val call = calls.get(c)
     val conn = conns.get(gen)
-    call.status == Waiting and conn.clientAlive and conn.published and gen >= call.minGen and (not(ordered(call.kind)) or conn.cancels == 0) and lowestFree <= R
+    call.status == Waiting and conn.clientAlive and conn.published and gen >= call.minGen and (not(ordered(call.kind)) or conn.cancels == 0)
   }
   action send(c: int): bool = {
     val call = calls.get(c)
@@ -300,13 +302,12 @@ module session {
   // ---- The client's own traffic (`crates/client/src/conn.rs`) ----
 
   /// `reopen_handles`: after a new session, each handle held when it began is opened again under its id before the connection is published, each by a task of its own (`ReopenRound::send`); the client expects the server's entry from this request. The kernel may release the handle meanwhile, and the reopen goes on all the same, its reply owing the release.
+  def reopenReady(fh: int): bool = conns.get(gen).clientAlive and not(conns.get(gen).published) and client.toReopen.contains(fh)
   action reopenSend(fh: int): bool = {
     val conn = conns.get(gen)
     val r = lowestFree
     all {
-      conn.clientAlive,
-      not(conn.published),
-      client.toReopen.contains(fh),
+      reopenReady(fh),
       r <= R,
       reqs' = reqs.set(r, newReq(Reopen(fh), 1, gen, conn)),
       client' = client
@@ -357,13 +358,11 @@ module session {
   }
 
   /// Every reopen of the round has ended, answered or given up on (the server may still run one given up on), so every handle held is reopened or dead (`ReopenRound::publishable`): the connection is published, and the releases of the handles the reopens killed, or the kernel released meanwhile, go out behind it (owed by the round, sent by `send_releases`). What was owed to the old session is moot (`conn.rs`, the new-session branch).
+  val publishReady = conns.get(gen).clientAlive and not(conns.get(gen).published) and client.toReopen == Set() and client.reopening == Set()
   action publish: bool = {
     val conn = conns.get(gen)
     all {
-      conn.clientAlive,
-      not(conn.published),
-      client.toReopen == Set(),
-      client.reopening == Set(),
+      publishReady,
       conns' = conns.set(gen, conn.with("published", true)),
       keepCalls,
       keepReqs,
@@ -375,10 +374,12 @@ module session {
     }
   }
 
-  /// `send_releases`: the connection's release task sends each release owed, whenever it is owed, once the connection's pending cancels are answered (it is ordered), with no give-up, once at a time on one connection; one the server does not answer stays owed, for the next connection.
-  def owedSendable(fh: int): bool = {
+  /// `send_releases`, by `machine::owed_sendable`: the connection's release task sends each release owed, whenever it is owed, once the connection's pending cancels are answered (it is ordered), with no give-up, once at a time on one connection; one the server does not answer stays owed, for the next connection.
+  def owedSendable(fh: int): bool = owedReady(fh) and lowestFree <= R
+  /// `owedSendable` but for the request pool.
+  def owedReady(fh: int): bool = {
     val conn = conns.get(gen)
-    conn.clientAlive and conn.published and conn.cancels == 0 and client.owed.contains(fh) and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh) and reqs.get(x).conn == gen and unsettled(reqs.get(x)))) and lowestFree <= R
+    conn.clientAlive and conn.published and conn.cancels == 0 and client.owed.contains(fh) and not(REQS.exists(x => reqs.get(x).origin == OwedRelease(fh) and reqs.get(x).conn == gen and unsettled(reqs.get(x))))
   }
   action owedSend(fh: int): bool = {
     val conn = conns.get(gen)
@@ -415,7 +416,7 @@ module session {
     }
   }
 
-  /// The client connects again and the server resumes the session (`Sessions::resume`, M1), taking it back into the table if it was dropped while something of it lived: the epoch moves on, the changes still running become `running_older`, and those given up on are no longer counted apart. A connection the server still held is taken over and closed (`handle_connection`), its requests `cutOff`. The connection is published at once, with everything owed to send (`HandleTable::owed_sendable`).
+  /// The client connects again and the server resumes the session (`Sessions::resume`, M1), taking it back into the table if it was dropped while something of it lived: the epoch moves on, the changes still running become `running_older`, and those given up on are no longer counted apart. A connection the server still held is taken over and closed (`handle_connection`), its requests `cutOff`. The connection is published at once, with everything owed to send (`machine::owed_sendable`).
   action reconnect: bool = {
     val g = gen + 1
     val old = conns.get(gen)

@@ -267,8 +267,8 @@ impl HandleTable {
         self.owed_count.subscribe()
     }
 
-    /// The handles whose release is owed and not being sent: those a connection may send.
-    pub fn owed_sendable(&self) -> Vec<u64> {
+    /// The handles whose release is owed and not being sent.
+    pub fn owed_unsent(&self) -> Vec<u64> {
         self.owed
             .lock()
             .iter()
@@ -454,7 +454,7 @@ pub(crate) mod tests {
             !changes.has_changed().unwrap(),
             "a release already owed is not owed again"
         );
-        assert_eq!(table.owed_sendable(), vec![1]);
+        assert_eq!(table.owed_unsent(), vec![1]);
         assert_eq!(
             table.owed_send(1, 1),
             Request::Release {
@@ -464,25 +464,21 @@ pub(crate) mod tests {
             "a release owed is sent ordered"
         );
         assert!(
-            table.owed_sendable().is_empty(),
+            table.owed_unsent().is_empty(),
             "not sent twice on one connection"
         );
         assert!(
-            table.owed_sendable().is_empty(),
+            table.owed_unsent().is_empty(),
             "one undelivered is not sent again on the connection that failed it"
         );
         table.owed_connection_ended(1);
-        assert_eq!(
-            table.owed_sendable(),
-            vec![1],
-            "the next connection sends it"
-        );
+        assert_eq!(table.owed_unsent(), vec![1], "the next connection sends it");
         table.owed_send(1, 2);
         table.owed_delivered(1, 2);
-        assert!(table.owed_sendable().is_empty());
+        assert!(table.owed_unsent().is_empty());
         table.owed_connection_ended(2);
         assert!(
-            table.owed_sendable().is_empty(),
+            table.owed_unsent().is_empty(),
             "delivered, it is owed no more"
         );
     }
@@ -494,11 +490,11 @@ pub(crate) mod tests {
         table.owe_release(release(2));
         table.owed_send(1, 1);
         table.owed_moot();
-        assert!(table.owed_sendable().is_empty());
+        assert!(table.owed_unsent().is_empty());
         table.owe_release(release(1));
         table.owed_delivered(1, 1);
         assert_eq!(
-            table.owed_sendable(),
+            table.owed_unsent(),
             vec![1],
             "the old connection's answer settles nothing owed since"
         );
@@ -568,7 +564,7 @@ pub(crate) mod tests {
         );
         table.kill_all();
         assert!(table.live().is_empty());
-        assert_eq!(table.owed_sendable(), vec![file, dir]);
+        assert_eq!(table.owed_unsent(), vec![file, dir]);
         assert_eq!(
             table.owed_send(file, 1),
             Request::Release {

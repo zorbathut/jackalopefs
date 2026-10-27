@@ -236,6 +236,19 @@ pub(crate) fn release_owed(result: &Result<Response, Error>) -> bool {
     matches!(result, Err(Error::Timeout | Error::Disconnected))
 }
 
+/// The releases owed that the connection's release task may send on `attached` now, `pending` being its count of pending cancels as just read: none until the connection is published and its pending cancels answered, since each is ordered like any change and one of those may be the open of its id; then each not already being sent on it.
+pub(crate) fn owed_sendable(
+    handles: &HandleTable,
+    attached: &AttachedState,
+    pending: usize,
+) -> Vec<u64> {
+    if attached.published() && pending == 0 {
+        handles.owed_unsent()
+    } else {
+        Vec::new()
+    }
+}
+
 /// The kernel releases `fh`: forget it, so a reconnect never reopens it, and say whether to tell the server; not for a dead handle, whose release whatever killed it owed.
 pub(crate) fn release_begins(handles: &HandleTable, fh: u64) -> bool {
     !handles.remove(fh).is_some_and(|rec| rec.is_dead())
@@ -494,6 +507,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![kept]
         );
-        assert_eq!(handles.owed_sendable(), vec![killed, released, unsent]);
+        assert_eq!(handles.owed_unsent(), vec![killed, released, unsent]);
     }
 }

@@ -5,7 +5,7 @@
 use crate::client::{exchange, given_up, Error, ErrorExchange, KeyRoot, Tapping, Timing};
 use crate::handles::HandleTable;
 use crate::ids::{IdMap, ModeIds};
-use crate::machine::{counts_give_up, AttachedState, ReopenRound};
+use crate::machine::{counts_give_up, owed_sendable, AttachedState, ReopenRound};
 use crate::perf::{Perf, Slowpath};
 use crate::transport::{client_config, ServerTrust};
 use jackalopefs_perf::hub::{Hub, IdsEvent, Side};
@@ -700,38 +700,36 @@ async fn send_releases(attached: Arc<Attached>, handles: &HandleTable, hub: Arc<
         owed.borrow_and_update();
         {
             let pending = cancels.borrow_and_update();
-            if *pending == 0 {
-                for fh in handles.owed_sendable() {
-                    let release = handles.owed_send(fh, attached.state.generation);
-                    // Recorded while the count is read, so no give-up comes between the two.
-                    #[cfg(feature = "spec-trace")]
-                    if let Some(recorder) = hub.recorder() {
-                        recorder.record(jackalopefs_perf::spec_trace::EventSpec::ReleaseReady {
-                            fh,
-                            conn: attached.conn_key.unwrap_or(0),
-                        });
-                    }
-                    let (attached, hub) = (attached.clone(), hub.clone());
-                    sends.spawn(async move {
-                        let tapping = Tapping {
-                            hub: &hub,
-                            session: attached.session_id,
-                            conn: attached.conn_key,
-                        };
-                        let mut timing = Timing::for_origin(Some(Origin::Owed(fh)));
-                        let sent = exchange(
-                            &attached.conn,
-                            &attached.root,
-                            &attached.ids,
-                            &release,
-                            &mut timing,
-                            tapping,
-                            std::future::pending(),
-                        )
-                        .await;
-                        (fh, sent)
+            for fh in owed_sendable(handles, &attached.state, *pending) {
+                let release = handles.owed_send(fh, attached.state.generation);
+                // Recorded while the count is read, so no give-up comes between the two.
+                #[cfg(feature = "spec-trace")]
+                if let Some(recorder) = hub.recorder() {
+                    recorder.record(jackalopefs_perf::spec_trace::EventSpec::ReleaseReady {
+                        fh,
+                        conn: attached.conn_key.unwrap_or(0),
                     });
                 }
+                let (attached, hub) = (attached.clone(), hub.clone());
+                sends.spawn(async move {
+                    let tapping = Tapping {
+                        hub: &hub,
+                        session: attached.session_id,
+                        conn: attached.conn_key,
+                    };
+                    let mut timing = Timing::for_origin(Some(Origin::Owed(fh)));
+                    let sent = exchange(
+                        &attached.conn,
+                        &attached.root,
+                        &attached.ids,
+                        &release,
+                        &mut timing,
+                        tapping,
+                        std::future::pending(),
+                    )
+                    .await;
+                    (fh, sent)
+                });
             }
         }
         tokio::select! {
