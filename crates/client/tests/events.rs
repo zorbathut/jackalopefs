@@ -164,13 +164,14 @@ async fn wait_for_resume(client: &jackalopefs_client::Client) {
         Duration::from_secs(10),
         "the session to resume",
         || match &*client.state().borrow() {
-            jackalopefs_client::conn::ConnState::Connected(attached) => (attached.generation >= 2)
-                .then(|| {
+            jackalopefs_client::conn::ConnState::Connected(attached) => {
+                (attached.state.generation >= 2).then(|| {
                     assert!(
                         attached.resumed,
                         "the session was resumed, not opened afresh"
                     )
-                }),
+                })
+            }
             _ => None,
         },
     )

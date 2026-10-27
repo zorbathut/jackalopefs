@@ -26,7 +26,7 @@ module session {
     // `retry_safe`: a reply lost with its connection may be asked for once more.
     resendable: bool,
     attempt: int,
-    // The generation `Caller::wait_connected` is asked for at least: the call takes no connection older than this.
+    // The generation the call waits for at least (`CallState::takes`): it takes no connection older than this.
     minGen: int,
     lostOnce: bool,
     // The request of the attempt in flight, 0 when none is.
@@ -59,7 +59,7 @@ module session {
     slot: Slot
   }
 
-  /// One connection, by the client's generation. `clientAlive` and `serverAlive` are each end's view; `published` is the connection manager's: the reopens are done and calls may use it. `cancels` is `Attached::cancels`.
+  /// One connection, by the client's generation. `clientAlive` and `serverAlive` are each end's view; `published` is the connection manager's (`AttachedState::publish`): the reopens are done and calls may use it. `cancels` is `AttachedState::cancels`.
   type Conn = { session: int, epoch: int, clientAlive: bool, serverAlive: bool, published: bool, cancels: int }
 
   /// A handle the server holds: the request that inserted it (0 for none).
@@ -171,7 +171,7 @@ module session {
     keepGhosts,
   }
 
-  /// `Caller::attempt`: the call takes the current connection once it is published and at least the generation it waits for (`Caller::wait_connected`); a change waits first for the connection's pending cancels to be answered; `client::exchange` writes the request.
+  /// `Caller::attempt`: the call takes the current connection once it is published and at least the generation it waits for; a change waits first for the connection's pending cancels to be answered (`CallState::sendable`); `client::exchange` writes the request (`CallState::sent`).
   def canSend(c: int): bool = {
     val call = calls.get(c)
     val conn = conns.get(gen)
@@ -191,7 +191,7 @@ module session {
     }
   }
 
-  /// The kernel interrupts the request, or `op_timeout` passes (`give_up`): the call returns at once (L1). A give-up before the frame was written leaves nothing on the wire, which `Waiting` stands for here, `send` being one step. After it, `client::exchange` resets a change's send side and counts it on `Attached::cancels` in the same step as the return (M2's client half); a release's streams are dropped unanswered and its request runs on. An open of unknown outcome owes the release of its id (the open path); a release that timed out is owed (`release`).
+  /// The kernel interrupts the request, or `op_timeout` passes (`give_up`): the call returns at once (L1). A give-up before the frame was written leaves nothing on the wire, which `Waiting` stands for here, `send` being one step. After it, the call counts a change on `AttachedState::cancels` and resets its send side in the same step as the return (`CallState::gave_up`, `client::given_up`; M2's client half); a release's streams are dropped unanswered and its request runs on. An open of unknown outcome owes the release of its id (the open path); a release that timed out is owed (`release`).
   action giveUp(c: int): bool = {
     val call = calls.get(c)
     val q = reqs.get(call.req)
@@ -213,7 +213,7 @@ module session {
     }
   }
 
-  /// `Caller::attempt`: a reply lost with its connection is asked for once more on a newer connection if `retry_safe` and not already resent (M3); otherwise the call fails with EIO.
+  /// `CallState::lost`: a reply lost with its connection is asked for once more on a newer connection if `retry_safe` and not already resent (M3); otherwise the call fails with EIO.
   pure def lostCall(call: Call, g: int): Call =
     if (call.resendable and not(call.lostOnce)) call.with("status", Waiting).with("minGen", g + 1).with("lostOnce", true).with("req", 0)
     else call.with("status", Ended).with("outcome", Failed).with("req", 0)

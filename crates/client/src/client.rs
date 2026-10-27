@@ -7,6 +7,10 @@ use crate::handles::Opener;
 use crate::handles::{HandleKind, HandleRec, HandleTable};
 use crate::ids::{IdMap, ModeIds};
 use crate::inodes::KeyNode;
+use crate::machine::{
+    open_settled, release_begins, release_owed, CallState, CancelPending, LossExchange, Sendable,
+    SettleOpen,
+};
 use crate::perf::{AccountCall, Outcome, Perf, Phases, Slowpath, EVENT_TARGET, TRACE_TARGET};
 use crate::transport::ServerTrust;
 use jackalopefs_perf::event;
@@ -184,7 +188,7 @@ impl RequestKernel {
             call.phase = phase;
             call.since = std::time::Instant::now();
             if let Some(attached) = attached {
-                call.generation = Some(attached.generation);
+                call.generation = Some(attached.state.generation);
                 call.conn = attached.conn_key;
             }
             call.stream = stream;
@@ -323,22 +327,6 @@ impl Drop for SideRecv {
         if let Err(e) = self.recv.stop(code_reset::CANCELLED.into()) {
             tracing::trace!("stop after cancel: {e}");
         }
-    }
-}
-
-/// A change on a connection that the call gave up on and the server has not yet said what became of, counted on the connection's [`Attached::cancels`] until dropped.
-struct CancelPending(watch::Sender<usize>);
-
-impl CancelPending {
-    fn count(cancels: &watch::Sender<usize>) -> CancelPending {
-        cancels.send_modify(|n| *n += 1);
-        CancelPending(cancels.clone())
-    }
-}
-
-impl Drop for CancelPending {
-    fn drop(&mut self) {
-        self.0.send_modify(|n| *n -= 1);
     }
 }
 
@@ -854,17 +842,17 @@ struct Caller {
 }
 
 impl Caller {
-    /// Wait for a connection of at least `min_generation` until `deadline`, or until the current outage has lasted the offline timeout if that comes first.
+    /// Wait for a connection `call` takes until `deadline`, or until the current outage has lasted the offline timeout if that comes first.
     async fn wait_connected(
         &self,
         deadline: Instant,
-        min_generation: u64,
+        call: &CallState,
     ) -> Result<Arc<Attached>, Error> {
         let mut state = self.state.clone();
         loop {
             let current = state.borrow_and_update().clone();
             let limit = match current {
-                ConnState::Connected(attached) if attached.generation >= min_generation => {
+                ConnState::Connected(attached) if call.takes(&attached.state) => {
                     return Ok(attached)
                 }
                 ConnState::Closed => return Err(Error::Closed),
@@ -961,8 +949,7 @@ impl Caller {
     ) -> Result<Response, Error> {
         let mut offline_deadline = Instant::now() + self.offline_timeout;
         let handles = req.fhs().map(|fh| fh.and_then(|fh| self.handles.get(fh)));
-        let mut min_generation = 0;
-        let mut lost_once = false;
+        let mut call = CallState::new(req.changes(), retry_safe(req, &handles));
         #[cfg(feature = "spec-trace")]
         let recorder = self.perf.hub.recorder();
         #[cfg(feature = "spec-trace")]
@@ -992,17 +979,15 @@ impl Caller {
             if handles.iter().flatten().any(|h| h.is_dead()) {
                 #[cfg(feature = "spec-trace")]
                 failed(None, Failure::Stale);
+                call.failed();
                 return Err(Error::Stale);
             }
             if let Some(kernel) = kernel {
                 kernel.call_phase(PhaseCall::Wait, None, None);
             }
             let waiting = Instant::now();
-            let attached = interruptible(
-                kernel,
-                self.wait_connected(offline_deadline, min_generation),
-            )
-            .await;
+            let attached =
+                interruptible(kernel, self.wait_connected(offline_deadline, &call)).await;
             account.phases.wait += waiting.elapsed();
             #[cfg(feature = "spec-trace")]
             if let Err(e) = &attached {
@@ -1018,11 +1003,17 @@ impl Caller {
                     },
                 );
             }
-            let attached = attached?;
+            let attached = attached.inspect_err(|e| match e {
+                Error::Timeout | Error::Interrupted => {
+                    call.gave_up(false);
+                }
+                _ => call.failed(),
+            })?;
             // Owners are put in server terms against the connection that carries the request, so a retry on the next one uses that one's.
             let mapped = attached.ids.outgoing(req).inspect_err(|_| {
                 #[cfg(feature = "spec-trace")]
                 failed(attached.conn_key, Failure::Other);
+                call.failed();
             })?;
             let sent = mapped.as_ref().unwrap_or(req);
             let give_up = give_up(kernel, self.op_timeout);
@@ -1038,25 +1029,28 @@ impl Caller {
                 }
             };
             let waits = {
-                let pending = attached.cancels.borrow();
-                let waits = req.changes() && *pending != 0;
-                #[cfg(feature = "spec-trace")]
-                if !waits {
-                    ready();
+                let pending = attached.state.cancels.borrow();
+                match call.sendable(&attached.state, *pending) {
+                    Sendable::Now => {
+                        #[cfg(feature = "spec-trace")]
+                        ready();
+                        false
+                    }
+                    Sendable::AfterCancels => true,
+                    Sendable::No => unreachable!("the call took this connection"),
                 }
-                waits
             };
             // A change goes out only once the server has said what became of every change this connection gave up on, so none of those can land after it.
             if waits {
                 if let Some(kernel) = kernel {
                     kernel.call_phase(PhaseCall::Cancel, Some(&attached), None);
                 }
-                let mut cancels = attached.cancels.subscribe();
+                let mut cancels = attached.state.cancels.subscribe();
                 let waiting = Instant::now();
                 let answered = tokio::select! {
                     biased;
                     e = &mut give_up => Err(e),
-                    answered = cancels.wait_for(|pending| *pending == 0) => {
+                    answered = cancels.wait_for(|pending| call.sendable(&attached.state, *pending) == Sendable::Now) => {
                         let _pending = answered.expect("the connection's count lives as long as the connection");
                         #[cfg(feature = "spec-trace")]
                         ready();
@@ -1064,8 +1058,8 @@ impl Caller {
                     }
                 };
                 account.phases.wait += waiting.elapsed();
-                #[cfg(feature = "spec-trace")]
                 if answered.is_err() {
+                    #[cfg(feature = "spec-trace")]
                     failed(
                         attached.conn_key,
                         Failure::GaveUp {
@@ -1073,6 +1067,7 @@ impl Caller {
                             counted: false,
                         },
                     );
+                    call.gave_up(false);
                 }
                 answered?;
             }
@@ -1085,6 +1080,7 @@ impl Caller {
                 timing.origin = origin;
             }
             let attempt = Instant::now();
+            call.sent(attached.state.generation);
             let tapping = Tapping {
                 hub: &self.perf.hub,
                 session: attached.session_id,
@@ -1102,13 +1098,20 @@ impl Caller {
             .await;
             account.phases += timing.phases(attempt);
             account.session = Some(attached.session_id);
-            account.generation = Some(attached.generation);
+            account.generation = Some(attached.state.generation);
             account.conn = attached.conn_key;
             account.stream = timing.stream;
             match exchanged {
-                Ok(Response::Err(errno)) => return Err(Error::Remote(errno)),
-                Ok(resp) => return Ok(resp),
+                Ok(Response::Err(errno)) => {
+                    call.answered(true);
+                    return Err(Error::Remote(errno));
+                }
+                Ok(resp) => {
+                    call.answered(false);
+                    return Ok(resp);
+                }
                 Err(ErrorExchange::NotSent(cause)) => {
+                    call.lost(LossExchange::NotSent)?;
                     event!(
                         target: EVENT_TARGET,
                         self.perf.events,
@@ -1118,15 +1121,12 @@ impl Caller {
                             "{} {} on generation {}: {cause}; waiting for the next connection",
                             req.op_name(),
                             req.subject(),
-                            attached.generation
+                            attached.state.generation
                         )
                     );
-                    min_generation = attached.generation + 1;
                 }
                 Err(ErrorExchange::Lost(cause)) => {
-                    if lost_once || !retry_safe(req, &handles) {
-                        return Err(Error::Disconnected);
-                    }
+                    call.lost(LossExchange::Lost)?;
                     event!(
                         target: EVENT_TARGET,
                         self.perf.events,
@@ -1136,27 +1136,29 @@ impl Caller {
                             "{} {} on generation {}: {cause}; the reply was lost with the connection, so it is sent once more on the next",
                             req.op_name(),
                             req.subject(),
-                            attached.generation
+                            attached.state.generation
                         )
                     );
-                    lost_once = true;
                     offline_deadline = Instant::now() + self.offline_timeout;
-                    min_generation = attached.generation + 1;
                 }
-                Err(ErrorExchange::Protocol(msg)) => return Err(Error::Protocol(msg)),
+                Err(ErrorExchange::Protocol(msg)) => {
+                    call.failed();
+                    return Err(Error::Protocol(msg));
+                }
                 Err(ErrorExchange::GaveUp {
                     error,
                     written,
                     pending,
                 }) => {
+                    let counted = call.gave_up(written);
                     return Err(given_up(
                         error,
                         written,
-                        pending.filter(|_| req.changes()),
-                        &attached.cancels,
+                        pending.filter(|_| counted),
+                        &attached.state.cancels,
                         tapping,
                         &timing,
-                    ))
+                    ));
                 }
             }
             account.retries += 1;
@@ -1168,13 +1170,13 @@ impl Caller {
 
     /// Release a handle on the server. One that fails for want of a connection, or times out, is owed: without it the server would hold the descriptor for as long as the session lives, so the connection's release task sends it again, on this connection or the session's next.
     async fn release(&self, req: Request) -> Result<(), Error> {
-        match self.call(req.clone()).await {
+        let released = self.call(req.clone()).await;
+        if release_owed(&released) {
+            self.handles.owe_release(req);
+        }
+        match released {
             Ok(Response::Ok) => Ok(()),
             Ok(other) => Err(unexpected(other)),
-            Err(e @ (Error::Timeout | Error::Disconnected)) => {
-                self.handles.owe_release(req);
-                Err(e)
-            }
             Err(e) => Err(e),
         }
     }
@@ -1259,7 +1261,9 @@ impl Client {
     /// The current connection and its generation, if there is one.
     pub fn connection(&self) -> Option<(u64, Connection)> {
         match &*self.conn.state.borrow() {
-            ConnState::Connected(attached) => Some((attached.generation, attached.conn.clone())),
+            ConnState::Connected(attached) => {
+                Some((attached.state.generation, attached.conn.clone()))
+            }
             _ => None,
         }
     }
@@ -1319,8 +1323,10 @@ impl Client {
     ) -> Result<(u64, Attr), Error> {
         let fh = self.caller.handles.alloc();
         let req = build(fh);
-        match self.call(req).await {
-            Ok(Response::Opened { attr }) => match node(&attr) {
+        let opened = self.call(req).await;
+        let owe = || self.caller.handles.owe_release(release_request(kind, fh));
+        match (open_settled(&opened), opened) {
+            (SettleOpen::Keep, Ok(Response::Opened { attr })) => match node(&attr) {
                 Ok(nodeid) => {
                     self.caller.handles.insert(
                         fh,
@@ -1334,22 +1340,20 @@ impl Client {
                     Ok((fh, attr))
                 }
                 Err(e) => {
-                    self.caller.handles.owe_release(release_request(kind, fh));
+                    owe();
                     Err(e)
                 }
             },
-            Ok(other) => {
-                self.caller.handles.owe_release(release_request(kind, fh));
+            (SettleOpen::Owe, Ok(other)) => {
+                owe();
                 Err(unexpected(other))
             }
-            Err(
-                e
-                @ (Error::Timeout | Error::Interrupted | Error::Disconnected | Error::Protocol(_)),
-            ) => {
-                self.caller.handles.owe_release(release_request(kind, fh));
+            (SettleOpen::Owe, Err(e)) => {
+                owe();
                 Err(e)
             }
-            Err(e) => Err(e),
+            (SettleOpen::Nothing, Err(e)) => Err(e),
+            (settle, opened) => unreachable!("an open's end settled as {settle:?}: {opened:?}"),
         }
     }
 
@@ -1555,12 +1559,7 @@ impl Client {
 
     /// Forget the handle locally first so a reconnect never reopens it, then tell the server, unless the handle is dead: whatever killed it owed its release.
     pub async fn release(&self, fh: u64) -> Result<(), Error> {
-        if self
-            .caller
-            .handles
-            .remove(fh)
-            .is_some_and(|rec| rec.is_dead())
-        {
+        if !release_begins(&self.caller.handles, fh) {
             return Ok(());
         }
         self.caller
@@ -1613,12 +1612,7 @@ impl Client {
 
     /// As [`Self::release`].
     pub async fn releasedir(&self, fh: u64) -> Result<(), Error> {
-        if self
-            .caller
-            .handles
-            .remove(fh)
-            .is_some_and(|rec| rec.is_dead())
-        {
+        if !release_begins(&self.caller.handles, fh) {
             return Ok(());
         }
         self.caller

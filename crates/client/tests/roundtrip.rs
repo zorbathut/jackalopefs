@@ -2531,7 +2531,7 @@ async fn a_release_failed_in_an_outage_is_sent_once_the_session_resumes() {
     })
     .await;
     assert!(
-        matches!(&*client.state().borrow(), ConnState::Connected(attached) if attached.generation == 2),
+        matches!(&*client.state().borrow(), ConnState::Connected(attached) if attached.state.generation == 2),
         "the owed release went out before the resumed connection was published"
     );
     client.shutdown().await;
@@ -2565,7 +2565,7 @@ async fn a_release_that_times_out_on_a_live_connection_is_sent_again_on_it() {
         "the first send is still held, so this was the second"
     );
     assert!(
-        matches!(&*client.state().borrow(), ConnState::Connected(attached) if attached.generation == 1),
+        matches!(&*client.state().borrow(), ConnState::Connected(attached) if attached.state.generation == 1),
         "sent again on the connection it timed out on"
     );
     gate.release();

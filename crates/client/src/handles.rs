@@ -405,11 +405,12 @@ impl HandleTable {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use jackalopefs_proto::{Attr, FileKind, TimeSpec};
 
-    fn attr(ino: u64) -> Attr {
+    /// The attributes of a regular file, its identity its inode number.
+    pub(crate) fn attr(ino: u64) -> Attr {
         let t = TimeSpec { sec: 0, nsec: 0 };
         Attr {
             ino,

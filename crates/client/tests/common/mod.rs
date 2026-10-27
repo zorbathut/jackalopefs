@@ -809,7 +809,7 @@ pub async fn wait_for_generation(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         if let jackalopefs_client::ConnState::Connected(att) = &*state.borrow_and_update() {
-            if att.generation >= generation {
+            if att.state.generation >= generation {
                 return att.clone();
             }
         }

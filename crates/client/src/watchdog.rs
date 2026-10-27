@@ -219,7 +219,7 @@ impl WatchClient {
     fn connection(&self) -> String {
         match &*self.shared.client.state().borrow() {
             ConnState::Connected(attached) => {
-                format!("connected, generation {}", attached.generation)
+                format!("connected, generation {}", attached.state.generation)
             }
             ConnState::Connecting { since } => {
                 format!("no connection for {}", fmt_duration(since.elapsed()))

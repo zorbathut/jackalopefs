@@ -7,6 +7,7 @@ pub mod handles;
 pub mod ids;
 pub mod inodes;
 pub mod invalidate;
+pub mod machine;
 pub mod mount;
 pub mod perf;
 pub mod procs;

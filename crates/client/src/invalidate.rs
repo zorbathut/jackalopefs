@@ -131,7 +131,7 @@ async fn translate(
                     break;
                 }
                 let generation = match &*state.borrow_and_update() {
-                    ConnState::Connected(att) => att.generation,
+                    ConnState::Connected(att) => att.state.generation,
                     _ => continue,
                 };
                 if generation > 1 && generation != last_generation {

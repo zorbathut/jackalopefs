@@ -7,6 +7,7 @@ use crate::client::{
 };
 use crate::handles::HandleTable;
 use crate::ids::{IdMap, ModeIds};
+use crate::machine::AttachedState;
 use crate::perf::{Perf, Slowpath};
 use crate::transport::{client_config, ServerTrust};
 use jackalopefs_perf::hub::{Hub, IdsEvent, Side};
@@ -54,14 +55,12 @@ pub struct Attached {
     pub conn: Connection,
     pub session_id: u64,
     pub resumed: bool,
-    /// Increments with every successful connection; callers that lost a reply wait for a strictly newer generation before retrying.
-    pub generation: u64,
     /// [`conn_key`](jackalopefs_perf::conn_key): what the server's lines call this connection.
     pub conn_key: Option<u64>,
     pub root: KeyRoot,
     pub ids: IdMap,
-    /// Changes on this connection that a call gave up on, and the server has not yet said what became of; a change is sent only once there are none.
-    pub cancels: watch::Sender<usize>,
+    /// Its generation, pending cancels and publication.
+    pub state: AttachedState,
 }
 
 #[derive(Clone, Debug)]
@@ -304,8 +303,8 @@ async fn run(
             session: attached.session_id,
             conn: conn_key,
         };
-        // Made before the reopens, which count on it the ones they give up on, so that a stale release waits for the answer.
-        let cancels = watch::Sender::new(0);
+        // Made before the reopens, which count on its pending cancels the ones they give up on, so that a stale release waits for the answer.
+        let attached_state = AttachedState::new(generation);
         let restore = async {
             if !resumed {
                 handles.owed_moot();
@@ -315,7 +314,7 @@ async fn run(
                     ids,
                     &handles,
                     cfg.offline_timeout,
-                    &cancels,
+                    &attached_state.cancels,
                     tapping,
                 )
                 .await
@@ -332,11 +331,10 @@ async fn run(
             conn: conn.clone(),
             session_id: attached.session_id,
             resumed,
-            generation,
             conn_key,
             root: root.clone(),
             ids,
-            cancels,
+            state: attached_state,
         });
         let releasing_on = attached.clone();
         // Recorded first, since a call can take the connection as soon as it is published.
@@ -346,6 +344,7 @@ async fn run(
                 conn: conn_key.unwrap_or(0)
             }
         );
+        attached.state.publish();
         if state.send(ConnState::Connected(attached)).is_err() {
             break;
         }
@@ -670,18 +669,18 @@ async fn reopen_handles(
     }
 }
 
-/// Send the releases owed, concurrently, for as long as the connection lasts: each as soon as it is owed and the connection's pending cancels (`Attached::cancels`) are answered, since each is ordered like any change and one of those may be the open of its id. Each goes once on this connection; one the server does not answer stays owed, for the session's next connection: sending it again here would only have it fail again on the connection that just failed it.
+/// Send the releases owed, concurrently, for as long as the connection lasts: each as soon as it is owed and the connection's pending cancels (`AttachedState::cancels`) are answered, since each is ordered like any change and one of those may be the open of its id. Each goes once on this connection; one the server does not answer stays owed, for the session's next connection: sending it again here would only have it fail again on the connection that just failed it.
 ///
 /// Every input of that decision (the releases owed, the pending cancels, a release settled) is marked seen before it is looked at, and waited on after, so none that changes in between goes unnoticed.
 async fn send_releases(attached: Arc<Attached>, handles: &HandleTable, hub: Arc<Hub>) {
     let mut owed = handles.owed_changes();
-    let mut cancels = attached.cancels.subscribe();
+    let mut cancels = attached.state.cancels.subscribe();
     let mut sends = tokio::task::JoinSet::new();
     let settle = |joined: Result<
         (u64, Result<Response, ErrorExchange>),
         tokio::task::JoinError,
     >| match joined {
-        Ok((fh, Ok(_))) => handles.owed_delivered(fh, attached.generation),
+        Ok((fh, Ok(_))) => handles.owed_delivered(fh, attached.state.generation),
         // The server may hold the handle until the session's next connection sends the release again.
         Ok((fh, Err(e))) if attached.conn.close_reason().is_none() => {
             tracing::warn!(fh, "a release owed failed on a live connection: {e:?}; it is sent again on the session's next connection")
@@ -695,7 +694,7 @@ async fn send_releases(attached: Arc<Attached>, handles: &HandleTable, hub: Arc<
             let pending = cancels.borrow_and_update();
             if *pending == 0 {
                 for fh in handles.owed_sendable() {
-                    let release = handles.owed_send(fh, attached.generation);
+                    let release = handles.owed_send(fh, attached.state.generation);
                     // Recorded while the count is read, so no give-up comes between the two.
                     #[cfg(feature = "spec-trace")]
                     if let Some(recorder) = hub.recorder() {
@@ -745,7 +744,7 @@ async fn send_releases(attached: Arc<Attached>, handles: &HandleTable, hub: Arc<
     while let Some(joined) = sends.join_next().await {
         settle(joined);
     }
-    handles.owed_connection_ended(attached.generation);
+    handles.owed_connection_ended(attached.state.generation);
 }
 
 /// Most processes a report of the handles names one by one.
