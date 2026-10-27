@@ -6,7 +6,7 @@ use crate::inodes::KeyNode;
 use jackalopefs_proto::control::{HandlesProcess, HandlesTotals};
 use jackalopefs_proto::{Name, Path, Request, Response};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -135,12 +135,18 @@ impl HandleRec {
     }
 }
 
+/// A release owed, and the generation of the connection it is being sent on, if it is.
+struct OwedRelease {
+    req: Request,
+    sending_on: Option<u64>,
+}
+
 #[derive(Default)]
 pub struct HandleTable {
     next: AtomicU64,
     map: Mutex<HashMap<u64, Arc<HandleRec>>>,
-    /// Releases that failed for want of a connection, or timed out: the connection's release task sends them as they are owed, and a session that resumes gets those its last connection could not deliver.
-    owed: Mutex<Vec<Request>>,
+    /// Releases that failed for want of a connection, or timed out, by handle id, until the server answers one: the connection's release task sends each once on its connection, and a session that resumes gets those its last connection could not deliver.
+    owed: Mutex<BTreeMap<u64, OwedRelease>>,
     /// Counts the releases ever owed, so the connection's release task wakes for each.
     owed_count: watch::Sender<u64>,
     /// The handles in `map` of each kind, changed under its lock.
@@ -229,19 +235,31 @@ impl HandleTable {
         Some(rec)
     }
 
-    /// Owe `release`, which from now on is sent in the background and so is ordered ([`Request::Release`]).
+    /// Owe `release`, which from now on is sent in the background and so is ordered ([`Request::Release`]); a release already owed stays as it is.
     pub fn owe_release(&self, release: Request) {
         let release = match release {
             Request::Release { fh, .. } => Request::Release { fh, ordered: true },
             Request::Releasedir { fh, .. } => Request::Releasedir { fh, ordered: true },
             other => unreachable!("only releases are owed: {other:?}"),
         };
+        let fh = release.fhs()[0].expect("a release names its handle");
         #[cfg(feature = "spec-trace")]
-        if let (Some(recorder), Some(fh)) = (self.recorder.get(), release.fhs()[0]) {
+        if let Some(recorder) = self.recorder.get() {
             recorder.record(jackalopefs_perf::spec_trace::EventSpec::Owed { fh });
         }
-        self.owed.lock().push(release);
-        self.owed_count.send_modify(|count| *count += 1);
+        let owed = match self.owed.lock().entry(fh) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(OwedRelease {
+                    req: release,
+                    sending_on: None,
+                });
+                true
+            }
+            std::collections::btree_map::Entry::Occupied(_) => false,
+        };
+        if owed {
+            self.owed_count.send_modify(|count| *count += 1);
+        }
     }
 
     /// Changes whenever a release is owed from now on.
@@ -249,8 +267,47 @@ impl HandleTable {
         self.owed_count.subscribe()
     }
 
-    pub fn take_owed(&self) -> Vec<Request> {
-        std::mem::take(&mut *self.owed.lock())
+    /// The handles whose release is owed and not being sent: those a connection may send.
+    pub fn owed_sendable(&self) -> Vec<u64> {
+        self.owed
+            .lock()
+            .iter()
+            .filter(|(_, owed)| owed.sending_on.is_none())
+            .map(|(fh, _)| *fh)
+            .collect()
+    }
+
+    /// The release owed of `fh`, now being sent on the connection of `generation`.
+    pub fn owed_send(&self, fh: u64, generation: u64) -> Request {
+        let mut owed = self.owed.lock();
+        let owed = owed.get_mut(&fh).expect("a release sent is owed");
+        owed.sending_on = Some(generation);
+        owed.req.clone()
+    }
+
+    /// The release of `fh` sent on the connection of `generation` was answered, and is owed no more. One that was not stays owed, sending on that connection until it ends.
+    pub fn owed_delivered(&self, fh: u64, generation: u64) {
+        let mut owed = self.owed.lock();
+        if owed
+            .get(&fh)
+            .is_some_and(|o| o.sending_on == Some(generation))
+        {
+            owed.remove(&fh);
+        }
+    }
+
+    /// The connection of `generation` has ended: what it did not deliver may go on the next.
+    pub fn owed_connection_ended(&self, generation: u64) {
+        for owed in self.owed.lock().values_mut() {
+            if owed.sending_on == Some(generation) {
+                owed.sending_on = None;
+            }
+        }
+    }
+
+    /// A new session holds none of the old one's handles, so the releases owed to that one are moot.
+    pub fn owed_moot(&self) {
+        self.owed.lock().clear();
     }
 
     pub fn len(&self) -> usize {
@@ -365,6 +422,75 @@ mod tests {
             },
             foreign: false,
         }
+    }
+
+    fn release(fh: u64) -> Request {
+        Request::Release { fh, ordered: false }
+    }
+
+    #[test]
+    fn a_release_owed_is_sent_once_per_connection_until_one_delivers_it() {
+        let table = HandleTable::default();
+        let mut changes = table.owed_changes();
+        table.owe_release(release(1));
+        assert!(
+            changes.has_changed().unwrap(),
+            "owing wakes the release task"
+        );
+        changes.borrow_and_update();
+        table.owe_release(release(1));
+        assert!(
+            !changes.has_changed().unwrap(),
+            "a release already owed is not owed again"
+        );
+        assert_eq!(table.owed_sendable(), vec![1]);
+        assert_eq!(
+            table.owed_send(1, 1),
+            Request::Release {
+                fh: 1,
+                ordered: true
+            },
+            "a release owed is sent ordered"
+        );
+        assert!(
+            table.owed_sendable().is_empty(),
+            "not sent twice on one connection"
+        );
+        assert!(
+            table.owed_sendable().is_empty(),
+            "one undelivered is not sent again on the connection that failed it"
+        );
+        table.owed_connection_ended(1);
+        assert_eq!(
+            table.owed_sendable(),
+            vec![1],
+            "the next connection sends it"
+        );
+        table.owed_send(1, 2);
+        table.owed_delivered(1, 2);
+        assert!(table.owed_sendable().is_empty());
+        table.owed_connection_ended(2);
+        assert!(
+            table.owed_sendable().is_empty(),
+            "delivered, it is owed no more"
+        );
+    }
+
+    #[test]
+    fn a_new_session_makes_the_releases_owed_moot() {
+        let table = HandleTable::default();
+        table.owe_release(release(1));
+        table.owe_release(release(2));
+        table.owed_send(1, 1);
+        table.owed_moot();
+        assert!(table.owed_sendable().is_empty());
+        table.owe_release(release(1));
+        table.owed_delivered(1, 1);
+        assert_eq!(
+            table.owed_sendable(),
+            vec![1],
+            "the old connection's answer settles nothing owed since"
+        );
     }
 
     #[test]

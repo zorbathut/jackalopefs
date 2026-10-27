@@ -448,7 +448,7 @@ module session {
     }
   }
 
-  /// The client connects again and the server resumes the session (`Sessions::resume`, M1), taking it back into the table if it was dropped while something of it lived: the epoch moves on, the changes still running become `running_older`, and those given up on are no longer counted apart. A connection the server still held is taken over and closed (`handle_connection`), its requests `cutOff`. The connection is published at once, with everything owed to send (`take_owed`).
+  /// The client connects again and the server resumes the session (`Sessions::resume`, M1), taking it back into the table if it was dropped while something of it lived: the epoch moves on, the changes still running become `running_older`, and those given up on are no longer counted apart. A connection the server still held is taken over and closed (`handle_connection`), its requests `cutOff`. The connection is published at once, with everything owed to send (`HandleTable::owed_sendable`).
   action reconnect: bool = {
     val g = gen + 1
     val old = conns.get(gen)
