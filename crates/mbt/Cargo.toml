@@ -1,0 +1,16 @@
+[package]
+name = "jackalopefs-mbt"
+description = "Runs of the session model (spec/session.qnt), read from ITF traces, for the model-based tests of the client and the server"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+flate2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+similar = { workspace = true }
+tempfile = { workspace = true }

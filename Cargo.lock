@@ -626,6 +626,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "jackalopefs-mbt"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+]
+
+[[package]]
 name = "jackalopefs-perf"
 version = "0.1.0"
 dependencies = [
@@ -658,8 +669,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "flate2",
  "humantime",
+ "jackalopefs-mbt",
  "jackalopefs-perf",
  "jackalopefs-proto",
  "libc",
@@ -669,9 +680,7 @@ dependencies = [
  "rand 0.9.5",
  "rcgen",
  "rustls",
- "serde",
  "serde_json",
- "similar",
  "subtle",
  "syn 2.0.119",
  "tempfile",

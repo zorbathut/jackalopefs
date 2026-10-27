@@ -2,7 +2,7 @@
 //!
 //! The driver reads from the model only what the client and the network did: which requests were written, by which call and on which connection, which answers the client read, and which end of a connection went (each listed in `spec/README.md`, "Model-based testing"). Everything the server decides comes from the code: a request's session and epoch are what `Sessions::resume` or `Sessions::create` gave its connection, never the model's.
 
-use super::model::{Answer, Kind, Model, Origin, Phase, Slot, View, ViewReq, ViewSession};
+use super::view::{view, View, ViewReq, ViewSession};
 use crate::export::Export;
 use crate::handles::{Handle, HandlePool, Reserved, SHARE_MAX};
 use crate::ids::{IdMap, ModeIds};
@@ -12,6 +12,8 @@ use crate::session::{
     SessionState, Sessions, Verdict,
 };
 use crate::watch::{ChangeLog, Watches};
+use jackalopefs_mbt::model::{Answer, Entry, Kind, Model, Origin, Phase, Slot};
+use jackalopefs_mbt::{Coverage, Drive};
 use jackalopefs_proto::{Name, Path, Request, Response};
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -39,7 +41,7 @@ pub enum Step {
 
 impl Step {
     /// The names of the model's actions (its `step`'s, as `mbt::actionTaken` gives them) this step can be.
-    pub fn actions(self) -> &'static [&'static str] {
+    fn actions(self) -> &'static [&'static str] {
         match self {
             Step::Arrive(_) => &["stepArrive"],
             Step::DropCut(_) => &["stepDropCut"],
@@ -72,7 +74,7 @@ impl Step {
 }
 
 /// Which server step took the model from `pre` to `post`: each changes something no other step does (a request's phase moving the way only it moves it, the generation, a connection's server end, a session leaving the table, its epoch, its handles closing). A change none of them explains, or more than one, is an error.
-pub fn infer(pre: &Model, post: &Model) -> Result<Step, String> {
+fn infer(pre: &Model, post: &Model) -> Result<Step, String> {
     use Phase::*;
     let mut found = Vec::new();
     let mut environment = false;
@@ -122,9 +124,8 @@ pub fn infer(pre: &Model, post: &Model) -> Result<Step, String> {
     }
     if found.is_empty() {
         for (s, ses) in &post.sessions {
-            let held = |handles: &BTreeMap<u64, super::model::Entry>| {
-                handles.values().filter(|e| e.by != 0).count()
-            };
+            let held =
+                |handles: &BTreeMap<u64, Entry>| handles.values().filter(|e| e.by != 0).count();
             if held(&pre.sessions[s].handles) > 0 && held(&ses.handles) == 0 {
                 found.push(Step::CloseSession(*s));
             }
@@ -134,7 +135,7 @@ pub fn infer(pre: &Model, post: &Model) -> Result<Step, String> {
         [] => {
             // A client's step may end what keeps a session alive (a request erased unsent), and nothing else of the server's.
             let server = |model: &Model| {
-                let mut sessions = model.view().sessions;
+                let mut sessions = view(model).sessions;
                 sessions.values_mut().for_each(|s| s.alive = false);
                 sessions
             };
@@ -183,9 +184,6 @@ struct ReqServer {
     read: Option<Answer>,
 }
 
-/// Each server step and outcome a run took, so a batch of runs can be seen to reach them all.
-pub type Coverage = BTreeMap<&'static str, usize>;
-
 /// What the model's session ids name in the code: the session (for as long as it lives) and its token.
 struct Known {
     weak: Weak<SessionState>,
@@ -203,12 +201,12 @@ pub struct Driver {
     conns: BTreeMap<u64, ConnServer>,
     reqs: BTreeMap<u64, ReqServer>,
     calls: Vec<u64>,
-    pub coverage: Coverage,
+    coverage: Coverage,
 }
 
 impl Driver {
     /// The server as the model's `init` has it: one session, attached by the first connection.
-    pub fn new(init: &Model) -> Result<Driver, String> {
+    fn start(init: &Model) -> Result<Driver, String> {
         let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
         let export = Arc::new(Export::open(dir.path()).map_err(|e| e.to_string())?);
         let mut driver = Driver {
@@ -227,12 +225,6 @@ impl Driver {
         let (state, epoch) = driver.sessions.create();
         driver.connect(init.gen, state, epoch, init.sid)?;
         Ok(driver)
-    }
-
-    /// Give up on a replay that parted from the model: the scratch directory goes, and the rest is forgotten, since its guards and exchanges are where the code parted, and their drops may panic over counts the model never had.
-    pub fn abandon(mut self) {
-        drop(self.dir.take());
-        std::mem::forget(self);
     }
 
     fn covered(&mut self, what: &'static str) {
@@ -333,7 +325,7 @@ impl Driver {
     }
 
     /// Take the step from `pre` to `post`.
-    pub fn apply(&mut self, pre: &Model, post: &Model, step: Step) -> Result<(), String> {
+    fn step(&mut self, pre: &Model, post: &Model, step: Step) -> Result<(), String> {
         match step {
             Step::Environment => self.environment(pre, post)?,
             Step::Arrive(r) => {
@@ -652,7 +644,7 @@ impl Driver {
     }
 
     /// The code's state, in the model's terms.
-    pub fn view(&mut self) -> View {
+    fn view(&mut self) -> View {
         let fhs = self.calls.clone();
         let mut sessions = BTreeMap::new();
         for (id, known) in self.known.iter_mut() {
@@ -716,6 +708,40 @@ impl Driver {
                 })
                 .collect(),
         }
+    }
+}
+
+impl Drive for Driver {
+    type Step = Step;
+
+    fn new(init: &Model) -> Result<Driver, String> {
+        Driver::start(init)
+    }
+
+    fn infer(pre: &Model, post: &Model) -> Result<Step, String> {
+        infer(pre, post)
+    }
+
+    fn actions(step: &Step) -> &'static [&'static str] {
+        step.actions()
+    }
+
+    fn apply(&mut self, pre: &Model, post: &Model, step: Step) -> Result<(), String> {
+        self.step(pre, post, step)
+    }
+
+    fn compared(&mut self, model: &Model) -> (String, String) {
+        (format!("{:#?}", self.view()), format!("{:#?}", view(model)))
+    }
+
+    /// Give up on a replay that parted from the model: the scratch directory goes, and the rest is forgotten, since its guards and exchanges are where the code parted, and their drops may panic over counts the model never had.
+    fn abandon(mut self) {
+        drop(self.dir.take());
+        std::mem::forget(self);
+    }
+
+    fn coverage(&mut self) -> Coverage {
+        std::mem::take(&mut self.coverage)
     }
 }
 
